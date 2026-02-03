@@ -74,6 +74,26 @@ def find_project_status_files(scan_paths=None, max_depth=2):
     return status_files
 
 
+def extract_list_items(content, header_pattern, max_items=3):
+    """Extract bullet points following a header pattern."""
+    items = []
+    # Find the header and get content after it
+    match = re.search(header_pattern + r'\s*\n((?:[-*]\s+.+\n?)+)', content, re.MULTILINE)
+    if match:
+        list_text = match.group(1)
+        # Extract individual items
+        for line in list_text.split('\n'):
+            line = line.strip()
+            if line.startswith('-') or line.startswith('*'):
+                item = line.lstrip('-* ').strip()
+                # Skip placeholder items
+                if item and not item.startswith('(') and item != '(Nothing yet)':
+                    items.append(item)
+                    if len(items) >= max_items:
+                        break
+    return items
+
+
 def parse_project_status(file_path):
     """Parse a PROJECT_STATUS.md file and extract metadata."""
     try:
@@ -122,6 +142,16 @@ def parse_project_status(file_path):
         project['has_github_repo'] = has_repo == 'yes' or (
             project['repo'] and 'not' not in project['repo'].lower()
         )
+
+        # Extract achievements (What was built + What was figured out)
+        achievements = []
+        achievements.extend(extract_list_items(content, r'\*\*What was built:\*\*', 3))
+        if len(achievements) < 3:
+            achievements.extend(extract_list_items(content, r'\*\*What was figured out:\*\*', 3 - len(achievements)))
+        project['achievements'] = achievements[:3]
+
+        # Extract next steps
+        project['next_steps'] = extract_list_items(content, r'\*\*Next time:\*\*', 3)
 
         return project
 
@@ -447,8 +477,73 @@ def create_pdf(output_path, projects):
         without_repos_table.setStyle(table_header_style)
         elements.append(without_repos_table)
 
-    # Footer
+    # Footer for page 1
     elements.append(Spacer(1, 0.3*inch))
+    elements.append(Paragraph('If this tool saves you time: Venmo @ctreada', footer_style))
+
+    # ==========================================================================
+    # PAGE 2: Achievements & Next Steps
+    # ==========================================================================
+    elements.append(PageBreak())
+
+    # Page 2 Header
+    elements.append(Paragraph('<b>Project Details: Achievements & Next Steps</b>', title_style))
+    elements.append(Spacer(1, 0.2*inch))
+
+    # Styles for page 2
+    project_name_style = ParagraphStyle(
+        'ProjectName', parent=styles['Heading3'],
+        fontSize=11, textColor=colors.HexColor('#2C3E50'),
+        spaceBefore=8, spaceAfter=2
+    )
+    label_style = ParagraphStyle(
+        'Label', parent=styles['Normal'],
+        fontSize=8, textColor=colors.HexColor('#7F8C8D'),
+        spaceBefore=2, spaceAfter=1
+    )
+    item_style = ParagraphStyle(
+        'Item', parent=styles['Normal'],
+        fontSize=8, textColor=colors.HexColor('#2C3E50'),
+        leftIndent=10, spaceBefore=1, spaceAfter=1
+    )
+
+    all_projects = projects['with_repos'] + projects['without_repos']
+    all_projects.sort(key=lambda x: x['name'])
+
+    for p in all_projects:
+        # Project name with progress
+        progress = p.get('progress', 0)
+        progress_color = '#2ECC71' if progress > 75 else '#3498DB' if progress >= 50 else '#F1C40F' if progress >= 25 else '#E74C3C'
+        elements.append(Paragraph(
+            f"<b>{p['name']}</b> <font color='{progress_color}'>({progress}%)</font>",
+            project_name_style
+        ))
+
+        # Achievements
+        achievements = p.get('achievements', [])
+        if achievements:
+            elements.append(Paragraph('<b>Recent Achievements:</b>', label_style))
+            for item in achievements:
+                # Truncate long items
+                display_item = item[:80] + '...' if len(item) > 80 else item
+                elements.append(Paragraph(f"• {display_item}", item_style))
+        else:
+            elements.append(Paragraph('<b>Recent Achievements:</b> <i>None recorded</i>', label_style))
+
+        # Next Steps
+        next_steps = p.get('next_steps', [])
+        if next_steps:
+            elements.append(Paragraph('<b>Next Steps:</b>', label_style))
+            for item in next_steps:
+                display_item = item[:80] + '...' if len(item) > 80 else item
+                elements.append(Paragraph(f"• {display_item}", item_style))
+        else:
+            elements.append(Paragraph('<b>Next Steps:</b> <i>None recorded</i>', label_style))
+
+        elements.append(Spacer(1, 0.1*inch))
+
+    # Footer for page 2
+    elements.append(Spacer(1, 0.2*inch))
     elements.append(Paragraph('If this tool saves you time: Venmo @ctreada', footer_style))
 
     doc.build(elements)
