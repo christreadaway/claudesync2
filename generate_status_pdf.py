@@ -685,7 +685,7 @@ def main():
     # Generate PDF
     if args.output is None:
         today = datetime.now().strftime('%Y-%m-%d')
-        output_dir = os.path.expanduser('~/claude-project-sync')
+        output_dir = os.path.expanduser('~/claudesync2')
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f'status_report_{today}.pdf')
     else:

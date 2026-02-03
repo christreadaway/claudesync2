@@ -29,8 +29,8 @@ Mixing these creates confusion. Keep them separate.
 
 ```bash
 # Clone the repository
-git clone https://github.com/christreadaway/claudesync2.git ~/claude-project-sync
-cd ~/claude-project-sync
+git clone https://github.com/christreadaway/claudesync2.git ~/claudesync2
+cd ~/claudesync2
 
 # Install dependencies
 pip3 install -r requirements.txt --break-system-packages
@@ -59,7 +59,7 @@ python3 generate_status_pdf.py
 
 | When | What Happens | Where Status Lives |
 |------|--------------|-------------------|
-| 6:00 AM | PDF dashboard auto-generates | `~/claude-project-sync/status_report_*.pdf` |
+| 6:00 AM | PDF dashboard auto-generates | `~/claudesync2/status_report_*.pdf` |
 | During work | Claude Code updates status at session end | `PROJECT_STATUS.md` in project folder |
 | Switching to chat | User uploads PDF to Claude.ai | Claude.ai conversation |
 | During chat | Claude.ai reads status from PDF | Claude.ai conversation |
@@ -69,7 +69,7 @@ python3 generate_status_pdf.py
 ### Generate PDF Dashboard
 ```bash
 python3 generate_status_pdf.py
-open ~/claude-project-sync/status_report_$(date +%Y-%m-%d).pdf
+open ~/claudesync2/status_report_$(date +%Y-%m-%d).pdf
 ```
 
 ### Initialize a New Project

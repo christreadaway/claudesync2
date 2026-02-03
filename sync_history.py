@@ -172,7 +172,7 @@ def main():
                 if assets:
                     print(f"  {project_name}: {len(assets)} assets")
 
-        output_dir = os.path.expanduser('~/claude-project-sync')
+        output_dir = os.path.expanduser('~/claudesync2')
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, 'SHARED_ASSETS.md')
         generate_shared_assets_md(all_assets, output_path)

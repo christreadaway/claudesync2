@@ -100,7 +100,7 @@ Reads `git remote get-url origin` from each project directory and updates the `P
 
 | Output | Format | Description |
 |--------|--------|-------------|
-| PDF Dashboard | `~/claude-project-sync/status_report_YYYY-MM-DD.pdf` | Visual report for Claude.ai |
+| PDF Dashboard | `~/claudesync2/status_report_YYYY-MM-DD.pdf` | Visual report for Claude.ai |
 | Console output | Text | Progress and debug info |
 
 ### What the User Sees
@@ -314,7 +314,7 @@ numpy>=1.24.0
 ## File Structure
 
 ```
-~/claude-project-sync/
+~/claudesync2/
 ├── generate_status_pdf.py    # Main PDF generator
 ├── init_project_status.py    # Project initializer
 ├── update_repos.py           # Batch repo updater
@@ -333,8 +333,8 @@ numpy>=1.24.0
 
 ```bash
 # Clone and setup
-git clone https://github.com/christreadaway/claudesync2.git ~/claude-project-sync
-cd ~/claude-project-sync
+git clone https://github.com/christreadaway/claudesync2.git ~/claudesync2
+cd ~/claudesync2
 pip3 install -r requirements.txt
 
 # Initialize a project
@@ -347,7 +347,7 @@ python3 update_repos.py
 python3 generate_status_pdf.py
 
 # View PDF
-open ~/claude-project-sync/status_report_$(date +%Y-%m-%d).pdf
+open ~/claudesync2/status_report_$(date +%Y-%m-%d).pdf
 ```
 
 ---
