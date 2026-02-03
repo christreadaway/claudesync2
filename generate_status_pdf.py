@@ -236,9 +236,14 @@ def parse_project_status(file_path):
         return None
 
 
-def load_projects(scan_paths=None):
+def load_projects(scan_paths=None, verbose=False):
     """Load all projects from PROJECT_STATUS.md files."""
     status_files = find_project_status_files(scan_paths)
+
+    if verbose:
+        print(f"\nFound {len(status_files)} PROJECT_STATUS.md files:")
+        for sf in status_files:
+            print(f"  - {sf}")
 
     with_repos = []
     without_repos = []
@@ -246,6 +251,17 @@ def load_projects(scan_paths=None):
     for sf in status_files:
         project = parse_project_status(sf)
         if project:
+            if verbose:
+                features = project.get('features', [])
+                commits = project.get('recent_commits', [])
+                print(f"\n{project['name']}:")
+                print(f"  Features: {len(features)}")
+                for f in features[:2]:
+                    print(f"    - {f[:50]}...")
+                print(f"  Commits: {len(commits)}")
+                for c in commits[:2]:
+                    print(f"    - {c[:50]}...")
+
             if project['has_github_repo']:
                 with_repos.append(project)
             else:
@@ -640,11 +656,13 @@ def main():
                         help='Output path for the PDF')
     parser.add_argument('--scan-paths', nargs='+', default=None,
                         help='Paths to scan for PROJECT_STATUS.md files')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                        help='Show detailed debug output')
     args = parser.parse_args()
 
     # Load projects dynamically
     print("Scanning for PROJECT_STATUS.md files...")
-    projects = load_projects(args.scan_paths)
+    projects = load_projects(args.scan_paths, verbose=args.verbose)
 
     total = len(projects['with_repos']) + len(projects['without_repos'])
     if total == 0:
