@@ -132,9 +132,9 @@ def get_recent_commits(project_dir, max_commits=5):
     ]
 
     try:
-        # Scan ALL commits to find meaningful ones
+        # Scan ALL commits across ALL branches to find meaningful ones
         result = subprocess.run(
-            ['git', 'log', '--pretty=format:%s'],
+            ['git', 'log', '--all', '--pretty=format:%s'],
             cwd=project_dir,
             capture_output=True,
             text=True,
