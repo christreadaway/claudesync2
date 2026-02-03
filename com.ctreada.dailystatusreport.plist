@@ -9,7 +9,7 @@
     <array>
         <string>/bin/bash</string>
         <string>-c</string>
-        <string>$HOME/claude-project-sync/daily_status_report.sh</string>
+        <string>$HOME/claudesync2/daily_status_report.sh</string>
     </array>
 
     <key>StartCalendarInterval</key>

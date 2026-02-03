@@ -4,7 +4,7 @@
 # Called by launchd at 6:00 AM daily
 #
 
-SCRIPT_DIR="$HOME/claude-project-sync"
+SCRIPT_DIR="$HOME/claudesync2"
 LOG_FILE="$SCRIPT_DIR/daily_report.log"
 
 mkdir -p "$SCRIPT_DIR"
