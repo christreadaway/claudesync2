@@ -2,18 +2,17 @@
 """
 Claude Project Sync - PDF Dashboard Generator
 
-Generates a visual PDF report with charts showing all project progress.
-Run daily at 6am via launchd or manually as needed.
-
-NOTE: This generates STATUS data. It does NOT generate instructions.
-      Instructions belong in ~/.claude/CLAUDE.md (separate file).
+Generates a visual PDF report by SCANNING PROJECT_STATUS.md files.
+No hardcoded data - reads from your actual projects.
 
 Usage:
     python3 generate_status_pdf.py [--output /path/to/output.pdf]
+    python3 generate_status_pdf.py --scan-paths ~/projects ~/work
 """
 
 import argparse
 import os
+import re
 from datetime import datetime
 from io import BytesIO
 
@@ -33,129 +32,129 @@ from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 
 
 # =============================================================================
-# PROJECT DATA - Update this dictionary when projects change
+# DYNAMIC PROJECT SCANNING - Reads from PROJECT_STATUS.md files
 # =============================================================================
 
-PROJECTS = {
-    'with_repos': [
-        {
-            'name': 'claude-project-sync',
-            'repo': 'christreadaway/claude-project-sync',
-            'status': 'Built',
-            'progress': 90,
-            'category': 'Infrastructure'
-        },
-        {
-            'name': 'ParentPoint',
-            'repo': 'christreadaway/parentpoint',
-            'status': 'Beta Live',
-            'progress': 70,
-            'category': 'School'
-        },
-        {
-            'name': 'ParentPoint EDU',
-            'repo': 'christreadaway/parentpoint',
-            'status': 'Ready to Build',
-            'progress': 30,
-            'category': 'School'
-        },
-        {
-            'name': 'Ministry Fair App',
-            'repo': 'christreadaway/ministryfair',
-            'status': 'Needs Testing',
-            'progress': 60,
-            'category': 'Church'
-        },
-        {
-            'name': 'Desmond',
-            'repo': 'Public repo',
-            'status': 'v1 Shipped',
-            'progress': 100,
-            'category': 'Infrastructure'
-        },
-        {
-            'name': 'multiloc.ai',
-            'repo': 'christreadaway/polygraph',
-            'status': 'Domain Bought',
-            'progress': 40,
-            'category': 'Product'
-        },
-    ],
-    'without_repos': [
-        {
-            'name': 'Audioscribe',
-            'status': 'v1 Working',
-            'progress': 75,
-            'category': 'Product',
-            'action_needed': 'Push to GitHub after Patreon'
-        },
-        {
-            'name': 'eSPACE MCP',
-            'status': 'Complete',
-            'progress': 95,
-            'category': 'Infrastructure',
-            'action_needed': 'Create repo, document'
-        },
-        {
-            'name': 'RenWeb MCP',
-            'status': 'Planned',
-            'progress': 10,
-            'category': 'School',
-            'action_needed': 'Scope complete, build next'
-        },
-        {
-            'name': 'MinistryPlatform MCP',
-            'status': 'Planned',
-            'progress': 10,
-            'category': 'Church',
-            'action_needed': 'Scope complete, build next'
-        },
-        {
-            'name': 'Bluewave MCP',
-            'status': 'Planned',
-            'progress': 5,
-            'category': 'Church',
-            'action_needed': 'Requires SQL approach'
-        },
-        {
-            'name': 'Vaticoin',
-            'status': 'Shelved',
-            'progress': 25,
-            'category': 'Product',
-            'action_needed': 'Waiting on Vatican interest'
-        },
-        {
-            'name': "Kim's Site",
-            'status': 'Deadline-driven',
-            'progress': 50,
-            'category': 'Personal',
-            'action_needed': 'WordPress, no repo needed'
-        },
-    ]
+DEFAULT_SCAN_PATHS = [
+    os.path.expanduser('~'),  # Home directory (top level)
+]
+
+SKIP_DIRS = {
+    'node_modules', '.git', '__pycache__', 'venv', '.venv',
+    'dist', 'build', '.next', 'coverage', 'Library', '.Trash',
+    'Applications', 'Pictures', 'Music', 'Movies', 'Documents'
 }
 
-NON_PROJECT_ITEMS = {
-    'Content & Thought Leadership': [
-        {'name': 'Catholic MBA', 'status': 'GTM Built, Not Launched'},
-        {'name': 'Modernize Catholic', 'status': '2 Posts Done'},
-        {'name': 'Book Project', 'status': 'Not Started'},
-    ],
-    'Church Operations': [
-        {'name': 'Emergency Procedures', 'status': 'Complete'},
-        {'name': 'Facilities Onboarding', 'status': 'Complete'},
-        {'name': 'Sacramental Records', 'status': 'Concept Stage'},
-    ],
-    'School Operations': [
-        {'name': 'The Human Code Class', 'status': 'Teaching Active'},
-    ],
-    'Research & Personal': [
-        {'name': 'Randy', 'status': 'TBD'},
-        {'name': 'Ralph Wiggums', 'status': 'TBD'},
-        {'name': 'HEB Scraper', 'status': 'Blocked'},
-        {'name': '2026 Fitness Goals', 'status': 'Active'},
-    ],
-}
 
+def find_project_status_files(scan_paths=None, max_depth=2):
+    """Find all PROJECT_STATUS.md files in scan paths."""
+    if scan_paths is None:
+        scan_paths = DEFAULT_SCAN_PATHS
+
+    status_files = []
+
+    for base_path in scan_paths:
+        base_path = os.path.expanduser(base_path)
+        if not os.path.isdir(base_path):
+            continue
+
+        for root, dirs, files in os.walk(base_path):
+            # Calculate depth
+            depth = root.replace(base_path, '').count(os.sep)
+            if depth >= max_depth:
+                dirs[:] = []  # Don't go deeper
+                continue
+
+            # Skip certain directories
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+
+            if 'PROJECT_STATUS.md' in files:
+                status_files.append(os.path.join(root, 'PROJECT_STATUS.md'))
+
+    return status_files
+
+
+def parse_project_status(file_path):
+    """Parse a PROJECT_STATUS.md file and extract metadata."""
+    try:
+        with open(file_path, 'r') as f:
+            content = f.read()
+
+        project = {
+            'file_path': file_path,
+            'project_path': os.path.dirname(file_path),
+        }
+
+        # Extract project name
+        name_match = re.search(r'# PROJECT_STATUS:\s*(.+)', content)
+        if name_match:
+            project['name'] = name_match.group(1).strip()
+        else:
+            project['name'] = os.path.basename(os.path.dirname(file_path))
+
+        # Extract from metadata table
+        patterns = {
+            'repo': r'\*\*Repository\*\*\s*\|\s*(.+)',
+            'category': r'\*\*Category\*\*\s*\|\s*(.+)',
+            'progress': r'\*\*Progress\*\*\s*\|\s*(\d+)',
+            'status': r'\*\*Status\*\*\s*\|\s*(.+)',
+            'has_repo': r'\*\*Has GitHub Repo\*\*\s*\|\s*(.+)',
+        }
+
+        for key, pattern in patterns.items():
+            match = re.search(pattern, content)
+            if match:
+                value = match.group(1).strip()
+                if key == 'progress':
+                    project[key] = int(value)
+                else:
+                    project[key] = value
+
+        # Set defaults
+        project.setdefault('progress', 0)
+        project.setdefault('status', 'Unknown')
+        project.setdefault('category', 'Personal')
+        project.setdefault('repo', '')
+        project.setdefault('has_repo', 'No')
+
+        # Determine if has repo
+        has_repo = project.get('has_repo', 'No').lower()
+        project['has_github_repo'] = has_repo == 'yes' or (
+            project['repo'] and 'not' not in project['repo'].lower()
+        )
+
+        return project
+
+    except Exception as e:
+        print(f"Error parsing {file_path}: {e}")
+        return None
+
+
+def load_projects(scan_paths=None):
+    """Load all projects from PROJECT_STATUS.md files."""
+    status_files = find_project_status_files(scan_paths)
+
+    with_repos = []
+    without_repos = []
+
+    for sf in status_files:
+        project = parse_project_status(sf)
+        if project:
+            if project['has_github_repo']:
+                with_repos.append(project)
+            else:
+                without_repos.append(project)
+
+    # Sort by progress descending
+    with_repos.sort(key=lambda x: x['progress'], reverse=True)
+    without_repos.sort(key=lambda x: x['progress'], reverse=True)
+
+    return {'with_repos': with_repos, 'without_repos': without_repos}
+
+
+# =============================================================================
+# CHART GENERATION
+# =============================================================================
 
 def get_progress_color(progress):
     """Return color based on progress percentage."""
@@ -169,16 +168,32 @@ def get_progress_color(progress):
         return '#E74C3C'  # Red
 
 
-def create_progress_chart():
+def create_progress_chart(projects):
     """Create horizontal bar chart showing all project progress."""
-    all_projects = PROJECTS['with_repos'] + PROJECTS['without_repos']
+    all_projects = projects['with_repos'] + projects['without_repos']
+
+    if not all_projects:
+        # Return empty chart if no projects
+        fig, ax = plt.subplots(figsize=(6, 2))
+        ax.text(0.5, 0.5, 'No projects found.\nRun init_project_status.py to add projects.',
+                ha='center', va='center', fontsize=10)
+        ax.axis('off')
+        buf = BytesIO()
+        plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+        plt.close()
+        buf.seek(0)
+        return buf
+
     all_projects.sort(key=lambda x: x['progress'], reverse=True)
 
     names = [p['name'] for p in all_projects]
     progress = [p['progress'] for p in all_projects]
     colors_list = [get_progress_color(p) for p in progress]
 
-    fig, ax = plt.subplots(figsize=(6, 5))
+    # Adjust figure height based on number of projects
+    fig_height = max(3, min(8, len(names) * 0.4))
+    fig, ax = plt.subplots(figsize=(6, fig_height))
+
     y_pos = np.arange(len(names))
     bars = ax.barh(y_pos, progress, color=colors_list, height=0.7)
 
@@ -189,7 +204,7 @@ def create_progress_chart():
     ax.set_xlabel('Progress %', fontsize=9)
     ax.set_title('Project Progress Overview', fontsize=11, fontweight='bold')
 
-    for i, (bar, pct) in enumerate(zip(bars, progress)):
+    for bar, pct in zip(bars, progress):
         ax.text(bar.get_width() + 2, bar.get_y() + bar.get_height()/2,
                 f'{pct}%', va='center', fontsize=7)
 
@@ -201,18 +216,37 @@ def create_progress_chart():
     return buf
 
 
-def create_repo_pie_chart():
+def create_repo_pie_chart(projects):
     """Create pie chart showing GitHub repo status."""
-    has_repo = len(PROJECTS['with_repos'])
-    no_repo = len(PROJECTS['without_repos'])
+    has_repo = len(projects['with_repos'])
+    no_repo = len(projects['without_repos'])
+
+    if has_repo == 0 and no_repo == 0:
+        fig, ax = plt.subplots(figsize=(3.5, 3))
+        ax.text(0.5, 0.5, 'No projects', ha='center', va='center')
+        ax.axis('off')
+        buf = BytesIO()
+        plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+        plt.close()
+        buf.seek(0)
+        return buf
 
     fig, ax = plt.subplots(figsize=(3.5, 3))
     sizes = [has_repo, no_repo]
     labels = [f'Has Repo ({has_repo})', f'No Repo ({no_repo})']
     colors_list = ['#2ECC71', '#E74C3C']
-    explode = (0.05, 0)
 
-    ax.pie(sizes, explode=explode, labels=labels, colors=colors_list,
+    # Handle case where one is zero
+    if has_repo == 0:
+        sizes = [no_repo]
+        labels = [f'No Repo ({no_repo})']
+        colors_list = ['#E74C3C']
+    elif no_repo == 0:
+        sizes = [has_repo]
+        labels = [f'Has Repo ({has_repo})']
+        colors_list = ['#2ECC71']
+
+    ax.pie(sizes, labels=labels, colors=colors_list,
            autopct='%1.0f%%', shadow=False, startangle=90,
            textprops={'fontsize': 8})
     ax.set_title('GitHub Repo Status', fontsize=10, fontweight='bold')
@@ -225,12 +259,23 @@ def create_repo_pie_chart():
     return buf
 
 
-def create_category_chart():
+def create_category_chart(projects):
     """Create bar chart showing projects by category."""
-    all_projects = PROJECTS['with_repos'] + PROJECTS['without_repos']
+    all_projects = projects['with_repos'] + projects['without_repos']
+
+    if not all_projects:
+        fig, ax = plt.subplots(figsize=(3.5, 2.5))
+        ax.text(0.5, 0.5, 'No projects', ha='center', va='center')
+        ax.axis('off')
+        buf = BytesIO()
+        plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+        plt.close()
+        buf.seek(0)
+        return buf
+
     categories = {}
     for p in all_projects:
-        cat = p['category']
+        cat = p.get('category', 'Personal')
         categories[cat] = categories.get(cat, 0) + 1
 
     sorted_cats = sorted(categories.items(), key=lambda x: x[1], reverse=True)
@@ -269,7 +314,11 @@ def create_category_chart():
     return buf
 
 
-def create_pdf(output_path):
+# =============================================================================
+# PDF GENERATION
+# =============================================================================
+
+def create_pdf(output_path, projects):
     """Generate the complete PDF dashboard."""
     doc = SimpleDocTemplate(
         output_path,
@@ -283,45 +332,26 @@ def create_pdf(output_path):
     styles = getSampleStyleSheet()
 
     title_style = ParagraphStyle(
-        'CustomTitle',
-        parent=styles['Heading1'],
-        fontSize=20,
-        textColor=colors.HexColor('#2C3E50'),
-        spaceAfter=6
+        'CustomTitle', parent=styles['Heading1'],
+        fontSize=20, textColor=colors.HexColor('#2C3E50'), spaceAfter=6
     )
-
     subtitle_style = ParagraphStyle(
-        'Subtitle',
-        parent=styles['Normal'],
-        fontSize=10,
-        textColor=colors.HexColor('#7F8C8D'),
-        alignment=TA_RIGHT
+        'Subtitle', parent=styles['Normal'],
+        fontSize=10, textColor=colors.HexColor('#7F8C8D'), alignment=TA_RIGHT
     )
-
     section_style = ParagraphStyle(
-        'Section',
-        parent=styles['Heading2'],
-        fontSize=14,
-        textColor=colors.HexColor('#2C3E50'),
-        spaceBefore=12,
-        spaceAfter=6
+        'Section', parent=styles['Heading2'],
+        fontSize=14, textColor=colors.HexColor('#2C3E50'),
+        spaceBefore=12, spaceAfter=6
     )
-
     subsection_style = ParagraphStyle(
-        'Subsection',
-        parent=styles['Heading3'],
-        fontSize=11,
-        textColor=colors.HexColor('#34495E'),
-        spaceBefore=8,
-        spaceAfter=4
+        'Subsection', parent=styles['Heading3'],
+        fontSize=11, textColor=colors.HexColor('#34495E'),
+        spaceBefore=8, spaceAfter=4
     )
-
     footer_style = ParagraphStyle(
-        'Footer',
-        parent=styles['Normal'],
-        fontSize=9,
-        textColor=colors.HexColor('#95A5A6'),
-        alignment=TA_CENTER
+        'Footer', parent=styles['Normal'],
+        fontSize=9, textColor=colors.HexColor('#95A5A6'), alignment=TA_CENTER
     )
 
     elements = []
@@ -329,10 +359,11 @@ def create_pdf(output_path):
     # Header
     now = datetime.now()
     date_str = now.strftime('%B %d, %Y at %I:%M %p')
+    total_projects = len(projects['with_repos']) + len(projects['without_repos'])
 
     header_data = [
         [Paragraph('<b>Project Status Report</b>', title_style),
-         Paragraph(f'Generated: {date_str}', subtitle_style)]
+         Paragraph(f'Generated: {date_str}<br/>{total_projects} projects found', subtitle_style)]
     ]
     header_table = Table(header_data, colWidths=[4*inch, 3*inch])
     header_table.setStyle(TableStyle([
@@ -346,11 +377,13 @@ def create_pdf(output_path):
     elements.append(Spacer(1, 0.1*inch))
 
     # Charts
-    progress_chart = create_progress_chart()
-    pie_chart = create_repo_pie_chart()
-    category_chart = create_category_chart()
+    progress_chart = create_progress_chart(projects)
+    pie_chart = create_repo_pie_chart(projects)
+    category_chart = create_category_chart(projects)
 
-    progress_img = Image(progress_chart, width=4*inch, height=3.3*inch)
+    # Adjust chart height based on project count
+    chart_height = max(3, min(5, total_projects * 0.35)) * inch
+    progress_img = Image(progress_chart, width=4*inch, height=chart_height)
     pie_img = Image(pie_chart, width=2.8*inch, height=2.2*inch)
     category_img = Image(category_chart, width=2.8*inch, height=1.8*inch)
 
@@ -382,39 +415,37 @@ def create_pdf(output_path):
     ])
 
     # Projects WITH repos
-    elements.append(Paragraph('Projects with GitHub Repositories', subsection_style))
-    with_repos_data = [['Project', 'Repository', 'Status', 'Progress']]
-    for p in PROJECTS['with_repos']:
-        with_repos_data.append([p['name'], p['repo'], p['status'], f"{p['progress']}%"])
+    if projects['with_repos']:
+        elements.append(Paragraph('Projects with GitHub Repositories', subsection_style))
+        with_repos_data = [['Project', 'Repository', 'Status', 'Progress']]
+        for p in projects['with_repos']:
+            with_repos_data.append([
+                p['name'],
+                p.get('repo', ''),
+                p.get('status', ''),
+                f"{p.get('progress', 0)}%"
+            ])
 
-    with_repos_table = Table(with_repos_data, colWidths=[1.5*inch, 2.5*inch, 1.3*inch, 0.8*inch])
-    with_repos_table.setStyle(table_header_style)
-    elements.append(with_repos_table)
-    elements.append(Spacer(1, 0.15*inch))
+        with_repos_table = Table(with_repos_data, colWidths=[1.5*inch, 2.5*inch, 1.3*inch, 0.8*inch])
+        with_repos_table.setStyle(table_header_style)
+        elements.append(with_repos_table)
+        elements.append(Spacer(1, 0.15*inch))
 
     # Projects WITHOUT repos
-    elements.append(Paragraph('Projects WITHOUT GitHub Repositories', subsection_style))
-    without_repos_data = [['Project', 'Status', 'Progress', 'Action Needed']]
-    for p in PROJECTS['without_repos']:
-        without_repos_data.append([p['name'], p['status'], f"{p['progress']}%", p.get('action_needed', '')])
+    if projects['without_repos']:
+        elements.append(Paragraph('Projects WITHOUT GitHub Repositories', subsection_style))
+        without_repos_data = [['Project', 'Status', 'Progress', 'Category']]
+        for p in projects['without_repos']:
+            without_repos_data.append([
+                p['name'],
+                p.get('status', ''),
+                f"{p.get('progress', 0)}%",
+                p.get('category', 'Personal')
+            ])
 
-    without_repos_table = Table(without_repos_data, colWidths=[1.5*inch, 1.2*inch, 0.8*inch, 2.6*inch])
-    without_repos_table.setStyle(table_header_style)
-    elements.append(without_repos_table)
-
-    # Page 2: Non-project items
-    elements.append(PageBreak())
-    elements.append(Paragraph('Non-Project Items', section_style))
-
-    for category, items in NON_PROJECT_ITEMS.items():
-        elements.append(Paragraph(category, subsection_style))
-        items_data = [['Item', 'Status']]
-        for item in items:
-            items_data.append([item['name'], item['status']])
-        items_table = Table(items_data, colWidths=[3*inch, 3*inch])
-        items_table.setStyle(table_header_style)
-        elements.append(items_table)
-        elements.append(Spacer(1, 0.1*inch))
+        without_repos_table = Table(without_repos_data, colWidths=[1.8*inch, 1.5*inch, 0.8*inch, 2*inch])
+        without_repos_table.setStyle(table_header_style)
+        elements.append(without_repos_table)
 
     # Footer
     elements.append(Spacer(1, 0.3*inch))
@@ -422,14 +453,34 @@ def create_pdf(output_path):
 
     doc.build(elements)
     print(f"PDF generated: {output_path}")
+    print(f"  Projects with repos: {len(projects['with_repos'])}")
+    print(f"  Projects without repos: {len(projects['without_repos'])}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Generate Claude Project Sync PDF dashboard')
+    parser = argparse.ArgumentParser(
+        description='Generate PDF dashboard from PROJECT_STATUS.md files'
+    )
     parser.add_argument('--output', '-o', default=None,
                         help='Output path for the PDF')
+    parser.add_argument('--scan-paths', nargs='+', default=None,
+                        help='Paths to scan for PROJECT_STATUS.md files')
     args = parser.parse_args()
 
+    # Load projects dynamically
+    print("Scanning for PROJECT_STATUS.md files...")
+    projects = load_projects(args.scan_paths)
+
+    total = len(projects['with_repos']) + len(projects['without_repos'])
+    if total == 0:
+        print("\nNo PROJECT_STATUS.md files found!")
+        print("Run init_project_status.py to create status files for your projects:")
+        print("  python3 init_project_status.py ~/myproject --name 'My Project' --category School")
+        return
+
+    print(f"Found {total} projects")
+
+    # Generate PDF
     if args.output is None:
         today = datetime.now().strftime('%Y-%m-%d')
         output_dir = os.path.expanduser('~/claude-project-sync')
@@ -438,7 +489,7 @@ def main():
     else:
         output_path = os.path.expanduser(args.output)
 
-    create_pdf(output_path)
+    create_pdf(output_path, projects)
 
 
 if __name__ == '__main__':
