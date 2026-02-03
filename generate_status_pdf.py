@@ -101,12 +101,33 @@ def extract_list_items(content, header_pattern, max_items=3):
     return items
 
 
-def get_recent_commits(project_dir, max_commits=3):
-    """Get recent commit messages from git log."""
+def get_recent_commits(project_dir, max_commits=5):
+    """Get recent meaningful commit messages from git log."""
     import subprocess
+
+    # Garbage commit patterns to skip
+    skip_patterns = [
+        'add files via upload',
+        'initial commit',
+        'first commit',
+        'init commit',
+        'create readme',
+        'update readme',
+        'delete ',
+        'remove ',
+        'merge branch',
+        'merge pull request',
+        'wip',
+        'fix typo',
+        'minor fix',
+        'small fix',
+        'quick fix',
+    ]
+
     try:
+        # Get more commits than needed to filter
         result = subprocess.run(
-            ['git', 'log', '--oneline', '-n', str(max_commits), '--pretty=format:%s'],
+            ['git', 'log', '--oneline', '-n', '20', '--pretty=format:%s'],
             cwd=project_dir,
             capture_output=True,
             text=True,
@@ -116,10 +137,18 @@ def get_recent_commits(project_dir, max_commits=3):
             commits = []
             for line in result.stdout.strip().split('\n'):
                 line = line.strip()
-                # Skip merge commits and very short messages
-                if line and not line.startswith('Merge') and len(line) > 10:
+                if not line or len(line) < 15:
+                    continue
+
+                # Check against skip patterns
+                line_lower = line.lower()
+                is_garbage = any(pattern in line_lower for pattern in skip_patterns)
+
+                if not is_garbage:
                     commits.append(line)
-            return commits[:max_commits]
+                    if len(commits) >= max_commits:
+                        break
+            return commits
     except Exception:
         pass
     return []
