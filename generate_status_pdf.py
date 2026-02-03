@@ -87,11 +87,42 @@ def extract_list_items(content, header_pattern, max_items=3):
             if line.startswith('-') or line.startswith('*'):
                 item = line.lstrip('-* ').strip()
                 # Skip placeholder items
-                if item and not item.startswith('(') and item != '(Nothing yet)':
+                placeholder_words = ['describe', 'nothing yet', 'none yet', 'tbd', 'todo',
+                                     'list ', 'add ', 'initial project', 'project structure']
+                is_placeholder = (
+                    item.startswith('(') or
+                    any(pw in item.lower() for pw in placeholder_words) or
+                    len(item) < 10
+                )
+                if item and not is_placeholder:
                     items.append(item)
                     if len(items) >= max_items:
                         break
     return items
+
+
+def get_recent_commits(project_dir, max_commits=3):
+    """Get recent commit messages from git log."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['git', 'log', '--oneline', '-n', str(max_commits), '--pretty=format:%s'],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            commits = []
+            for line in result.stdout.strip().split('\n'):
+                line = line.strip()
+                # Skip merge commits and very short messages
+                if line and not line.startswith('Merge') and len(line) > 10:
+                    commits.append(line)
+            return commits[:max_commits]
+    except Exception:
+        pass
+    return []
 
 
 def parse_project_status(file_path):
@@ -143,15 +174,24 @@ def parse_project_status(file_path):
             project['repo'] and 'not' not in project['repo'].lower()
         )
 
-        # Extract achievements (What was built + What was figured out)
-        achievements = []
-        achievements.extend(extract_list_items(content, r'\*\*What was built:\*\*', 3))
-        if len(achievements) < 3:
-            achievements.extend(extract_list_items(content, r'\*\*What was figured out:\*\*', 3 - len(achievements)))
-        project['achievements'] = achievements[:3]
+        # Extract features from "What's Working" section (most specific)
+        features = extract_list_items(content, r"### What's Working", 5)
 
-        # Extract next steps
-        project['next_steps'] = extract_list_items(content, r'\*\*Next time:\*\*', 3)
+        # If not enough, try "What was built" entries
+        if len(features) < 3:
+            features.extend(extract_list_items(content, r'\*\*What was built:\*\*', 3))
+
+        # Dedupe while preserving order
+        seen = set()
+        unique_features = []
+        for f in features:
+            if f.lower() not in seen:
+                seen.add(f.lower())
+                unique_features.append(f)
+        project['features'] = unique_features[:5]
+
+        # Get recent commits for additional context
+        project['recent_commits'] = get_recent_commits(project['project_path'], 3)
 
         return project
 
@@ -482,29 +522,34 @@ def create_pdf(output_path, projects):
     elements.append(Paragraph('If this tool saves you time: Venmo @ctreada', footer_style))
 
     # ==========================================================================
-    # PAGE 2: Achievements & Next Steps
+    # PAGE 2: Features Built
     # ==========================================================================
     elements.append(PageBreak())
 
     # Page 2 Header
-    elements.append(Paragraph('<b>Project Details: Achievements & Next Steps</b>', title_style))
+    elements.append(Paragraph('<b>Project Details: Features Built</b>', title_style))
     elements.append(Spacer(1, 0.2*inch))
 
     # Styles for page 2
     project_name_style = ParagraphStyle(
         'ProjectName', parent=styles['Heading3'],
         fontSize=11, textColor=colors.HexColor('#2C3E50'),
-        spaceBefore=8, spaceAfter=2
+        spaceBefore=10, spaceAfter=2
     )
     label_style = ParagraphStyle(
         'Label', parent=styles['Normal'],
-        fontSize=8, textColor=colors.HexColor('#7F8C8D'),
+        fontSize=8, textColor=colors.HexColor('#7F8C8D'), fontName='Helvetica-Bold',
         spaceBefore=2, spaceAfter=1
     )
     item_style = ParagraphStyle(
         'Item', parent=styles['Normal'],
         fontSize=8, textColor=colors.HexColor('#2C3E50'),
         leftIndent=10, spaceBefore=1, spaceAfter=1
+    )
+    commit_style = ParagraphStyle(
+        'Commit', parent=styles['Normal'],
+        fontSize=7, textColor=colors.HexColor('#7F8C8D'),
+        leftIndent=10, spaceBefore=1, spaceAfter=1, fontName='Courier'
     )
 
     all_projects = projects['with_repos'] + projects['without_repos']
@@ -519,28 +564,27 @@ def create_pdf(output_path, projects):
             project_name_style
         ))
 
-        # Achievements
-        achievements = p.get('achievements', [])
-        if achievements:
-            elements.append(Paragraph('<b>Recent Achievements:</b>', label_style))
-            for item in achievements:
-                # Truncate long items
-                display_item = item[:80] + '...' if len(item) > 80 else item
+        # Features (from What's Working)
+        features = p.get('features', [])
+        if features:
+            elements.append(Paragraph('Working Features:', label_style))
+            for item in features:
+                display_item = item[:100] + '...' if len(item) > 100 else item
                 elements.append(Paragraph(f"• {display_item}", item_style))
-        else:
-            elements.append(Paragraph('<b>Recent Achievements:</b> <i>None recorded</i>', label_style))
 
-        # Next Steps
-        next_steps = p.get('next_steps', [])
-        if next_steps:
-            elements.append(Paragraph('<b>Next Steps:</b>', label_style))
-            for item in next_steps:
-                display_item = item[:80] + '...' if len(item) > 80 else item
-                elements.append(Paragraph(f"• {display_item}", item_style))
-        else:
-            elements.append(Paragraph('<b>Next Steps:</b> <i>None recorded</i>', label_style))
+        # Recent commits
+        commits = p.get('recent_commits', [])
+        if commits:
+            elements.append(Paragraph('Recent Work:', label_style))
+            for commit in commits:
+                display_commit = commit[:90] + '...' if len(commit) > 90 else commit
+                elements.append(Paragraph(f"› {display_commit}", commit_style))
 
-        elements.append(Spacer(1, 0.1*inch))
+        # If nothing found, show minimal placeholder
+        if not features and not commits:
+            elements.append(Paragraph('<i>No features documented yet</i>', item_style))
+
+        elements.append(Spacer(1, 0.08*inch))
 
     # Footer for page 2
     elements.append(Spacer(1, 0.2*inch))
