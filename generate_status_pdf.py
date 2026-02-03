@@ -122,16 +122,23 @@ def get_recent_commits(project_dir, max_commits=5):
         'minor fix',
         'small fix',
         'quick fix',
+        'bump version',
+        'update dependencies',
+        'update package',
+        'lint fix',
+        'format code',
+        'cleanup',
+        'refactor',
     ]
 
     try:
-        # Get more commits than needed to filter
+        # Scan ALL commits to find meaningful ones
         result = subprocess.run(
-            ['git', 'log', '--oneline', '-n', '20', '--pretty=format:%s'],
+            ['git', 'log', '--pretty=format:%s'],
             cwd=project_dir,
             capture_output=True,
             text=True,
-            timeout=5
+            timeout=10
         )
         if result.returncode == 0:
             commits = []
