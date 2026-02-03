@@ -227,7 +227,7 @@ def parse_project_status(file_path):
         project['features'] = unique_features[:5]
 
         # Get recent commits for additional context
-        project['recent_commits'] = get_recent_commits(project['project_path'], 3)
+        project['recent_commits'] = get_recent_commits(project['project_path'], 5)
 
         return project
 
@@ -574,69 +574,78 @@ def create_pdf(output_path, projects):
     elements.append(Paragraph('If this tool saves you time: Venmo @ctreada', footer_style))
 
     # ==========================================================================
-    # PAGE 2: Features Built
+    # PAGE 2+: Features Built (2-column layout)
     # ==========================================================================
     elements.append(PageBreak())
 
     # Page 2 Header
-    elements.append(Paragraph('<b>Project Details: Features Built</b>', title_style))
-    elements.append(Spacer(1, 0.2*inch))
+    elements.append(Paragraph('<b>Project Details: Recent Work</b>', title_style))
+    elements.append(Spacer(1, 0.15*inch))
 
     # Styles for page 2
     project_name_style = ParagraphStyle(
         'ProjectName', parent=styles['Heading3'],
-        fontSize=11, textColor=colors.HexColor('#2C3E50'),
-        spaceBefore=10, spaceAfter=2
-    )
-    label_style = ParagraphStyle(
-        'Label', parent=styles['Normal'],
-        fontSize=8, textColor=colors.HexColor('#7F8C8D'), fontName='Helvetica-Bold',
-        spaceBefore=2, spaceAfter=1
-    )
-    item_style = ParagraphStyle(
-        'Item', parent=styles['Normal'],
-        fontSize=8, textColor=colors.HexColor('#2C3E50'),
-        leftIndent=10, spaceBefore=1, spaceAfter=1
+        fontSize=9, textColor=colors.HexColor('#2C3E50'),
+        spaceBefore=4, spaceAfter=2
     )
     commit_style = ParagraphStyle(
         'Commit', parent=styles['Normal'],
-        fontSize=7, textColor=colors.HexColor('#7F8C8D'),
-        leftIndent=10, spaceBefore=1, spaceAfter=1, fontName='Courier'
+        fontSize=6, textColor=colors.HexColor('#555555'),
+        leftIndent=5, spaceBefore=1, spaceAfter=1
+    )
+    no_data_style = ParagraphStyle(
+        'NoData', parent=styles['Normal'],
+        fontSize=6, textColor=colors.HexColor('#999999'),
+        leftIndent=5, fontName='Helvetica-Oblique'
     )
 
     all_projects = projects['with_repos'] + projects['without_repos']
     all_projects.sort(key=lambda x: x['name'])
 
-    for p in all_projects:
-        # Project name with progress
+    def build_project_cell(p):
+        """Build content for a single project cell."""
+        cell_content = []
         progress = p.get('progress', 0)
         progress_color = '#2ECC71' if progress > 75 else '#3498DB' if progress >= 50 else '#F1C40F' if progress >= 25 else '#E74C3C'
-        elements.append(Paragraph(
+        cell_content.append(Paragraph(
             f"<b>{p['name']}</b> <font color='{progress_color}'>({progress}%)</font>",
             project_name_style
         ))
 
-        # Features (from What's Working)
-        features = p.get('features', [])
-        if features:
-            elements.append(Paragraph('Working Features:', label_style))
-            for item in features:
-                display_item = item[:100] + '...' if len(item) > 100 else item
-                elements.append(Paragraph(f"• {display_item}", item_style))
-
-        # Recent commits
         commits = p.get('recent_commits', [])
         if commits:
-            elements.append(Paragraph('Recent Work:', label_style))
-            for commit in commits:
-                display_commit = commit[:90] + '...' if len(commit) > 90 else commit
-                elements.append(Paragraph(f"› {display_commit}", commit_style))
+            for commit in commits[:5]:
+                display_commit = commit[:55] + '...' if len(commit) > 55 else commit
+                cell_content.append(Paragraph(f"› {display_commit}", commit_style))
+        else:
+            cell_content.append(Paragraph('No recent work logged', no_data_style))
 
-        # If nothing found, show minimal placeholder
-        if not features and not commits:
-            elements.append(Paragraph('<i>No features documented yet</i>', item_style))
+        return cell_content
 
-        elements.append(Spacer(1, 0.08*inch))
+    # Build 2-column table
+    col_width = 3.7 * inch
+    row_data = []
+
+    for i in range(0, len(all_projects), 2):
+        left_cell = build_project_cell(all_projects[i])
+        if i + 1 < len(all_projects):
+            right_cell = build_project_cell(all_projects[i + 1])
+        else:
+            right_cell = []
+
+        row_data.append([left_cell, right_cell])
+
+    # Create table with project pairs
+    for row in row_data:
+        row_table = Table([[row[0], row[1]]], colWidths=[col_width, col_width])
+        row_table.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('LEFTPADDING', (0, 0), (-1, -1), 4),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 4),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ]))
+        elements.append(row_table)
 
     # Footer for page 2
     elements.append(Spacer(1, 0.2*inch))
