@@ -1,71 +1,72 @@
 # Claude Code Global Instructions
 
-> **IMPORTANT:** This file contains INSTRUCTIONS for Claude Code behavior.
-> It does NOT contain project status, progress, or history.
-> Status data belongs in PROJECT_STATUS.md files and PDF reports.
+This file provides global instructions for Claude Code sessions. Place it at `~/.claude/CLAUDE.md`.
 
 ---
 
-## End-of-Session Protocol
+## Project Sync Protocol
 
-When the user says "goodbye", "thanks", "done", "wrap up", or "sync":
+At the **end of every session**, update the project's `PROJECT_STATUS.md` file with:
 
-1. **Update PROJECT_STATUS.md** in the current project directory with:
-   - What was built
-   - What was figured out
-   - Still stuck on
-   - Next time
+1. **What was built** - Concrete deliverables from this session
+2. **What was figured out** - Decisions made, problems solved
+3. **Still stuck on** - Remaining challenges
+4. **Next time** - What to work on next session
 
-2. **Remind the user** to sync with Claude.ai:
-   ```
-   To sync with Claude.ai:
-   - Upload the PDF: ~/claude-project-sync/status_report_*.pdf
-   - Or copy/paste: cat PROJECT_STATUS.md | pbcopy
-   ```
-
----
-
-## Status Update Format
-
-When updating PROJECT_STATUS.md, append this format:
+### Update Format
 
 ```markdown
-### [YYYY-MM-DD]
+### [Today's Date]
 
 **What was built:**
-- [specific files, features in plain language]
+- [List items]
 
 **What was figured out:**
-- [problems solved, decisions made]
+- [List items]
 
 **Still stuck on:**
-- [blockers, unknowns]
+- [List items]
 
 **Next time:**
-- [recommended next actions]
+- [List items]
 ```
-
----
-
-## Writing Style
-
-Write like a project manager, not a changelog:
-
-**Good:**
-> Got notifications working. Parents now get alerts when teachers post. Debugged Android permissions - manifest was missing RECEIVE_BOOT_COMPLETED.
-
-**Bad:**
-> Implemented NotificationService.sendPush(). Fixed FCM config.
 
 ---
 
 ## Reusable Asset Detection
 
-When creating components that could be reused, note them in PROJECT_STATUS.md:
+When creating new components that could be reused, flag them in the project's `PROJECT_STATUS.md` under the "Reusable Assets" section:
 
 | Asset | Description | Tags |
 |-------|-------------|------|
-| `src/auth/oauth.js` | Google OAuth flow | auth, google |
+| `path/to/file.js` | Brief description | tag1, tag2 |
+
+Common reusable patterns to watch for:
+- Authentication flows
+- Notification systems
+- UI component libraries
+- API integration patterns
+- Database utilities
+
+---
+
+## Progress Tracking
+
+Update the **Progress** percentage in the metadata section when significant milestones are reached:
+- 0-25%: Planning/Setup
+- 25-50%: Core development
+- 50-75%: Feature complete, testing
+- 75-90%: Bug fixes, polish
+- 90-100%: Shipping/Shipped
+
+---
+
+## Sync Reminders
+
+- The user syncs between Claude Code and Claude.ai via PDF upload or copy/paste
+- Keep status updates concise but complete
+- Write in natural language, not jargon
+- Include enough context that Claude.ai can understand without access to the codebase
 
 ---
 
@@ -73,27 +74,18 @@ When creating components that could be reused, note them in PROJECT_STATUS.md:
 
 ```bash
 # Generate PDF dashboard
-python3 ~/claude-project-sync/generate_status_pdf.py
+python ~/claude-project-sync/generate_status_pdf.py
 
 # Initialize new project status
-python3 ~/claude-project-sync/init_project_status.py /path --name "Name" --category School
+python ~/claude-project-sync/init_project_status.py /path/to/project --name "Name" --category Category
 
 # Copy status to clipboard (Mac)
 cat PROJECT_STATUS.md | pbcopy
 
-# Build asset registry
-python3 ~/claude-project-sync/sync_history.py --assets
+# Rebuild asset registry
+python ~/claude-project-sync/sync_history.py --assets
 ```
 
 ---
 
-## Key Reminders
-
-1. **Claude.ai cannot write local files** - user must save manually
-2. **Status goes in PROJECT_STATUS.md** - not in this file
-3. **PDF is the visual dashboard** - upload to Claude.ai for context
-
----
-
 *Claude Project Sync - github.com/christreadaway/claudesync2*
-*If this saves you time: Venmo @ctreada*
