@@ -2,22 +2,58 @@
 """
 Claude Project Sync - Batch Repository Updater
 
-Updates PROJECT_STATUS.md files with GitHub repository information.
+Auto-detects GitHub repos from local git directories and updates PROJECT_STATUS.md files.
 
 Usage:
-    # Interactive mode - prompts for each project missing repo info
+    # Auto-detect and update all projects
     python3 update_repos.py
 
-    # Update a specific project
-    python3 update_repos.py --project "Project Name" --repo "user/repo"
-
-    # List all projects and their repo status
+    # List all projects and their status
     python3 update_repos.py --list
+
+    # Update a specific project manually
+    python3 update_repos.py --project "Project Name" --repo "user/repo"
 """
 
 import argparse
 import os
 import re
+import subprocess
+
+
+def get_git_remote(project_dir):
+    """Get the GitHub repo from git remote origin."""
+    try:
+        result = subprocess.run(
+            ['git', 'remote', 'get-url', 'origin'],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            url = result.stdout.strip()
+            # Parse various formats:
+            # https://github.com/user/repo.git
+            # git@github.com:user/repo.git
+            # https://github.com/user/repo
+
+            if 'github.com' in url:
+                # Remove .git suffix
+                url = url.rstrip('.git')
+
+                if url.startswith('git@'):
+                    # git@github.com:user/repo
+                    match = re.search(r'github\.com[:/](.+/.+)', url)
+                else:
+                    # https://github.com/user/repo
+                    match = re.search(r'github\.com/(.+/.+)', url)
+
+                if match:
+                    return match.group(1)
+    except Exception:
+        pass
+    return None
 
 
 def find_project_status_files(max_depth=2):
@@ -108,32 +144,42 @@ def list_projects(projects):
     print(f"Total: {len(projects)} projects ({with_repo} with repos, {without_repo} without)")
 
 
-def interactive_update(projects):
-    """Interactively update projects missing repo info."""
+def auto_update(projects):
+    """Auto-detect repos from git remotes and update PROJECT_STATUS.md files."""
     missing_repo = [p for p in projects if not p['has_real_repo']]
 
     if not missing_repo:
-        print("\nAll projects have repository information!")
+        print("\nAll projects already have repository information!")
         return
 
-    print(f"\n{len(missing_repo)} projects are missing repository info:\n")
+    print(f"\n{len(missing_repo)} projects missing repository info. Auto-detecting...\n")
 
-    for i, p in enumerate(missing_repo, 1):
-        print(f"\n[{i}/{len(missing_repo)}] {p['name']}")
-        print(f"    Path: {os.path.dirname(p['file_path'])}")
+    updated = 0
+    not_found = []
 
-        repo = input("    Enter repo (user/repo) or press Enter to skip: ").strip()
+    for p in missing_repo:
+        project_dir = os.path.dirname(p['file_path'])
+        repo = get_git_remote(project_dir)
 
         if repo:
-            if '/' not in repo:
-                repo = f"christreadaway/{repo}"
-
             update_repo_in_file(p['file_path'], repo)
-            print(f"    Updated: {repo}")
+            print(f"  Updated: {p['name']} -> {repo}")
+            updated += 1
         else:
-            print("    Skipped")
+            not_found.append(p['name'])
 
-    print("\nDone! Run 'python3 generate_status_pdf.py' to regenerate the PDF.")
+    print(f"\n{'='*50}")
+    print(f"Updated: {updated} projects")
+
+    if not_found:
+        print(f"\nNo git remote found for {len(not_found)} projects:")
+        for name in not_found:
+            print(f"  - {name}")
+        print("\nTo manually update these, use:")
+        print("  python3 update_repos.py --project \"Name\" --repo \"user/repo\"")
+
+    if updated > 0:
+        print("\nRun 'python3 generate_status_pdf.py' to regenerate the PDF.")
 
 
 def update_single_project(projects, project_name, repo_name):
@@ -176,7 +222,7 @@ def main():
     elif args.project or args.repo:
         print("Error: --project and --repo must be used together")
     else:
-        interactive_update(projects)
+        auto_update(projects)
 
 
 if __name__ == '__main__':
