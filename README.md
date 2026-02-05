@@ -115,6 +115,4 @@ The PDF will generate daily at 6:00 AM (or when Mac wakes if asleep).
 
 Open Source
 
----
 
-*If this tool saves you time: Venmo @ctreada*
