@@ -195,7 +195,9 @@ def update_single_project(projects, project_name, repo_name):
 
     p = matches[0]
     if '/' not in repo_name:
-        repo_name = f"christreadaway/{repo_name}"
+        # Assume user's GitHub username as prefix if not provided
+        print(f"Note: No username prefix provided. Use 'user/repo' format for accuracy.")
+        repo_name = repo_name
 
     update_repo_in_file(p['file_path'], repo_name)
     print(f"Updated {p['name']}: {repo_name}")

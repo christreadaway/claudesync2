@@ -41,7 +41,7 @@
 ### 2026-02-04 (Claude.ai Chat — Sacramental Records Integration)
 **Source:** Claude.ai project chat, current session
 - Integrated full Sacramental Records Product Spec v1.0 into PROJECT_STATUS_SacramentalRecords.md on Mac via MCP
-- Spec built from parish secretary interview at St. Theresa Catholic Church (Austin, TX) + physical register page analysis
+- Spec built from parish secretary interview at [Parish Name] Catholic Church ([City], [State]) + physical register page analysis
 - Also integrated Google Drive strategy docs (blockchain/Vaticoin vision for v3-v5)
 - Upgraded sacramental records status from "Planning 10%" to "Spec Complete — Ready for Development 25%"
 - Confirmed all 13 projects have substantive PROJECT_STATUS.md files on Mac (Claude Code had already created them)

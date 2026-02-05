@@ -19,7 +19,7 @@
 
 ## Project Summary
 
-A digital sacramental records management system for Catholic parishes. Replaces the manual, handwritten record-keeping process across five physical register books with a single integrated digital platform. Built from a real interview with a parish secretary at St. Theresa Catholic Church in Austin, TX, plus analysis of 8 physical register book pages (Baptismal, First Communion, Confirmation, Marriage).
+A digital sacramental records management system for Catholic parishes. Replaces the manual, handwritten record-keeping process across five physical register books with a single integrated digital platform. Built from a real interview with a parish secretary at [Parish Name] Catholic Church in [City], [State], plus analysis of 8 physical register book pages (Baptismal, First Communion, Confirmation, Marriage).
 
 The product spec (v1.0) is complete and ready for a developer to build from. No personal names or data from the registers were captured — images were used only to map column structures.
 
@@ -343,7 +343,7 @@ Commemorative coins with crypto pairing. Confraternity of Church Modernization a
 ## Progress Log
 
 ### 2026-02-04
-Integrated Product Spec v1.0 and Project Summary from Claude.ai Sacramental Records project into this status file. Spec was built from parish secretary interview at St. Theresa (Austin, TX) + physical register analysis. Status upgraded from "Planning" to "Spec Complete — Ready for Development." Progress bumped to 25%.
+Integrated Product Spec v1.0 and Project Summary from Claude.ai Sacramental Records project into this status file. Spec was built from parish secretary interview at [Parish Name] ([City], [State]) + physical register analysis. Status upgraded from "Planning" to "Spec Complete — Ready for Development." Progress bumped to 25%.
 
 ### 2026-02-04 (earlier)
 Compiled all existing project documentation from Google Drive into this PROJECT_STATUS file. Established that v1 is the basic records management system (no blockchain), and that Vaticoin/blockchain is the v4/v5 future layer.
