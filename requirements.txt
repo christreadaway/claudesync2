@@ -1,0 +1,6 @@
+# Claude Project Sync - Python Dependencies
+# Install: pip3 install -r requirements.txt --break-system-packages
+
+reportlab>=4.0.0
+matplotlib>=3.7.0
+numpy>=1.24.0
