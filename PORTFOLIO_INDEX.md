@@ -23,8 +23,8 @@
 | 2 | Catholic Events | christreadaway/catholicevents | Church | Yes | ~/catholicevents/PROJECT_STATUS.md |
 | 3 | Claude Project Sync (v1) | christreadaway/claude-project-sync | Infrastructure | Yes | ~/claude-project-sync/PROJECT_STATUS.md |
 | 4 | Claude Project Sync v2 | christreadaway/claudesync2 | Infrastructure | Yes | [PROJECT_STATUS.md](PROJECT_STATUS.md) |
-| 5 | Desmond | christreadaway/desmond | Personal | Yes | ~/desmond/PROJECT_STATUS.md |
-| 6 | GrantFinder AI | christreadaway/grantfinder | Product | Yes | ~/grantfinder/PROJECT_STATUS.md |
+| 5 | Desmond | christreadaway/desmond | Infrastructure | Yes | ~/desmond/PROJECT_STATUS.md |
+| 6 | GrantFinder AI | christreadaway/grantfinder | School | Yes | ~/grantfinder/PROJECT_STATUS.md |
 | 7 | iMessage Dashboard v6 | christreadaway/imessage-dashboard-v6 | Personal | Yes | ~/imessage-dashboard-v6/PROJECT_STATUS.md |
 | 8 | Ministry Fair App | christreadaway/ministryfair | Church | Yes | ~/ministryfair/PROJECT_STATUS.md |
 | 9 | MinistryLife | christreadaway/ministrylife | Church | Yes | ~/ministrylife/PROJECT_STATUS.md |
@@ -43,6 +43,7 @@
 |---------|------------|--------------|
 | Claude Project Sync (v1) | claude-project-sync | Original sync tool |
 | Claude Project Sync v2 | claudesync2 | PDF dashboard, MCP integration, multi-platform |
+| Desmond | desmond | v1 shipped, iMessage exporter, Windows/Android support |
 
 ### Church / Catholic Tech
 | Project | Repository | Key Features |
@@ -55,6 +56,7 @@
 ### School
 | Project | Repository | Key Features |
 |---------|------------|--------------|
+| GrantFinder AI | grantfinder | Product spec v2.4, grant discovery, probability scoring |
 | ParentPoint | parentpoint | Family profiles, custody schedules, Alexa integration |
 | ParentPoint EDU | parentpointedu | Firebase, Google sign-in, academic calendar, AI chat |
 
@@ -62,13 +64,11 @@
 | Project | Repository | Key Features |
 |---------|------------|--------------|
 | audioscribe | audioscribe | WhisperX transcription, Gradio web UI, speaker diarization |
-| GrantFinder AI | grantfinder | Product spec v2.4, grant discovery, probability scoring |
 | multiloc.ai (Polygraph) | polygraph | Domain purchased, full spec document, job scheduler |
 
 ### Personal
 | Project | Repository | Key Features |
 |---------|------------|--------------|
-| Desmond | desmond | v1 shipped, iMessage exporter, Windows/Android support |
 | iMessage Dashboard v6 | imessage-dashboard-v6 | Package dependencies defined |
 | Personal CRM | personalcrm | GitHub repo created, README exists |
 
