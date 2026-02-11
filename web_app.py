@@ -21,6 +21,7 @@ Usage:
 
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -516,6 +517,7 @@ def _project_activity_breakdown(projects):
             'status': p.get('status', ''),
             'category': p.get('category_group', ''),
             'last_worked': p.get('last_worked', ''),
+            'dev_state': p.get('dev_state', ''),
             'total_events': len(timeline),
             'commits': commits,
             'chats': chats,
@@ -631,6 +633,16 @@ DASHBOARD_HTML = """
         .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: 600; }
         .badge-blocker { background: #fce4ec; color: #c62828; }
         .badge-eol { background: var(--eol-bg); color: var(--eol-text); border: 1px solid var(--eol-border); }
+        .badge-dev-state { font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 10px; margin-left: 6px; }
+        .badge-dev-test { background: #FDF2E9; color: #E67E22; border: 1px solid #E67E22; }
+        .badge-dev-refine { background: #EBF5FB; color: #3498DB; border: 1px solid #3498DB; }
+        .badge-dev-continue { background: #FDEDEC; color: #E74C3C; border: 1px solid #E74C3C; }
+        [data-theme="dark"] .badge-dev-test { background: #3d2e00; color: #F5B041; border-color: #E67E22; }
+        [data-theme="dark"] .badge-dev-refine { background: #0d2137; color: #5DADE2; border-color: #3498DB; }
+        [data-theme="dark"] .badge-dev-continue { background: #3d0d0d; color: #F1948A; border-color: #E74C3C; }
+        .project-card.dev-test { border-left: 3px solid #E67E22; }
+        .project-card.dev-refine { border-left: 3px solid #3498DB; }
+        .project-card.dev-continue { border-left: 3px solid #E74C3C; }
 
         /* Recent decisions + loose ends on cards */
         .card-section { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border-light); }
@@ -768,11 +780,12 @@ DASHBOARD_HTML = """
         <!-- Project Cards -->
         <div class="projects-grid" id="projectsGrid">
             {% for p in project_cards %}
-            <div class="project-card {% if p.eol_reason %}eol{% endif %} {% if p.name in ignored_names %}hidden{% endif %}"
-                 data-name="{{ p.name }}" data-eol="{{ 'yes' if p.eol_reason else 'no' }}" data-ignored="{{ 'yes' if p.name in ignored_names else 'no' }}"
+            <div class="project-card {% if p.eol_reason %}eol{% endif %} {% if p.name in ignored_names %}hidden{% endif %} {% if p.dev_state %}dev-{{ p.dev_state|lower }}{% endif %}"
+                 data-name="{{ p.name }}" data-eol="{{ 'yes' if p.eol_reason else 'no' }}" data-ignored="{{ 'yes' if p.name in ignored_names else 'no' }}" data-devstate="{{ p.dev_state|lower }}"
                  onclick="if (!event.target.closest('.btn-ignore, .btn-restore')) window.location='/project/{{ loop.index0 }}'">
                 <div class="name">
                     {{ p.name }}
+                    {% if p.dev_state %}<span class="badge badge-dev-state badge-dev-{{ p.dev_state|lower }}">{{ p.dev_state }}</span>{% endif %}
                     {% if p.eol_reason %}<span class="badge badge-eol">Possibly EOL</span>{% endif %}
                 </div>
                 <div class="meta">{{ p.category }} &middot; {{ p.status }}{% if p.last_worked %} &middot; Last: {{ p.last_worked }}{% endif %}</div>
@@ -1235,7 +1248,10 @@ PROJECT_DETAIL_HTML = """
     <div class="container">
         <!-- Project Header -->
         <div class="header-card">
-            <div class="name">{{ project.name }}</div>
+            <div class="name">
+                {{ project.name }}
+                {% if project.dev_state %}<span class="badge badge-dev-state badge-dev-{{ project.dev_state|lower }}">{{ project.dev_state }}</span>{% endif %}
+            </div>
             <div class="meta">
                 {{ project.category_group }}
                 &middot; {{ project.status }}
@@ -1246,6 +1262,19 @@ PROJECT_DETAIL_HTML = """
                 <div class="progress-fill" style="width: {{ project.progress }}%; background: {{ '#2ECC71' if project.progress > 75 else '#3498DB' if project.progress >= 50 else '#F1C40F' if project.progress >= 25 else '#E74C3C' }};"></div>
             </div>
             <div class="meta">{{ project.progress }}% complete</div>
+            <div style="margin-top:10px; display:flex; align-items:center; gap:10px;">
+                <label style="font-size:12px; font-weight:600; color:var(--text-secondary); margin:0;">Dev State:</label>
+                <select id="devStateSelect" onchange="setDevState(this.value)" style="padding:4px 8px; border-radius:5px; border:1px solid var(--input-border); background:var(--input-bg); color:var(--text); font-size:12px;">
+                    <option value="" {{ 'selected' if not project.dev_state }}>-- none --</option>
+                    <option value="test" {{ 'selected' if project.dev_state == 'test' }}>test</option>
+                    <option value="refine" {{ 'selected' if project.dev_state == 'refine' }}>refine</option>
+                    <option value="continue" {{ 'selected' if project.dev_state == 'continue' }}>continue</option>
+                </select>
+                {% if ai_configured %}
+                <button class="btn-ai" style="font-size:11px; padding:4px 10px;" onclick="aiAssessState()">AI Assess</button>
+                {% endif %}
+                <span id="devStateStatus" style="font-size:11px; color:var(--text-muted);"></span>
+            </div>
             {% if project.narrative %}
             <div class="summary" id="projectDescription">{{ project.narrative }}</div>
             {% endif %}
@@ -1358,6 +1387,42 @@ PROJECT_DETAIL_HTML = """
                 result.textContent = 'Failed to connect to AI API';
                 result.style.display = 'block';
             });
+        }
+
+        function setDevState(state) {
+            var status = document.getElementById('devStateStatus');
+            status.textContent = 'Saving...';
+            fetch('/api/dev-state/{{ project_idx }}', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({dev_state: state})
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                if (data.ok) {
+                    status.textContent = 'Saved';
+                    setTimeout(function() { status.textContent = ''; }, 2000);
+                } else {
+                    status.textContent = 'Error: ' + (data.error || 'unknown');
+                }
+            })
+            .catch(function() { status.textContent = 'Failed to save'; });
+        }
+
+        function aiAssessState() {
+            var status = document.getElementById('devStateStatus');
+            status.textContent = 'AI assessing...';
+            fetch('/api/ai-assess-state/{{ project_idx }}', { method: 'POST' })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                if (data.dev_state) {
+                    document.getElementById('devStateSelect').value = data.dev_state;
+                    status.textContent = 'AI suggests: ' + data.dev_state + (data.reason ? ' — ' + data.reason : '');
+                } else if (data.error) {
+                    status.textContent = 'Error: ' + data.error;
+                }
+            })
+            .catch(function() { status.textContent = 'AI assessment failed'; });
         }
     </script>
 </body>
@@ -1661,6 +1726,101 @@ def api_ai_config():
         config['model'] = data['model']
     _save_ai_config(config)
     return jsonify({'ok': True})
+
+
+@app.route('/api/dev-state/<int:idx>', methods=['POST'])
+def api_set_dev_state(idx):
+    """Set the dev state for a project and persist it to PROJECT_STATUS.md."""
+    projects = _project_cache.get('projects', [])
+    if idx < 0 or idx >= len(projects):
+        return jsonify({'error': 'Project not found'}), 404
+
+    data = request.get_json(force=True)
+    new_state = data.get('dev_state', '').strip().lower()
+    project = projects[idx]
+    project['dev_state'] = new_state
+
+    # Also persist to the PROJECT_STATUS.md file if we have it
+    status_file = project.get('file_path', '')
+    if status_file and os.path.isfile(status_file):
+        try:
+            with open(status_file, 'r') as f:
+                content = f.read()
+            # Try to update existing Dev State line
+            updated = re.sub(
+                r'(\*\*Dev State\*\*\s*\|\s*)(.+)',
+                r'\g<1>' + (new_state or '[test/refine/continue]'),
+                content
+            )
+            if updated == content and new_state:
+                # No existing Dev State line — insert after Status line
+                updated = re.sub(
+                    r'(\| \*\*Status\*\* \|[^\n]+\n)',
+                    r'\1| **Dev State** | ' + new_state + ' |\n',
+                    content
+                )
+            if updated != content:
+                with open(status_file, 'w') as f:
+                    f.write(updated)
+        except Exception as e:
+            print(f"Warning: could not persist dev_state to {status_file}: {e}")
+
+    return jsonify({'ok': True, 'dev_state': new_state})
+
+
+@app.route('/api/ai-assess-state/<int:idx>', methods=['POST'])
+def api_ai_assess_state(idx):
+    """Use AI to assess which dev state a project should be in."""
+    projects = _project_cache.get('projects', [])
+    if idx < 0 or idx >= len(projects):
+        return jsonify({'error': 'Project not found'}), 404
+
+    project = projects[idx]
+
+    timeline_text = '\n'.join(
+        f"- {e.get('date', '?')}: [{e.get('source', '')}] {e.get('text', '')}"
+        for e in project.get('timeline', [])[:20]
+    )
+    threads_text = '\n'.join(
+        f"- [{t}] {txt}" for t, txt in project.get('open_threads', [])
+    )
+
+    prompt = f"""Classify this project into exactly ONE development state. The three states are:
+
+- test: Code was pushed with no evidence of testing. Needs testing before proceeding.
+- refine: The user seems satisfied or is riffing/exploring. Chat was abandoned in a good state. Refinement work.
+- continue: Active testing is ongoing but not resolved. Work in progress that needs continuation.
+
+Project: {project.get('name', '')}
+Status: {project.get('status', 'Unknown')} ({project.get('progress', 0)}% complete)
+
+Recent activity:
+{timeline_text or 'No recent activity'}
+
+Open threads:
+{threads_text or 'None'}
+
+Reply with ONLY a JSON object like: {{"state": "test", "reason": "brief reason"}}
+No other text."""
+
+    result = _call_ai(prompt, max_tokens=100)
+    if result:
+        try:
+            parsed = json.loads(result.strip())
+            state = parsed.get('state', '').lower()
+            reason = parsed.get('reason', '')
+            if state in ('test', 'refine', 'continue'):
+                project['dev_state'] = state
+                return jsonify({'dev_state': state, 'reason': reason})
+        except (json.JSONDecodeError, AttributeError):
+            # Try to extract state from freeform response
+            result_lower = result.lower()
+            for s in ('test', 'refine', 'continue'):
+                if s in result_lower:
+                    project['dev_state'] = s
+                    return jsonify({'dev_state': s, 'reason': result.strip()})
+        return jsonify({'error': 'AI returned unexpected format: ' + result[:200]})
+    return jsonify({'error': 'AI not configured or call failed. Check AI Settings.'})
 
 
 @app.route('/upload', methods=['POST'])
