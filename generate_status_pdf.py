@@ -20,6 +20,7 @@ Usage:
 import argparse
 import os
 import re
+import subprocess
 import zipfile
 from datetime import datetime
 
@@ -462,6 +463,57 @@ def extract_next_steps(content):
     return items
 
 
+def get_dated_commits(project_dir, max_commits=50):
+    """Get recent commits with dates from a git repo.
+
+    Returns list of dicts: [{'date': 'YYYY-MM-DD', 'source': 'Git Commit', 'text': '...'}, ...]
+    """
+    commits = []
+    git_dir = os.path.join(project_dir, '.git')
+    if not os.path.isdir(git_dir):
+        return commits
+
+    skip_patterns = [
+        'add files via upload', 'initial commit', 'first commit',
+        'merge branch', 'merge pull request', 'wip', 'fix typo',
+        'minor fix', 'bump version', 'update dependencies', 'lint fix',
+        'format code', 'cleanup',
+    ]
+
+    try:
+        result = subprocess.run(
+            ['git', 'log', '--all', '--pretty=format:%ad|%s', '--date=short'],
+            cwd=project_dir, capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().split('\n'):
+                if '|' not in line:
+                    continue
+                date_str, message = line.split('|', 1)
+                date_str = date_str.strip()
+                message = message.strip()
+
+                if not message or len(message) < 10:
+                    continue
+
+                msg_lower = message.lower()
+                if any(p in msg_lower for p in skip_patterns):
+                    continue
+
+                commits.append({
+                    'date': date_str,
+                    'source': 'Git Commit',
+                    'text': message,
+                })
+
+                if len(commits) >= max_commits:
+                    break
+    except Exception:
+        pass
+
+    return commits
+
+
 def parse_project_status(file_path):
     """Parse a PROJECT_STATUS.md file and extract all metadata including temporal data."""
     try:
@@ -561,6 +613,12 @@ def parse_project_status(file_path):
         # Progress log (temporal data!)
         project['progress_log'] = extract_progress_log(content)
 
+        # Git commits (temporal data!)
+        if project['has_github_repo']:
+            project['git_commits'] = get_dated_commits(project['project_path'])
+        else:
+            project['git_commits'] = []
+
         # Narrative and timeline built later after chat history is loaded
         project['narrative'] = ''
         project['timeline'] = []
@@ -622,6 +680,10 @@ def build_project_timeline(project, chat_data=None):
 
     # Add progress log entries
     for entry in project.get('progress_log', []):
+        timeline.append(entry.copy())
+
+    # Add git commits
+    for entry in project.get('git_commits', []):
         timeline.append(entry.copy())
 
     # Add chat-sourced entries
