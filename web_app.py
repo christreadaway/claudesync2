@@ -1449,7 +1449,7 @@ LIST_VIEW_HTML = """
         <button class="btn-theme" onclick="toggleTheme()"><span id="themeIcon"></span></button>
     </div>
     <div class="container">
-        {{ content }}
+        {{ content|safe }}
         <footer><a href="/">&larr; Back to Dashboard</a></footer>
     </div>
     <script>
