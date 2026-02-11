@@ -11,8 +11,10 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import re
+import sys
 from datetime import datetime
 from io import BytesIO
 
@@ -29,6 +31,142 @@ from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
 )
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+
+
+# =============================================================================
+# STATUS LINE - Non-blocking progress display
+# =============================================================================
+
+class StatusLine:
+    """Displays a single updating status line at the top of output."""
+
+    def __init__(self, enabled=True):
+        self.enabled = enabled and sys.stdout.isatty()
+        self._last_len = 0
+
+    def update(self, message):
+        """Update the status line in-place."""
+        if not self.enabled:
+            return
+        # Clear previous line, write new one
+        clear = '\r' + ' ' * self._last_len + '\r'
+        line = f"\033[36m⟳ {message}\033[0m"
+        sys.stdout.write(clear + line)
+        sys.stdout.flush()
+        self._last_len = len(message) + 4  # account for prefix
+
+    def done(self, message=None):
+        """Clear status line and optionally print a final message."""
+        if self.enabled:
+            sys.stdout.write('\r' + ' ' * self._last_len + '\r')
+            sys.stdout.flush()
+        if message:
+            print(message)
+
+status = StatusLine()
+
+
+# =============================================================================
+# CONFIG & API KEY MANAGEMENT
+# =============================================================================
+
+CONFIG_PATH = os.path.expanduser('~/.claudesync/config.json')
+
+
+def load_config():
+    """Load config from ~/.claudesync/config.json."""
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
+    return {}
+
+
+def save_config(config):
+    """Save config to ~/.claudesync/config.json."""
+    config_dir = os.path.dirname(CONFIG_PATH)
+    os.makedirs(config_dir, exist_ok=True)
+    with open(CONFIG_PATH, 'w') as f:
+        json.dump(config, f, indent=2)
+
+
+def get_api_key(config=None):
+    """Get Claude API key from config, env, or prompt the user."""
+    if config is None:
+        config = load_config()
+
+    # 1. Check config file
+    key = config.get('anthropic_api_key', '')
+    if key:
+        return key
+
+    # 2. Check environment variable
+    key = os.environ.get('ANTHROPIC_API_KEY', '')
+    if key:
+        return key
+
+    # 3. Prompt the user
+    if sys.stdout.isatty():
+        print("\n\033[33m⚠  No Claude API key found.\033[0m")
+        print("An API key is needed for AI-powered project state assessment.")
+        print("Get one at: https://console.anthropic.com/settings/keys\n")
+        key = input("Enter your Anthropic API key (or press Enter to skip): ").strip()
+        if key:
+            config['anthropic_api_key'] = key
+            save_config(config)
+            print("\033[32m✓ API key saved to ~/.claudesync/config.json\033[0m\n")
+            return key
+        else:
+            print("Skipping AI state assessment. You can set it later with:")
+            print("  export ANTHROPIC_API_KEY=sk-ant-...")
+            print(f"  or add it to {CONFIG_PATH}\n")
+
+    return None
+
+
+# =============================================================================
+# DEV STATE DEFINITIONS
+# =============================================================================
+
+# Default development states with color codes
+DEV_STATES = {
+    'test': {
+        'label': 'Test',
+        'description': 'Push with no evidence of testing',
+        'color': '#E67E22',    # Orange
+        'pdf_color': '#E67E22',
+    },
+    'refine': {
+        'label': 'Refine',
+        'description': 'Chat abandoned — user satisfied or riffing on features',
+        'color': '#3498DB',    # Blue
+        'pdf_color': '#3498DB',
+    },
+    'continue': {
+        'label': 'Continue',
+        'description': 'Tests ongoing, not fully resolved',
+        'color': '#E74C3C',    # Red
+        'pdf_color': '#E74C3C',
+    },
+}
+
+
+def load_custom_states():
+    """Load user-defined custom dev states from config."""
+    config = load_config()
+    custom = config.get('custom_dev_states', {})
+    merged = dict(DEV_STATES)
+    merged.update(custom)
+    return merged
+
+
+def get_dev_state_color(state_key):
+    """Get the color for a dev state."""
+    all_states = load_custom_states()
+    state = all_states.get(state_key, {})
+    return state.get('color', '#95A5A6')  # Gray fallback
 
 
 # =============================================================================
@@ -58,6 +196,8 @@ def find_project_status_files(scan_paths=None, max_depth=2):
         if not os.path.isdir(base_path):
             continue
 
+        status.update(f"Scanning {base_path} for projects...")
+
         for root, dirs, files in os.walk(base_path):
             # Calculate depth
             depth = root.replace(base_path, '').count(os.sep)
@@ -69,6 +209,8 @@ def find_project_status_files(scan_paths=None, max_depth=2):
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
 
             if 'PROJECT_STATUS.md' in files:
+                project_name = os.path.basename(root)
+                status.update(f"Found project: {project_name}")
                 status_files.append(os.path.join(root, 'PROJECT_STATUS.md'))
 
     return status_files
@@ -179,6 +321,8 @@ def parse_project_status(file_path):
         else:
             project['name'] = os.path.basename(os.path.dirname(file_path))
 
+        status.update(f"Parsing: {project['name']}")
+
         # Extract from metadata table
         patterns = {
             'repo': r'\*\*Repository\*\*\s*\|\s*(.+)',
@@ -186,6 +330,7 @@ def parse_project_status(file_path):
             'progress': r'\*\*Progress\*\*\s*\|\s*(\d+)',
             'status': r'\*\*Status\*\*\s*\|\s*(.+)',
             'has_repo': r'\*\*Has GitHub Repo\*\*\s*\|\s*(.+)',
+            'dev_state': r'\*\*Dev State\*\*\s*\|\s*(.+)',
         }
 
         for key, pattern in patterns.items():
@@ -203,6 +348,7 @@ def parse_project_status(file_path):
         project.setdefault('category', 'Personal')
         project.setdefault('repo', '')
         project.setdefault('has_repo', 'No')
+        project.setdefault('dev_state', '')
 
         # Determine if has repo
         has_repo = project.get('has_repo', 'No').lower()
@@ -227,7 +373,11 @@ def parse_project_status(file_path):
         project['features'] = unique_features[:5]
 
         # Get recent commits for additional context
+        status.update(f"Reading commits: {project['name']}")
         project['recent_commits'] = get_recent_commits(project['project_path'], 5)
+
+        # Store raw content for AI assessment
+        project['_raw_content'] = content
 
         return project
 
@@ -240,6 +390,7 @@ def load_projects(scan_paths=None, verbose=False):
     """Load all projects from PROJECT_STATUS.md files."""
     status_files = find_project_status_files(scan_paths)
 
+    status.done()
     if verbose:
         print(f"\nFound {len(status_files)} PROJECT_STATUS.md files:")
         for sf in status_files:
@@ -248,10 +399,13 @@ def load_projects(scan_paths=None, verbose=False):
     with_repos = []
     without_repos = []
 
-    for sf in status_files:
+    total = len(status_files)
+    for i, sf in enumerate(status_files, 1):
+        status.update(f"Loading project {i}/{total}: {os.path.basename(os.path.dirname(sf))}")
         project = parse_project_status(sf)
         if project:
             if verbose:
+                status.done()
                 features = project.get('features', [])
                 commits = project.get('recent_commits', [])
                 print(f"\n{project['name']}:")
@@ -267,11 +421,107 @@ def load_projects(scan_paths=None, verbose=False):
             else:
                 without_repos.append(project)
 
+    status.done()
+
     # Sort by progress descending
     with_repos.sort(key=lambda x: x['progress'], reverse=True)
     without_repos.sort(key=lambda x: x['progress'], reverse=True)
 
     return {'with_repos': with_repos, 'without_repos': without_repos}
+
+
+# =============================================================================
+# AI-POWERED STATE ASSESSMENT
+# =============================================================================
+
+def assess_dev_state(project, api_key):
+    """Use Claude API to assess which dev state a project is in."""
+    try:
+        import urllib.request
+        import urllib.error
+
+        name = project['name']
+        commits = project.get('recent_commits', [])
+        progress = project.get('progress', 0)
+        current_status = project.get('status', 'Unknown')
+        raw = project.get('_raw_content', '')
+
+        # Extract progress log section for context
+        log_match = re.search(r'## Progress Log\s*\n(.*)', raw, re.DOTALL)
+        progress_log = log_match.group(1)[:2000] if log_match else ''
+
+        all_states = load_custom_states()
+        state_descriptions = '\n'.join(
+            f'- "{key}": {s["description"]}'
+            for key, s in all_states.items()
+        )
+
+        prompt = f"""Analyze this project and determine its current development state.
+
+Project: {name}
+Progress: {progress}%
+Status: {current_status}
+Recent commits: {json.dumps(commits[:5])}
+
+Progress log (excerpt):
+{progress_log[:1500]}
+
+Available states:
+{state_descriptions}
+
+Based on the evidence, which single state best describes this project? Look for:
+- "test": Recent pushes but no mention of tests passing, no test results in logs
+- "refine": Work appears paused, user seems satisfied or moved on to feature ideas
+- "continue": Active testing, unresolved bugs, ongoing test cycles
+
+Respond with ONLY the state key (e.g. "test", "refine", or "continue"). Nothing else."""
+
+        body = json.dumps({
+            'model': 'claude-sonnet-4-20250514',
+            'max_tokens': 20,
+            'messages': [{'role': 'user', 'content': prompt}]
+        }).encode('utf-8')
+
+        req = urllib.request.Request(
+            'https://api.anthropic.com/v1/messages',
+            data=body,
+            headers={
+                'Content-Type': 'application/json',
+                'x-api-key': api_key,
+                'anthropic-version': '2023-06-01',
+            },
+            method='POST'
+        )
+
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode('utf-8'))
+            answer = result['content'][0]['text'].strip().lower().strip('"\'')
+            # Validate it's a known state
+            if answer in all_states:
+                return answer
+
+    except Exception:
+        pass
+
+    return None
+
+
+def assess_all_projects(projects, api_key):
+    """Run AI assessment on all projects that don't have a dev_state set."""
+    all_projects = projects['with_repos'] + projects['without_repos']
+    needs_assessment = [p for p in all_projects if not p.get('dev_state')]
+
+    if not needs_assessment:
+        return
+
+    total = len(needs_assessment)
+    for i, project in enumerate(needs_assessment, 1):
+        status.update(f"AI assessing state {i}/{total}: {project['name']}")
+        state = assess_dev_state(project, api_key)
+        if state:
+            project['dev_state'] = state
+
+    status.done()
 
 
 # =============================================================================
@@ -308,7 +558,16 @@ def create_progress_chart(projects):
 
     all_projects.sort(key=lambda x: x['progress'], reverse=True)
 
-    names = [p['name'] for p in all_projects]
+    # Build labels with dev state indicators
+    all_states = load_custom_states()
+    names = []
+    for p in all_projects:
+        ds = p.get('dev_state', '')
+        label = p['name']
+        if ds and ds in all_states:
+            label = f"{p['name']}  [{all_states[ds]['label']}]"
+        names.append(label)
+
     progress = [p['progress'] for p in all_projects]
     colors_list = [get_progress_color(p) for p in progress]
 
@@ -318,6 +577,13 @@ def create_progress_chart(projects):
 
     y_pos = np.arange(len(names))
     bars = ax.barh(y_pos, progress, color=colors_list, height=0.7)
+
+    # Add dev state color dots on the left side
+    for i, p in enumerate(all_projects):
+        ds = p.get('dev_state', '')
+        if ds:
+            dot_color = get_dev_state_color(ds)
+            ax.plot(-2, i, 'o', color=dot_color, markersize=6, clip_on=False)
 
     ax.set_yticks(y_pos)
     ax.set_yticklabels(names, fontsize=8)
@@ -536,19 +802,33 @@ def create_pdf(output_path, projects):
         ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F8F9FA')]),
     ])
 
+    # Dev state style for colored labels
+    all_states = load_custom_states()
+
+    def dev_state_cell(project):
+        """Return a colored Paragraph for the dev state."""
+        ds = project.get('dev_state', '')
+        if ds and ds in all_states:
+            state_info = all_states[ds]
+            color = state_info['color']
+            label = state_info['label']
+            return Paragraph(f"<font color='{color}'><b>{label}</b></font>", styles['Normal'])
+        return Paragraph('<font color="#CCCCCC">—</font>', styles['Normal'])
+
     # Projects WITH repos
     if projects['with_repos']:
         elements.append(Paragraph('Projects with GitHub Repositories', subsection_style))
-        with_repos_data = [['Project', 'Repository', 'Status', 'Progress']]
+        with_repos_data = [['Project', 'Repository', 'Status', 'State', 'Progress']]
         for p in projects['with_repos']:
             with_repos_data.append([
                 p['name'],
                 p.get('repo', ''),
                 p.get('status', ''),
+                dev_state_cell(p),
                 f"{p.get('progress', 0)}%"
             ])
 
-        with_repos_table = Table(with_repos_data, colWidths=[1.5*inch, 2.5*inch, 1.3*inch, 0.8*inch])
+        with_repos_table = Table(with_repos_data, colWidths=[1.3*inch, 2.2*inch, 1.0*inch, 0.8*inch, 0.8*inch])
         with_repos_table.setStyle(table_header_style)
         elements.append(with_repos_table)
         elements.append(Spacer(1, 0.15*inch))
@@ -556,16 +836,17 @@ def create_pdf(output_path, projects):
     # Projects WITHOUT repos
     if projects['without_repos']:
         elements.append(Paragraph('Projects WITHOUT GitHub Repositories', subsection_style))
-        without_repos_data = [['Project', 'Status', 'Progress', 'Category']]
+        without_repos_data = [['Project', 'Status', 'State', 'Progress', 'Category']]
         for p in projects['without_repos']:
             without_repos_data.append([
                 p['name'],
                 p.get('status', ''),
+                dev_state_cell(p),
                 f"{p.get('progress', 0)}%",
                 p.get('category', 'Personal')
             ])
 
-        without_repos_table = Table(without_repos_data, colWidths=[1.8*inch, 1.5*inch, 0.8*inch, 2*inch])
+        without_repos_table = Table(without_repos_data, colWidths=[1.5*inch, 1.2*inch, 0.8*inch, 0.7*inch, 1.9*inch])
         without_repos_table.setStyle(table_header_style)
         elements.append(without_repos_table)
 
@@ -602,15 +883,31 @@ def create_pdf(output_path, projects):
     all_projects = projects['with_repos'] + projects['without_repos']
     all_projects.sort(key=lambda x: x['name'])
 
+    dev_state_tag_style = ParagraphStyle(
+        'DevStateTag', parent=styles['Normal'],
+        fontSize=6, spaceBefore=0, spaceAfter=2
+    )
+
     def build_project_cell(p):
         """Build content for a single project cell."""
         cell_content = []
         progress = p.get('progress', 0)
         progress_color = '#2ECC71' if progress > 75 else '#3498DB' if progress >= 50 else '#F1C40F' if progress >= 25 else '#E74C3C'
-        cell_content.append(Paragraph(
-            f"<b>{p['name']}</b> <font color='{progress_color}'>({progress}%)</font>",
-            project_name_style
-        ))
+
+        # Project name with progress
+        name_line = f"<b>{p['name']}</b> <font color='{progress_color}'>({progress}%)</font>"
+        cell_content.append(Paragraph(name_line, project_name_style))
+
+        # Dev state tag
+        ds = p.get('dev_state', '')
+        if ds and ds in all_states:
+            state_info = all_states[ds]
+            sc = state_info['color']
+            sl = state_info['label']
+            cell_content.append(Paragraph(
+                f"<font color='{sc}'>[{sl}]</font> <font color='#999999' size='5'>{state_info['description']}</font>",
+                dev_state_tag_style
+            ))
 
         commits = p.get('recent_commits', [])
         if commits:
@@ -667,10 +964,23 @@ def main():
                         help='Paths to scan for PROJECT_STATUS.md files')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Show detailed debug output')
+    parser.add_argument('--no-ai', action='store_true',
+                        help='Skip AI-powered state assessment')
+    parser.add_argument('--set-key', default=None, metavar='API_KEY',
+                        help='Set Anthropic API key and save to config')
     args = parser.parse_args()
 
+    # Handle --set-key
+    if args.set_key:
+        config = load_config()
+        config['anthropic_api_key'] = args.set_key
+        save_config(config)
+        print("\033[32m✓ API key saved to ~/.claudesync/config.json\033[0m")
+        if not args.output and not args.scan_paths:
+            return  # Just setting key, no PDF generation requested
+
     # Load projects dynamically
-    print("Scanning for PROJECT_STATUS.md files...")
+    status.update("Scanning for PROJECT_STATUS.md files...")
     projects = load_projects(args.scan_paths, verbose=args.verbose)
 
     total = len(projects['with_repos']) + len(projects['without_repos'])
@@ -682,7 +992,19 @@ def main():
 
     print(f"Found {total} projects")
 
+    # AI-powered dev state assessment
+    if not args.no_ai:
+        config = load_config()
+        api_key = get_api_key(config)
+        if api_key:
+            assess_all_projects(projects, api_key)
+        else:
+            print("Skipping AI state assessment (no API key)")
+    else:
+        print("Skipping AI state assessment (--no-ai)")
+
     # Generate PDF
+    status.update("Generating PDF report...")
     if args.output is None:
         today = datetime.now().strftime('%Y-%m-%d')
         output_dir = os.path.expanduser('~/claudesync2')
@@ -691,7 +1013,9 @@ def main():
     else:
         output_path = os.path.expanduser(args.output)
 
+    status.update("Building charts and tables...")
     create_pdf(output_path, projects)
+    status.done()
 
 
 if __name__ == '__main__':

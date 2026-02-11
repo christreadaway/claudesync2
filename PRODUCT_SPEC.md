@@ -159,6 +159,40 @@ A project "has a repo" if:
 | 25-49% | Yellow (#F1C40F) |
 | < 25% | Red (#E74C3C) |
 
+### Development State (Dev State)
+
+Projects can be tagged with a development state that reflects their current workflow status. These are color-coded in the PDF dashboard.
+
+| State | Color | Description |
+|-------|-------|-------------|
+| `test` | Orange (#E67E22) | Push with no evidence of testing |
+| `refine` | Blue (#3498DB) | Chat abandoned — user satisfied or riffing on features |
+| `continue` | Red (#E74C3C) | Tests ongoing, not fully resolved |
+
+**Custom states** can be added via `~/.claudesync/config.json`:
+```json
+{
+  "custom_dev_states": {
+    "blocked": {
+      "label": "Blocked",
+      "description": "Waiting on external dependency",
+      "color": "#8E44AD"
+    }
+  }
+}
+```
+
+**AI-powered assessment:** When an Anthropic API key is configured, the system uses Claude to analyze each project's commit history and progress log to automatically suggest a dev state for projects that don't have one set manually.
+
+### API Key Management
+
+The system checks for an API key in this order:
+1. `~/.claudesync/config.json` (`anthropic_api_key` field)
+2. `ANTHROPIC_API_KEY` environment variable
+3. Interactive prompt (if running in a terminal)
+
+Set a key via CLI: `python3 generate_status_pdf.py --set-key sk-ant-...`
+
 ---
 
 ## Data Requirements
@@ -179,6 +213,7 @@ A project "has a repo" if:
 | **Status** | [Not Started/In Progress/Beta/Complete/Shelved] |
 | **Last Worked** | [YYYY-MM-DD] |
 | **Has GitHub Repo** | [Yes/No] |
+| **Dev State** | [test/refine/continue or custom] |
 
 ## Current State
 
@@ -222,7 +257,8 @@ project = {
     'has_repo': str,
     'has_github_repo': bool,
     'features': list[str],      # From "What's Working"
-    'recent_commits': list[str] # From git log --all
+    'recent_commits': list[str], # From git log --all
+    'dev_state': str,           # test/refine/continue (or custom)
 }
 ```
 
@@ -252,7 +288,7 @@ numpy>=1.24.0
 | GitHub | URL parsing only | Extract user/repo from remote URLs |
 | Claude.ai | Manual PDF upload | Provide context to conversations |
 
-**No API keys or authentication required.**
+**Optional:** Anthropic API key for AI-powered dev state assessment. Not required for core functionality.
 
 ---
 
@@ -261,7 +297,7 @@ numpy>=1.24.0
 1. **Automatic Claude.ai upload** - User must manually upload PDF
 2. **Real-time sync** - PDF is point-in-time snapshot
 3. **Claude Code hooks** - No automatic triggering on session end
-4. **Progress auto-calculation** - User must manually set progress %
+4. **Progress auto-calculation** - User must manually set progress % (dev state IS auto-assessed via AI)
 5. **Multi-user support** - Single developer use case only
 6. **Cloud storage** - All data is local
 7. **Windows support** - Untested, may work
