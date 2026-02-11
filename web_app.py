@@ -49,6 +49,7 @@ _project_cache = {
     'projects': [],
     'scan_paths': '~',
     'chat_history_path': None,
+    'lock': threading.Lock(),
 }
 
 # Background task state — shared between threads
@@ -60,6 +61,12 @@ _bg_task = {
     'result_msg': None,
     'lock': threading.Lock(),
 }
+
+
+def _get_projects():
+    """Thread-safe read of the cached projects list."""
+    with _project_cache['lock']:
+        return list(_project_cache.get('projects', []))
 
 
 def _bg_progress(step, detail=''):
@@ -104,6 +111,7 @@ Conversations:
 
         result = _call_ai(prompt, max_tokens=800)
         if not result:
+            _bg_progress('ai_classify', 'AI call failed — check API key and connection')
             break
 
         for line in result.strip().split('\n'):
@@ -170,9 +178,10 @@ def _bg_run_load(scan_paths_str, chat_history_path, ai_analyze):
             progress_callback=_bg_progress,
         )
 
-        _project_cache['projects'] = projects
-        _project_cache['scan_paths'] = scan_paths_str
-        _project_cache['chat_history_path'] = chp
+        with _project_cache['lock']:
+            _project_cache['projects'] = projects
+            _project_cache['scan_paths'] = scan_paths_str
+            _project_cache['chat_history_path'] = chp
 
         # Chat stats
         chat_stats = getattr(load_projects, '_last_chat_stats', {})
@@ -187,11 +196,16 @@ def _bg_run_load(scan_paths_str, chat_history_path, ai_analyze):
         # AI enrichment + classification (automatic when key is present)
         enriched = 0
         classified = 0
+        ai_warnings = []
         if ai_analyze:
             _bg_progress('ai_enrichment', 'Enriching project descriptions with AI...')
-            enriched = _ai_enrich_all_projects()
-            if enriched:
-                msg += f'. AI enriched {enriched} projects'
+            try:
+                enriched = _ai_enrich_all_projects()
+                if enriched:
+                    msg += f'. AI enriched {enriched} projects'
+            except Exception as e:
+                ai_warnings.append(f'AI enrichment failed: {e}')
+                _bg_progress('ai_enrichment', f'AI enrichment failed: {e}')
 
             # Auto-classify unmatched conversations
             unmatched = chat_stats.get('unmatched_chats', [])
@@ -201,11 +215,16 @@ def _bg_run_load(scan_paths_str, chat_history_path, ai_analyze):
                     classified = _bg_classify_unmatched(unmatched, projects)
                     if classified:
                         msg += f', classified {classified} conversations'
+                    elif unmatched:
+                        ai_warnings.append('AI classified 0 conversations — API may have failed')
                 except Exception as e:
-                    print(f"AI classification failed: {e}")
+                    ai_warnings.append(f'AI classification failed: {e}')
+                    _bg_progress('ai_classify', f'AI classification failed: {e}')
 
             if enriched or classified:
                 msg += '.'
+            if ai_warnings:
+                msg += ' Warnings: ' + '; '.join(ai_warnings)
 
         with _bg_task['lock']:
             _bg_task['result_msg'] = msg
@@ -370,9 +389,10 @@ def _load_cached_projects(scan_paths_str=None, chat_history_path=None):
 
     projects = load_projects(scan_paths=scan_paths, chat_history_path=chp, verbose=False)
 
-    _project_cache['projects'] = projects
-    _project_cache['scan_paths'] = scan_paths_str
-    _project_cache['chat_history_path'] = chp
+    with _project_cache['lock']:
+        _project_cache['projects'] = projects
+        _project_cache['scan_paths'] = scan_paths_str
+        _project_cache['chat_history_path'] = chp
 
     return projects
 
@@ -520,7 +540,7 @@ def _project_activity_breakdown(projects):
             'dev_state': p.get('dev_state', ''),
             'total_events': len(timeline),
             'commits': commits,
-            'chats': chats,
+            'chats': p.get('chat_conversations', 0) or chats,
             'logs': logs,
             'open_threads': len(active_threads),
             'all_threads': len(all_threads),
@@ -1098,6 +1118,11 @@ DASHBOARD_HTML = """
         };
 
         function startProgressPolling() {
+            // Clear any existing poll interval to prevent duplicates on reload
+            if (_progressPoll) {
+                clearInterval(_progressPoll);
+                _progressPoll = null;
+            }
             var banner = document.getElementById('progressBanner');
             banner.className = 'progress-banner show';
             _progressPoll = setInterval(function() {
@@ -1116,13 +1141,16 @@ DASHBOARD_HTML = """
                             banner.className = 'progress-banner show error';
                             stepEl.textContent = 'Error';
                             detailEl.textContent = data.error;
+                            // Don't auto-reload on error — let user read it
                         } else {
                             banner.className = 'progress-banner show done';
                             stepEl.textContent = 'Complete';
                             detailEl.textContent = data.result_msg || 'Done';
                             fillEl.style.width = '100%';
-                            // Auto-reload after a brief pause so user sees the result
-                            setTimeout(function() { location.reload(); }, 1500);
+                            // Check for warnings in result message
+                            var hasWarnings = data.result_msg && data.result_msg.indexOf('Warning') !== -1;
+                            var delay = hasWarnings ? 5000 : 2500;
+                            setTimeout(function() { location.reload(); }, delay);
                         }
                     }
                 });
@@ -1527,7 +1555,7 @@ Be specific and factual. No filler language."""
 
 @app.route('/')
 def dashboard():
-    projects = _project_cache.get('projects')
+    projects = _get_projects()
     if not projects:
         projects = _load_cached_projects()
 
@@ -1618,7 +1646,7 @@ def api_restore():
 
 @app.route('/project/<int:idx>')
 def project_detail(idx):
-    projects = _project_cache.get('projects', [])
+    projects = _get_projects()
     if idx < 0 or idx >= len(projects):
         flash('Project not found.', 'error')
         return redirect(url_for('dashboard'))
@@ -1661,7 +1689,7 @@ def api_resolve_thread():
 @app.route('/api/enrich/<int:idx>', methods=['POST'])
 def api_enrich(idx):
     """Use AI to generate a richer project description."""
-    projects = _project_cache.get('projects', [])
+    projects = _get_projects()
     if idx < 0 or idx >= len(projects):
         return jsonify({'error': 'Project not found'}), 404
 
@@ -1731,7 +1759,7 @@ def api_ai_config():
 @app.route('/api/dev-state/<int:idx>', methods=['POST'])
 def api_set_dev_state(idx):
     """Set the dev state for a project and persist it to PROJECT_STATUS.md."""
-    projects = _project_cache.get('projects', [])
+    projects = _get_projects()
     if idx < 0 or idx >= len(projects):
         return jsonify({'error': 'Project not found'}), 404
 
@@ -1771,7 +1799,7 @@ def api_set_dev_state(idx):
 @app.route('/api/ai-assess-state/<int:idx>', methods=['POST'])
 def api_ai_assess_state(idx):
     """Use AI to assess which dev state a project should be in."""
-    projects = _project_cache.get('projects', [])
+    projects = _get_projects()
     if idx < 0 or idx >= len(projects):
         return jsonify({'error': 'Project not found'}), 404
 
