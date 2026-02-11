@@ -68,6 +68,83 @@ def _bg_progress(step, detail=''):
         _bg_task['detail'] = detail
 
 
+def _bg_classify_unmatched(unmatched_chats, projects):
+    """Classify unmatched chat conversations using AI. Returns count classified."""
+    project_names = [p.get('name', '') for p in projects if p.get('name')]
+    all_results = []
+    batch_size = 15
+
+    for batch_start in range(0, len(unmatched_chats), batch_size):
+        batch = unmatched_chats[batch_start:batch_start + batch_size]
+        _bg_progress('ai_classify', f'Classifying batch {batch_start // batch_size + 1}/{(len(unmatched_chats) + batch_size - 1) // batch_size}...')
+
+        lines = []
+        for i, chat in enumerate(batch):
+            idx = batch_start + i
+            excerpt = chat.get('excerpt', '')[:200].replace('\n', ' ')
+            lines.append(f"[{idx}] file: {chat['filename']} | date: {chat.get('date', '?')} | excerpt: {excerpt}")
+
+        prompt = f"""These chat conversations were not automatically matched to any existing project initiative.
+
+Existing initiatives: {', '.join(project_names)}
+
+For each conversation below, determine:
+1. If it clearly belongs to an existing initiative: [idx] MATCH initiative_name
+2. If it doesn't match any existing initiative, suggest a new name: [idx] NEW suggested_initiative_name
+3. If it's too vague or just small talk/greetings: [idx] SKIP
+
+Rules:
+- Initiative names should be descriptive (2-5 words)
+- Group related conversations under the same new initiative name
+- Be specific, not generic.
+
+Conversations:
+{chr(10).join(lines)}"""
+
+        result = _call_ai(prompt, max_tokens=800)
+        if not result:
+            break
+
+        for line in result.strip().split('\n'):
+            line = line.strip()
+            if not line or not line.startswith('['):
+                continue
+            try:
+                idx_str = line[1:line.index(']')]
+                idx = int(idx_str)
+                rest = line[line.index(']') + 1:].strip()
+                if idx < 0 or idx >= len(unmatched_chats):
+                    continue
+                chat_info = unmatched_chats[idx]
+                entry = {'idx': idx, 'filename': chat_info['filename'],
+                         'date': chat_info.get('date', '?'),
+                         'excerpt': chat_info.get('excerpt', '')[:150]}
+                if rest.startswith('MATCH'):
+                    entry['action'] = 'match'
+                    entry['initiative'] = rest[5:].strip()
+                elif rest.startswith('NEW'):
+                    entry['action'] = 'new'
+                    entry['initiative'] = rest[3:].strip()
+                elif rest.startswith('SKIP'):
+                    entry['action'] = 'skip'
+                    entry['initiative'] = ''
+                else:
+                    continue
+                all_results.append(entry)
+            except (ValueError, IndexError):
+                continue
+
+    # Save results
+    if all_results:
+        initiatives = _load_initiatives()
+        initiatives['last_classified'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+        initiatives['results'] = all_results
+        initiatives['total_unmatched'] = len(unmatched_chats)
+        _save_initiatives(initiatives)
+
+    return len(all_results)
+
+
 def _bg_run_load(scan_paths_str, chat_history_path, ai_analyze):
     """Background worker: load projects, optionally enrich with AI."""
     try:
@@ -106,13 +183,28 @@ def _bg_run_load(scan_paths_str, chat_history_path, ai_analyze):
             if chat_stats.get('unmatched_files'):
                 msg += f', {chat_stats["unmatched_files"]} unmatched'
 
-        # AI enrichment
+        # AI enrichment + classification (automatic when key is present)
         enriched = 0
+        classified = 0
         if ai_analyze:
-            _bg_progress('ai_enrichment', 'Enriching projects with AI...')
+            _bg_progress('ai_enrichment', 'Enriching project descriptions with AI...')
             enriched = _ai_enrich_all_projects()
             if enriched:
-                msg += f'. AI enriched {enriched} projects.'
+                msg += f'. AI enriched {enriched} projects'
+
+            # Auto-classify unmatched conversations
+            unmatched = chat_stats.get('unmatched_chats', [])
+            if unmatched:
+                _bg_progress('ai_classify', f'Classifying {len(unmatched)} unmatched conversations...')
+                try:
+                    classified = _bg_classify_unmatched(unmatched, projects)
+                    if classified:
+                        msg += f', classified {classified} conversations'
+                except Exception as e:
+                    print(f"AI classification failed: {e}")
+
+            if enriched or classified:
+                msg += '.'
 
         with _bg_task['lock']:
             _bg_task['result_msg'] = msg
@@ -764,15 +856,7 @@ DASHBOARD_HTML = """
                 </div>
                 <label for="scan_paths">Scan Paths</label>
                 <input type="text" name="scan_paths" id="scanPaths" value="{{ scan_paths }}" placeholder="~ ~/projects">
-                {% if ai_config.api_key %}
-                <label style="margin-top:14px; display:flex; align-items:center; gap:8px; cursor:pointer;">
-                    <input type="checkbox" name="ai_analyze" id="aiAnalyze" value="1" style="width:auto;">
-                    <span>Analyze chats with AI for richer project descriptions</span>
-                </label>
-                <p style="font-size:10px; color:var(--text-muted); margin-top:2px;">Uses {{ ai_config.model }} &mdash; costs a few cents per project</p>
-                {% else %}
-                <p style="font-size:11px; color:var(--text-muted); margin-top:14px;">Configure an API key in AI Settings to enable AI-powered chat analysis.</p>
-                {% endif %}
+                <input type="hidden" name="ai_analyze" id="aiAnalyzeHidden" value="{{ '1' if ai_config.api_key else '0' }}">
                 <div class="btn-row">
                     <button type="submit" class="btn btn-upload" id="uploadBtn">Load & Refresh</button>
                     <button type="button" class="btn btn-cancel" onclick="document.getElementById('uploadModal').classList.remove('show')">Cancel</button>
@@ -809,7 +893,67 @@ DASHBOARD_HTML = """
         </div>
     </div>
 
+    <!-- AI Key Prompt (shown when no key exists and user clicks Load) -->
+    <div class="modal-overlay" id="aiPromptModal">
+        <div class="modal">
+            <h2>Enable AI-Enhanced Results?</h2>
+            <p style="font-size:13px; color:var(--text-secondary); margin-bottom:14px; line-height:1.5;">
+                With an Anthropic API key, the dashboard will automatically:<br>
+                &bull; Enrich project descriptions with AI-generated summaries<br>
+                &bull; Classify unmatched chat conversations into initiatives<br>
+                &bull; Verify project categorization
+            </p>
+            <label for="ai_prompt_key">API Key</label>
+            <input type="text" id="ai_prompt_key" placeholder="sk-ant-..." style="font-family:monospace;">
+            <p style="font-size:10px; color:var(--text-muted); margin-top:4px;">Stored locally in ~/.claudesync_ai.json. Never leaves this machine.</p>
+            <div class="btn-row">
+                <button class="btn" style="background:#8e44ad;" id="aiPromptOk" onclick="aiPromptAccept()">OK</button>
+                <button type="button" class="btn btn-cancel" id="aiPromptSkip" onclick="aiPromptDecline()">Skip</button>
+            </div>
+        </div>
+    </div>
+
     <script>
+        // Track whether we're waiting on the AI prompt before submitting
+        var _pendingFormData = null;
+
+        function aiPromptAccept() {
+            var key = document.getElementById('ai_prompt_key').value.trim();
+            if (!key) { document.getElementById('ai_prompt_key').style.borderColor = '#E74C3C'; return; }
+            // Save the key
+            fetch('/api/ai-config', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ api_key: key, api_url: 'https://api.anthropic.com/v1/messages', model: 'claude-haiku-4-5-20251001' })
+            })
+            .then(function(r) { return r.json(); })
+            .then(function() {
+                document.getElementById('aiPromptModal').classList.remove('show');
+                if (_pendingFormData) {
+                    _pendingFormData.set('ai_analyze', '1');
+                    submitUpload(_pendingFormData);
+                    _pendingFormData = null;
+                }
+            });
+        }
+
+        function aiPromptDecline() {
+            document.getElementById('aiPromptModal').classList.remove('show');
+            if (_pendingFormData) {
+                _pendingFormData.set('ai_analyze', '0');
+                submitUpload(_pendingFormData);
+                _pendingFormData = null;
+            }
+        }
+
+        function submitUpload(formData) {
+            startProgressPolling();
+            fetch('/upload', { method: 'POST', body: formData })
+            .then(function(r) { return r.json(); })
+            .then(function() { document.getElementById('uploadBtn').disabled = false; })
+            .catch(function() { document.getElementById('uploadBtn').disabled = false; });
+        }
+
         function saveAiConfig() {
             var body = {
                 api_url: document.getElementById('ai_url').value,
@@ -972,23 +1116,24 @@ DASHBOARD_HTML = """
             }, 500);
         }
 
-        // Intercept upload form — submit via AJAX, don't block UI
+        // Intercept upload form — check for AI key, then submit via AJAX
         document.querySelector('#uploadModal form').addEventListener('submit', function(e) {
             e.preventDefault();
             var form = e.target;
             var formData = new FormData(form);
             document.getElementById('uploadModal').classList.remove('show');
             document.getElementById('uploadBtn').disabled = true;
-            startProgressPolling();
-            fetch('/upload', { method: 'POST', body: formData })
-            .then(function(r) { return r.json(); })
-            .then(function(data) {
-                // Progress polling handles the reload
-                document.getElementById('uploadBtn').disabled = false;
-            })
-            .catch(function() {
-                document.getElementById('uploadBtn').disabled = false;
-            });
+
+            var hasKey = document.getElementById('aiAnalyzeHidden').value === '1';
+            if (hasKey) {
+                // Key already configured — auto-enable AI and submit
+                formData.set('ai_analyze', '1');
+                submitUpload(formData);
+            } else {
+                // No key — ask the user
+                _pendingFormData = formData;
+                document.getElementById('aiPromptModal').classList.add('show');
+            }
         });
 
         // Check on page load if a background task is already running
