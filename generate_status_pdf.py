@@ -18,6 +18,7 @@ Usage:
 import argparse
 import os
 import re
+import zipfile
 from datetime import datetime
 
 from reportlab.lib import colors
@@ -66,6 +67,222 @@ CATEGORY_MAP = {
     'personal': 'Personal',
     'research': 'Research',
 }
+
+
+# =============================================================================
+# CHAT HISTORY INTEGRATION - Reads from exported Claude chat files
+# =============================================================================
+
+def load_chat_files(chat_path):
+    """Load text content from a zip file or directory of .md/.txt files.
+
+    Returns a list of dicts: [{'filename': str, 'content': str}, ...]
+    """
+    chat_files = []
+
+    if chat_path is None:
+        return chat_files
+
+    chat_path = os.path.expanduser(chat_path)
+
+    if zipfile.is_zipfile(chat_path):
+        with zipfile.ZipFile(chat_path, 'r') as zf:
+            for name in zf.namelist():
+                if name.endswith(('.md', '.txt', '.json')):
+                    try:
+                        raw = zf.read(name)
+                        text = raw.decode('utf-8', errors='replace')
+                        chat_files.append({
+                            'filename': os.path.basename(name),
+                            'content': text
+                        })
+                    except Exception:
+                        continue
+    elif os.path.isdir(chat_path):
+        for root, _dirs, files in os.walk(chat_path):
+            for fname in files:
+                if fname.endswith(('.md', '.txt', '.json')):
+                    fpath = os.path.join(root, fname)
+                    try:
+                        with open(fpath, 'r', errors='replace') as f:
+                            text = f.read()
+                        chat_files.append({
+                            'filename': fname,
+                            'content': text
+                        })
+                    except Exception:
+                        continue
+    else:
+        # Single file
+        try:
+            with open(chat_path, 'r', errors='replace') as f:
+                text = f.read()
+            chat_files.append({
+                'filename': os.path.basename(chat_path),
+                'content': text
+            })
+        except Exception:
+            pass
+
+    return chat_files
+
+
+def _build_search_terms(project_name):
+    """Build a list of search patterns from a project name.
+
+    'Sacramental Records' -> ['sacramental records', 'sacramentalrecords', 'sacramental']
+    'Claude Project Sync v2' -> ['claude project sync', 'claudeprojectsync', 'claudesync']
+    """
+    name_lower = project_name.lower().strip()
+
+    terms = set()
+    terms.add(name_lower)
+
+    # Remove version suffixes for matching
+    no_version = re.sub(r'\s*v\d+(\.\d+)*\s*$', '', name_lower).strip()
+    if no_version and len(no_version) > 3:
+        terms.add(no_version)
+
+    # Squashed (no spaces)
+    squashed = name_lower.replace(' ', '')
+    if len(squashed) > 5:
+        terms.add(squashed)
+
+    # First two significant words (for "Sacramental Records" -> "sacramental records")
+    words = [w for w in name_lower.split() if len(w) > 2 and w not in ('the', 'and', 'for', 'app')]
+    if len(words) >= 2:
+        terms.add(words[0] + ' ' + words[1])
+
+    # Single longest word if distinctive enough
+    if words:
+        longest = max(words, key=len)
+        if len(longest) >= 8:
+            terms.add(longest)
+
+    return list(terms)
+
+
+def _split_into_paragraphs(text):
+    """Split text into meaningful paragraphs.
+
+    Handles markdown conversations with --- separators, blank lines, etc.
+    Filters out very short or code-heavy blocks.
+    """
+    # Strip common role markers used in chat exports
+    # (Human:, Assistant:, User:, Claude:, etc.)
+    cleaned = re.sub(r'^(Human|Assistant|User|Claude|System)\s*:', '', text, flags=re.MULTILINE)
+
+    # Split on double newlines or --- separators
+    raw_blocks = re.split(r'\n\s*\n|\n---+\n', cleaned)
+
+    paragraphs = []
+    for block in raw_blocks:
+        block = block.strip()
+        if not block:
+            continue
+
+        # Skip code blocks (```...```)
+        if block.startswith('```'):
+            continue
+
+        # Skip very short blocks (headers, single words)
+        if len(block) < 50:
+            continue
+
+        # Skip blocks that are mostly code or commands
+        code_line_count = sum(1 for line in block.split('\n')
+                              if line.strip().startswith(('$', '>', '#!', 'import ', 'from ', 'def ', 'class ')))
+        total_lines = len(block.split('\n'))
+        if total_lines > 1 and code_line_count / total_lines > 0.5:
+            continue
+
+        # Clean markdown formatting for readability
+        clean = block.replace('**', '').replace('`', '')
+        clean = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', clean)  # links -> text
+        clean = re.sub(r'^#+\s+', '', clean, flags=re.MULTILINE)  # remove headers
+        clean = re.sub(r'\n+', ' ', clean).strip()  # join into one line
+
+        if len(clean) >= 50:
+            paragraphs.append(clean)
+
+    return paragraphs
+
+
+def match_chat_to_projects(chat_files, projects, verbose=False):
+    """Match chat history content to projects and extract the best snippets.
+
+    Returns a dict: {project_name: [snippet1, snippet2, ...]}
+    Each snippet is the most relevant paragraph about that project found in chats.
+    """
+    project_snippets = {}
+
+    for project in projects:
+        name = project.get('name', '')
+        if not name:
+            continue
+
+        search_terms = _build_search_terms(name)
+        scored_paragraphs = []
+
+        for chat in chat_files:
+            paragraphs = _split_into_paragraphs(chat['content'])
+
+            for para in paragraphs:
+                para_lower = para.lower()
+
+                # Score based on how many search terms appear
+                score = 0
+                for term in search_terms:
+                    count = para_lower.count(term)
+                    if count > 0:
+                        # Longer terms are more specific, worth more
+                        score += count * len(term)
+
+                if score > 0:
+                    # Bonus for longer, more descriptive paragraphs (up to 500 chars)
+                    length_bonus = min(len(para), 500) / 100
+                    # Bonus for descriptive language
+                    descriptive_words = ['project', 'build', 'feature', 'implement',
+                                         'design', 'status', 'progress', 'complete',
+                                         'working', 'develop', 'launch', 'deploy']
+                    desc_bonus = sum(1 for w in descriptive_words if w in para_lower)
+                    total_score = score + length_bonus + desc_bonus
+                    scored_paragraphs.append((total_score, para))
+
+        # Sort by score descending, take top snippets
+        scored_paragraphs.sort(key=lambda x: x[0], reverse=True)
+
+        # Pick the best 1-2 snippets, avoid redundancy
+        best = []
+        for _score, para in scored_paragraphs:
+            # Skip if too similar to an already-picked snippet
+            is_redundant = any(
+                _overlap_ratio(para, existing) > 0.5
+                for existing in best
+            )
+            if not is_redundant:
+                best.append(para)
+                if len(best) >= 2:
+                    break
+
+        if best:
+            project_snippets[name] = best
+            if verbose:
+                print(f"  Chat match for '{name}': {len(scored_paragraphs)} candidates, "
+                      f"kept {len(best)} snippets")
+
+    return project_snippets
+
+
+def _overlap_ratio(a, b):
+    """Quick overlap check between two strings using word sets."""
+    words_a = set(a.lower().split())
+    words_b = set(b.lower().split())
+    if not words_a or not words_b:
+        return 0.0
+    intersection = words_a & words_b
+    smaller = min(len(words_a), len(words_b))
+    return len(intersection) / smaller if smaller > 0 else 0.0
 
 
 def find_project_status_files(scan_paths=None, max_depth=2):
@@ -155,8 +372,12 @@ def extract_next_steps(content):
     return items
 
 
-def build_project_narrative(project):
-    """Build a narrative paragraph for a project from its status data."""
+def build_project_narrative(project, chat_snippets=None):
+    """Build a narrative paragraph for a project from its status data.
+
+    If chat_snippets are provided, they supplement the status file content
+    to create richer descriptions.
+    """
     parts = []
 
     # Use summary if available
@@ -189,6 +410,25 @@ def build_project_narrative(project):
             step_text = ('Next steps include ' +
                          ', '.join(s.rstrip('.').lower() for s in next_steps[:3]) + '.')
         parts.append(step_text)
+
+    # Supplement with chat history snippets
+    if chat_snippets:
+        name = project.get('name', '')
+        snippets = chat_snippets.get(name, [])
+        if snippets:
+            # Combine existing narrative text to check for redundancy
+            existing_text = ' '.join(parts).lower()
+            for snippet in snippets:
+                # Only add if it brings genuinely new information
+                if _overlap_ratio(snippet, existing_text) < 0.4:
+                    # Trim to reasonable length for the PDF
+                    trimmed = snippet[:600]
+                    if len(snippet) > 600:
+                        # Cut at last sentence boundary
+                        last_period = trimmed.rfind('.')
+                        if last_period > 300:
+                            trimmed = trimmed[:last_period + 1]
+                    parts.append(trimmed)
 
     if not parts:
         return 'Status file exists but no detailed description available yet.'
@@ -290,8 +530,8 @@ def parse_project_status(file_path):
         # Extract next steps
         project['next_steps'] = extract_next_steps(content)
 
-        # Build narrative
-        project['narrative'] = build_project_narrative(project)
+        # Narrative is built later after chat history is loaded
+        project['narrative'] = ''
 
         return project
 
@@ -300,8 +540,12 @@ def parse_project_status(file_path):
         return None
 
 
-def load_projects(scan_paths=None, verbose=False):
-    """Load all projects from PROJECT_STATUS.md files."""
+def load_projects(scan_paths=None, chat_history_path=None, verbose=False):
+    """Load all projects from PROJECT_STATUS.md files.
+
+    If chat_history_path is provided, also loads chat exports and matches
+    them to projects to supplement the narrative descriptions.
+    """
     status_files = find_project_status_files(scan_paths)
 
     if verbose:
@@ -314,12 +558,28 @@ def load_projects(scan_paths=None, verbose=False):
     for sf in status_files:
         project = parse_project_status(sf)
         if project:
-            if verbose:
-                print(f"\n{project['name']}:")
-                print(f"  Category: {project['category_group']}")
-                print(f"  Summary: {project.get('summary', '')[:60]}...")
-                print(f"  Narrative: {project.get('narrative', '')[:60]}...")
             all_projects.append(project)
+
+    # Load chat history and match to projects
+    chat_snippets = {}
+    if chat_history_path:
+        print(f"Loading chat history from: {chat_history_path}")
+        chat_files = load_chat_files(chat_history_path)
+        print(f"  Loaded {len(chat_files)} chat files")
+        if chat_files:
+            chat_snippets = match_chat_to_projects(chat_files, all_projects, verbose=verbose)
+            print(f"  Matched chat context to {len(chat_snippets)} projects")
+
+    # Build narratives (now with chat context available)
+    for project in all_projects:
+        project['narrative'] = build_project_narrative(project, chat_snippets)
+        if verbose:
+            print(f"\n{project['name']}:")
+            print(f"  Category: {project['category_group']}")
+            print(f"  Summary: {project.get('summary', '')[:60]}...")
+            has_chat = project['name'] in chat_snippets
+            print(f"  Chat context: {'Yes' if has_chat else 'No'}")
+            print(f"  Narrative: {project.get('narrative', '')[:80]}...")
 
     # Sort by progress descending within each group
     all_projects.sort(key=lambda x: x['progress'], reverse=True)
@@ -536,13 +796,19 @@ def main():
                         help='Output path for the PDF')
     parser.add_argument('--scan-paths', nargs='+', default=None,
                         help='Paths to scan for PROJECT_STATUS.md files')
+    parser.add_argument('--chat-history', '-c', default=None,
+                        help='Path to chat history zip file or directory of .md/.txt exports')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Show detailed debug output')
     args = parser.parse_args()
 
     # Load projects dynamically
     print("Scanning for PROJECT_STATUS.md files...")
-    all_projects = load_projects(args.scan_paths, verbose=args.verbose)
+    all_projects = load_projects(
+        args.scan_paths,
+        chat_history_path=args.chat_history,
+        verbose=args.verbose
+    )
 
     if not all_projects:
         print("\nNo PROJECT_STATUS.md files found!")
