@@ -259,7 +259,7 @@ def match_chat_to_projects(chat_files, projects, verbose=False):
                     'text': summary_line,
                 })
 
-                if len(best_snippets) >= 3:
+                if len(best_snippets) >= 8:
                     break
 
         if best_snippets or dated_entries:

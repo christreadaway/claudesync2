@@ -9,6 +9,8 @@ Features:
 - Activity chart (day/week/month) across all projects
 - Project cards with progress, last active, open thread count
 - Drill-down to full decision timeline per project
+- EOL/abandoned project detection with ignore/hide
+- Dark mode toggle (persisted in localStorage)
 - Chat history zip upload
 - One-click PDF generation + download
 
@@ -32,6 +34,7 @@ app = Flask(__name__)
 app.secret_key = os.urandom(24)
 
 UPLOAD_DIR = tempfile.mkdtemp(prefix='claudesync_')
+IGNORED_FILE = os.path.expanduser('~/.claudesync_ignored.json')
 
 # Cache loaded projects so dashboard + drill-down share data
 _project_cache = {
@@ -40,6 +43,31 @@ _project_cache = {
     'chat_history_path': None,
 }
 
+
+# =============================================================================
+# IGNORED PROJECTS PERSISTENCE
+# =============================================================================
+
+def _load_ignored():
+    """Load ignored project names from disk."""
+    if os.path.exists(IGNORED_FILE):
+        try:
+            with open(IGNORED_FILE, 'r') as f:
+                return set(json.load(f))
+        except Exception:
+            pass
+    return set()
+
+
+def _save_ignored(names):
+    """Save ignored project names to disk."""
+    with open(IGNORED_FILE, 'w') as f:
+        json.dump(sorted(names), f, indent=2)
+
+
+# =============================================================================
+# DATA LOADING + EOL DETECTION
+# =============================================================================
 
 def _load_cached_projects(scan_paths_str=None, chat_history_path=None):
     """Load projects, caching the result for the session."""
@@ -60,13 +88,45 @@ def _load_cached_projects(scan_paths_str=None, chat_history_path=None):
     return projects
 
 
-def _aggregate_activity(projects, mode='day'):
-    """Aggregate activity events across all projects into time buckets.
+def _detect_eol(project):
+    """Detect if a project looks abandoned/EOL. Returns reason string or None."""
+    status = project.get('status', '').lower()
+    eol_statuses = ['abandoned', 'archived', 'deprecated', 'eol', 'end of life',
+                    'merged', 'completed', 'sunset', 'dead']
+    for s in eol_statuses:
+        if s in status:
+            return f'Status: {project.get("status")}'
 
-    mode: 'day', 'week', or 'month'
-    Returns: {labels: [...], datasets: [{label, data, backgroundColor}]}
-    """
-    # Collect all events with dates and sources
+    # Had a repo reference but it's marked as not having one
+    repo_str = project.get('repo', '').lower()
+    has_repo = project.get('has_github_repo', False)
+    if repo_str and not has_repo and 'not' in repo_str:
+        pass  # This is "not yet created", not EOL
+
+    # No activity in 90+ days
+    timeline = project.get('timeline', [])
+    if timeline:
+        dates = []
+        for e in timeline:
+            try:
+                dates.append(datetime.strptime(e.get('date', ''), '%Y-%m-%d'))
+            except (ValueError, TypeError):
+                continue
+        if dates:
+            latest = max(dates)
+            days_ago = (datetime.now() - latest).days
+            if days_ago > 90:
+                return f'No activity in {days_ago} days'
+
+    # 0% progress with no timeline at all
+    if project.get('progress', 0) == 0 and len(timeline) == 0:
+        return 'No progress and no activity recorded'
+
+    return None
+
+
+def _aggregate_activity(projects, mode='day'):
+    """Aggregate activity events across all projects into time buckets."""
     events = []
     for p in projects:
         name = p.get('name', 'Unknown')
@@ -78,7 +138,6 @@ def _aggregate_activity(projects, mode='day'):
             except (ValueError, TypeError):
                 continue
 
-            # Categorize source
             src_lower = source.lower()
             if 'commit' in src_lower or 'git' in src_lower:
                 category = 'Commits'
@@ -92,12 +151,6 @@ def _aggregate_activity(projects, mode='day'):
     if not events:
         return {'labels': [], 'datasets': []}
 
-    # Determine date range
-    dates = [e['date'] for e in events]
-    min_date = min(dates)
-    max_date = max(dates)
-
-    # Build time buckets
     buckets = defaultdict(lambda: defaultdict(int))
 
     for e in events:
@@ -105,20 +158,16 @@ def _aggregate_activity(projects, mode='day'):
         if mode == 'day':
             key = dt.strftime('%Y-%m-%d')
         elif mode == 'week':
-            # Monday of the week
             monday = dt - timedelta(days=dt.weekday())
             key = monday.strftime('%Y-%m-%d')
         elif mode == 'month':
             key = dt.strftime('%Y-%m')
         else:
             key = dt.strftime('%Y-%m-%d')
-
         buckets[key][e['category']] += 1
 
-    # Sort labels chronologically
     labels = sorted(buckets.keys())
 
-    # Format labels for display
     display_labels = []
     for label in labels:
         try:
@@ -134,7 +183,6 @@ def _aggregate_activity(projects, mode='day'):
         except ValueError:
             display_labels.append(label)
 
-    # Build datasets
     categories = ['Commits', 'Chat Activity', 'Progress Log']
     cat_colors = {
         'Commits': '#3498DB',
@@ -145,7 +193,7 @@ def _aggregate_activity(projects, mode='day'):
     datasets = []
     for cat in categories:
         data = [buckets[label].get(cat, 0) for label in labels]
-        if sum(data) > 0:  # Only include categories that have data
+        if sum(data) > 0:
             datasets.append({
                 'label': cat,
                 'data': data,
@@ -176,13 +224,51 @@ def _project_activity_breakdown(projects):
             'logs': logs,
             'open_threads': len(p.get('open_threads', [])),
             'blockers': sum(1 for t, _ in p.get('open_threads', []) if t == 'Blocker'),
+            'eol_reason': _detect_eol(p),
         })
 
     return breakdown
 
 
 # =============================================================================
-# HTML TEMPLATES
+# SHARED CSS (dark mode via CSS custom properties)
+# =============================================================================
+
+THEME_CSS = """
+:root {
+    --bg: #f5f6f8; --bg-card: #fff; --bg-card-hover: #fff;
+    --text: #1a1a1a; --text-secondary: #888; --text-muted: #aaa;
+    --heading: #2C3E50; --border: #e0e0e0; --border-light: #f0f0f0;
+    --input-bg: #fff; --input-border: #ddd;
+    --bar-bg: #2C3E50; --bar-text: #fff;
+    --stat-bg: #f8f9fa; --progress-bg: #eee;
+    --shadow: rgba(0,0,0,0.06); --shadow-hover: rgba(0,0,0,0.12);
+    --flash-success-bg: #d4edda; --flash-success-text: #155724;
+    --flash-error-bg: #f8d7da; --flash-error-text: #721c24;
+    --modal-bg: rgba(0,0,0,0.4);
+    --drop-bg: #fafbfc; --drop-border: #ccd; --drop-hover-bg: #f0f7ff;
+    --toggle-bg: #fff; --toggle-border: #ddd; --toggle-text: #666;
+    --eol-bg: #fff8e1; --eol-border: #ffe082; --eol-text: #8d6e00;
+}
+[data-theme="dark"] {
+    --bg: #1a1b1e; --bg-card: #25262b; --bg-card-hover: #2c2e33;
+    --text: #c9ccd1; --text-secondary: #909296; --text-muted: #5c5f66;
+    --heading: #e4e5e7; --border: #373a40; --border-light: #2c2e33;
+    --input-bg: #2c2e33; --input-border: #373a40;
+    --bar-bg: #141517; --bar-text: #c9ccd1;
+    --stat-bg: #2c2e33; --progress-bg: #373a40;
+    --shadow: rgba(0,0,0,0.2); --shadow-hover: rgba(0,0,0,0.4);
+    --flash-success-bg: #1b3d2a; --flash-success-text: #69db7c;
+    --flash-error-bg: #3d1b1b; --flash-error-text: #ff8787;
+    --modal-bg: rgba(0,0,0,0.7);
+    --drop-bg: #2c2e33; --drop-border: #373a40; --drop-hover-bg: #1c3a5c;
+    --toggle-bg: #2c2e33; --toggle-border: #373a40; --toggle-text: #909296;
+    --eol-bg: #332b00; --eol-border: #665500; --eol-text: #ffd54f;
+}
+"""
+
+# =============================================================================
+# DASHBOARD HTML
 # =============================================================================
 
 DASHBOARD_HTML = """
@@ -194,9 +280,10 @@ DASHBOARD_HTML = """
     <title>Project Portfolio Dashboard</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
     <style>
+        """ + THEME_CSS + """
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f6f8; color: #1a1a1a; }
-        .top-bar { background: #2C3E50; color: white; padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); transition: background 0.3s, color 0.3s; }
+        .top-bar { background: var(--bar-bg); color: var(--bar-text); padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; }
         .top-bar h1 { font-size: 18px; font-weight: 600; }
         .top-bar .actions { display: flex; gap: 10px; align-items: center; }
         .top-bar .btn { padding: 8px 16px; border-radius: 5px; font-size: 12px; font-weight: 600; cursor: pointer; border: none; text-decoration: none; color: white; }
@@ -204,59 +291,88 @@ DASHBOARD_HTML = """
         .btn-upload:hover { background: #2980B9; }
         .btn-pdf { background: #2ECC71; }
         .btn-pdf:hover { background: #27AE60; }
+        .btn-theme { background: transparent; border: 1px solid rgba(255,255,255,0.3) !important; color: var(--bar-text); font-size: 14px; padding: 6px 12px; }
+        .btn-theme:hover { background: rgba(255,255,255,0.1); }
         .container { max-width: 1100px; margin: 0 auto; padding: 24px 20px; }
+
+        /* Filter bar */
+        .filter-bar { display: flex; gap: 10px; align-items: center; margin-bottom: 18px; font-size: 12px; }
+        .filter-bar label { color: var(--text-secondary); font-weight: 500; }
+        .filter-toggle { padding: 4px 12px; border: 1px solid var(--toggle-border); background: var(--toggle-bg); border-radius: 4px; font-size: 11px; cursor: pointer; color: var(--toggle-text); }
+        .filter-toggle.active { background: var(--heading); color: white; border-color: var(--heading); }
+
         .stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 24px; }
-        .stat-card { background: white; border-radius: 8px; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
-        .stat-card .number { font-size: 28px; font-weight: 700; color: #2C3E50; }
-        .stat-card .label { font-size: 11px; color: #888; margin-top: 2px; text-transform: uppercase; letter-spacing: 0.5px; }
-        .chart-card { background: white; border-radius: 8px; padding: 20px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+        .stat-card { background: var(--bg-card); border-radius: 8px; padding: 18px; box-shadow: 0 1px 3px var(--shadow); }
+        .stat-card .number { font-size: 28px; font-weight: 700; color: var(--heading); }
+        .stat-card .label { font-size: 11px; color: var(--text-secondary); margin-top: 2px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .chart-card { background: var(--bg-card); border-radius: 8px; padding: 20px; margin-bottom: 24px; box-shadow: 0 1px 3px var(--shadow); }
         .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
-        .chart-header h2 { font-size: 15px; color: #2C3E50; }
+        .chart-header h2 { font-size: 15px; color: var(--heading); }
         .toggle-group { display: flex; gap: 4px; }
-        .toggle-btn { padding: 5px 14px; border: 1px solid #ddd; background: white; border-radius: 4px; font-size: 12px; cursor: pointer; color: #666; }
-        .toggle-btn.active { background: #2C3E50; color: white; border-color: #2C3E50; }
+        .toggle-btn { padding: 5px 14px; border: 1px solid var(--toggle-border); background: var(--toggle-bg); border-radius: 4px; font-size: 12px; cursor: pointer; color: var(--toggle-text); }
+        .toggle-btn.active { background: var(--heading); color: white; border-color: var(--heading); }
         .projects-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
-        .project-card { background: white; border-radius: 8px; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); cursor: pointer; transition: box-shadow 0.2s; text-decoration: none; color: inherit; display: block; }
-        .project-card:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.12); }
-        .project-card .name { font-size: 14px; font-weight: 600; color: #2C3E50; margin-bottom: 2px; }
-        .project-card .meta { font-size: 11px; color: #888; margin-bottom: 10px; }
-        .progress-bar { height: 6px; background: #eee; border-radius: 3px; overflow: hidden; margin-bottom: 10px; }
+        .project-card { background: var(--bg-card); border-radius: 8px; padding: 18px; box-shadow: 0 1px 3px var(--shadow); cursor: pointer; transition: box-shadow 0.2s, background 0.2s; text-decoration: none; color: inherit; display: block; position: relative; }
+        .project-card:hover { box-shadow: 0 4px 12px var(--shadow-hover); background: var(--bg-card-hover); }
+        .project-card.eol { border-left: 3px solid var(--eol-border); opacity: 0.75; }
+        .project-card.hidden { display: none; }
+        .project-card .name { font-size: 14px; font-weight: 600; color: var(--heading); margin-bottom: 2px; }
+        .project-card .meta { font-size: 11px; color: var(--text-secondary); margin-bottom: 10px; }
+        .progress-bar { height: 6px; background: var(--progress-bg); border-radius: 3px; overflow: hidden; margin-bottom: 10px; }
         .progress-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
-        .project-card .counts { display: flex; gap: 12px; font-size: 11px; color: #666; }
+        .project-card .counts { display: flex; gap: 12px; font-size: 11px; color: var(--text-secondary); flex-wrap: wrap; }
         .project-card .counts span { display: flex; align-items: center; gap: 3px; }
         .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
         .dot-commit { background: #3498DB; }
         .dot-chat { background: #9B59B6; }
         .dot-log { background: #2ECC71; }
-        .dot-blocker { background: #E74C3C; }
         .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: 600; }
         .badge-blocker { background: #fce4ec; color: #c62828; }
-        footer { text-align: center; font-size: 11px; color: #aaa; margin-top: 40px; padding-bottom: 20px; }
+        .badge-eol { background: var(--eol-bg); color: var(--eol-text); border: 1px solid var(--eol-border); }
+
+        /* EOL bar inside project card */
+        .eol-bar { display: flex; align-items: center; justify-content: space-between; background: var(--eol-bg); border: 1px solid var(--eol-border); border-radius: 5px; padding: 6px 10px; margin-top: 10px; font-size: 11px; color: var(--eol-text); }
+        .eol-bar .reason { flex: 1; }
+        .eol-bar .btn-ignore { background: none; border: 1px solid var(--eol-border); color: var(--eol-text); padding: 2px 10px; border-radius: 3px; font-size: 10px; font-weight: 600; cursor: pointer; margin-left: 8px; }
+        .eol-bar .btn-ignore:hover { background: var(--eol-border); color: #333; }
+
+        footer { text-align: center; font-size: 11px; color: var(--text-muted); margin-top: 40px; padding-bottom: 20px; }
         .flash { padding: 10px 16px; border-radius: 6px; margin-bottom: 16px; font-size: 13px; }
-        .flash-success { background: #d4edda; color: #155724; }
-        .flash-error { background: #f8d7da; color: #721c24; }
+        .flash-success { background: var(--flash-success-bg); color: var(--flash-success-text); }
+        .flash-error { background: var(--flash-error-bg); color: var(--flash-error-text); }
+
         /* Upload modal */
-        .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.4); z-index: 100; justify-content: center; align-items: center; }
+        .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--modal-bg); z-index: 100; justify-content: center; align-items: center; }
         .modal-overlay.show { display: flex; }
-        .modal { background: white; border-radius: 10px; padding: 28px; max-width: 500px; width: 90%; }
-        .modal h2 { font-size: 16px; color: #2C3E50; margin-bottom: 16px; }
-        .drop-zone { border: 2px dashed #ccd; border-radius: 8px; padding: 28px; text-align: center; cursor: pointer; transition: all 0.2s; background: #fafbfc; }
-        .drop-zone:hover, .drop-zone.dragover { border-color: #3498DB; background: #f0f7ff; }
-        .drop-zone p { font-size: 13px; color: #666; }
+        .modal { background: var(--bg-card); border-radius: 10px; padding: 28px; max-width: 500px; width: 90%; }
+        .modal h2 { font-size: 16px; color: var(--heading); margin-bottom: 16px; }
+        .drop-zone { border: 2px dashed var(--drop-border); border-radius: 8px; padding: 28px; text-align: center; cursor: pointer; transition: all 0.2s; background: var(--drop-bg); }
+        .drop-zone:hover, .drop-zone.dragover { border-color: #3498DB; background: var(--drop-hover-bg); }
+        .drop-zone p { font-size: 13px; color: var(--text-secondary); }
         .drop-zone input[type="file"] { display: none; }
         .drop-zone .filename { margin-top: 8px; font-size: 13px; color: #2ECC71; font-weight: 600; }
-        .modal label { display: block; font-size: 13px; color: #555; margin: 14px 0 6px; font-weight: 500; }
-        .modal input[type="text"] { width: 100%; padding: 9px 12px; border: 1px solid #ddd; border-radius: 5px; font-size: 13px; }
+        .modal label { display: block; font-size: 13px; color: var(--text-secondary); margin: 14px 0 6px; font-weight: 500; }
+        .modal input[type="text"] { width: 100%; padding: 9px 12px; border: 1px solid var(--input-border); border-radius: 5px; font-size: 13px; background: var(--input-bg); color: var(--text); }
         .modal .btn-row { display: flex; gap: 10px; margin-top: 18px; }
         .modal .btn { padding: 10px 22px; font-size: 13px; }
-        .btn-cancel { background: #eee; color: #555; }
-        .btn-cancel:hover { background: #ddd; }
+        .btn-cancel { background: var(--stat-bg); color: var(--text-secondary); }
+        .btn-cancel:hover { background: var(--progress-bg); }
     </style>
+    <script>
+        // Apply theme before paint to prevent flash
+        (function() {
+            var t = localStorage.getItem('theme') || 'light';
+            document.documentElement.setAttribute('data-theme', t);
+        })();
+    </script>
 </head>
 <body>
     <div class="top-bar">
         <h1>Project Portfolio Dashboard</h1>
         <div class="actions">
+            <button class="btn btn-theme" onclick="toggleTheme()" id="themeBtn" title="Toggle dark mode">
+                <span id="themeIcon"></span>
+            </button>
             <button class="btn btn-upload" onclick="document.getElementById('uploadModal').classList.add('show')">Upload Chat History</button>
             <a href="/generate-pdf" class="btn btn-pdf">Generate PDF</a>
         </div>
@@ -274,19 +390,19 @@ DASHBOARD_HTML = """
         <!-- Stats Row -->
         <div class="stats-row">
             <div class="stat-card">
-                <div class="number">{{ total_projects }}</div>
+                <div class="number" id="statProjects">{{ total_projects }}</div>
                 <div class="label">Projects</div>
             </div>
             <div class="stat-card">
-                <div class="number">{{ total_events }}</div>
+                <div class="number" id="statEvents">{{ total_events }}</div>
                 <div class="label">Total Events</div>
             </div>
             <div class="stat-card">
-                <div class="number">{{ total_threads }}</div>
+                <div class="number" id="statThreads">{{ total_threads }}</div>
                 <div class="label">Open Threads</div>
             </div>
             <div class="stat-card">
-                <div class="number">{{ total_blockers }}</div>
+                <div class="number" id="statBlockers">{{ total_blockers }}</div>
                 <div class="label">Blockers</div>
             </div>
         </div>
@@ -304,11 +420,24 @@ DASHBOARD_HTML = """
             <canvas id="activityChart" height="80"></canvas>
         </div>
 
+        <!-- Filter bar -->
+        <div class="filter-bar">
+            <label>Show:</label>
+            <button class="filter-toggle active" onclick="toggleFilter('active', this)">Active</button>
+            <button class="filter-toggle" onclick="toggleFilter('eol', this)">Possibly EOL</button>
+            <button class="filter-toggle" onclick="toggleFilter('ignored', this)">Ignored</button>
+        </div>
+
         <!-- Project Cards -->
-        <div class="projects-grid">
+        <div class="projects-grid" id="projectsGrid">
             {% for p in project_cards %}
-            <a href="/project/{{ loop.index0 }}" class="project-card">
-                <div class="name">{{ p.name }}</div>
+            <div class="project-card {% if p.eol_reason %}eol{% endif %} {% if p.name in ignored_names %}hidden{% endif %}"
+                 data-name="{{ p.name }}" data-eol="{{ 'yes' if p.eol_reason else 'no' }}" data-ignored="{{ 'yes' if p.name in ignored_names else 'no' }}"
+                 onclick="if (!event.target.closest('.btn-ignore, .btn-restore')) window.location='/project/{{ loop.index0 }}'">
+                <div class="name">
+                    {{ p.name }}
+                    {% if p.eol_reason %}<span class="badge badge-eol">Possibly EOL</span>{% endif %}
+                </div>
                 <div class="meta">{{ p.category }} &middot; {{ p.status }}{% if p.last_worked %} &middot; Last: {{ p.last_worked }}{% endif %}</div>
                 <div class="progress-bar">
                     <div class="progress-fill" style="width: {{ p.progress }}%; background: {{ '#2ECC71' if p.progress > 75 else '#3498DB' if p.progress >= 50 else '#F1C40F' if p.progress >= 25 else '#E74C3C' }};"></div>
@@ -321,7 +450,19 @@ DASHBOARD_HTML = """
                     <span class="badge badge-blocker">{{ p.blockers }} blocker{{ 's' if p.blockers != 1 }}</span>
                     {% endif %}
                 </div>
-            </a>
+                {% if p.eol_reason and p.name not in ignored_names %}
+                <div class="eol-bar">
+                    <span class="reason">{{ p.eol_reason }}</span>
+                    <button class="btn-ignore" onclick="ignoreProject('{{ p.name }}')">Ignore</button>
+                </div>
+                {% endif %}
+                {% if p.name in ignored_names %}
+                <div class="eol-bar">
+                    <span class="reason">This project is hidden</span>
+                    <button class="btn-ignore btn-restore" onclick="restoreProject('{{ p.name }}')">Restore</button>
+                </div>
+                {% endif %}
+            </div>
             {% endfor %}
         </div>
 
@@ -352,15 +493,38 @@ DASHBOARD_HTML = """
     </div>
 
     <script>
-        // Chart.js setup
+        // ---- Dark mode ----
+        function toggleTheme() {
+            var cur = document.documentElement.getAttribute('data-theme');
+            var next = cur === 'dark' ? 'light' : 'dark';
+            document.documentElement.setAttribute('data-theme', next);
+            localStorage.setItem('theme', next);
+            updateThemeIcon();
+            updateChartColors();
+        }
+        function updateThemeIcon() {
+            var isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+            document.getElementById('themeIcon').textContent = isDark ? 'Light' : 'Dark';
+        }
+        updateThemeIcon();
+
+        function updateChartColors() {
+            var isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+            var textColor = isDark ? '#909296' : '#666';
+            var gridColor = isDark ? '#373a40' : '#e0e0e0';
+            chart.options.scales.x.ticks.color = textColor;
+            chart.options.scales.y.ticks.color = textColor;
+            chart.options.scales.y.grid = { color: gridColor };
+            chart.options.plugins.legend.labels.color = textColor;
+            chart.update();
+        }
+
+        // ---- Chart.js ----
         const chartData = {{ chart_data | tojson }};
         const ctx = document.getElementById('activityChart').getContext('2d');
         let chart = new Chart(ctx, {
             type: 'bar',
-            data: {
-                labels: chartData.labels,
-                datasets: chartData.datasets
-            },
+            data: { labels: chartData.labels, datasets: chartData.datasets },
             options: {
                 responsive: true,
                 plugins: { legend: { position: 'bottom', labels: { boxWidth: 12, font: { size: 11 } } } },
@@ -370,6 +534,7 @@ DASHBOARD_HTML = """
                 }
             }
         });
+        updateChartColors();
 
         function switchMode(mode, btn) {
             document.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('active'));
@@ -380,10 +545,51 @@ DASHBOARD_HTML = """
                     chart.data.labels = data.labels;
                     chart.data.datasets = data.datasets;
                     chart.update();
+                    updateChartColors();
                 });
         }
 
-        // Drag and drop
+        // ---- Filter: active / eol / ignored ----
+        var activeFilters = new Set(['active']);
+
+        function toggleFilter(filter, btn) {
+            if (activeFilters.has(filter)) {
+                activeFilters.delete(filter);
+                btn.classList.remove('active');
+            } else {
+                activeFilters.add(filter);
+                btn.classList.add('active');
+            }
+            applyFilters();
+        }
+
+        function applyFilters() {
+            document.querySelectorAll('.project-card').forEach(function(card) {
+                var isEol = card.dataset.eol === 'yes';
+                var isIgnored = card.dataset.ignored === 'yes';
+                var isActive = !isEol && !isIgnored;
+                var show = false;
+                if (activeFilters.has('active') && isActive) show = true;
+                if (activeFilters.has('eol') && isEol && !isIgnored) show = true;
+                if (activeFilters.has('ignored') && isIgnored) show = true;
+                card.classList.toggle('hidden', !show);
+            });
+        }
+        applyFilters();
+
+        // ---- Ignore/restore ----
+        function ignoreProject(name) {
+            fetch('/api/ignore', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name: name}) })
+                .then(r => r.json())
+                .then(() => location.reload());
+        }
+        function restoreProject(name) {
+            fetch('/api/restore', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name: name}) })
+                .then(r => r.json())
+                .then(() => location.reload());
+        }
+
+        // ---- Drag and drop ----
         const dropZone = document.getElementById('dropZone');
         const fileInput = document.getElementById('fileInput');
         const fileName = document.getElementById('fileName');
@@ -400,54 +606,70 @@ DASHBOARD_HTML = """
 </html>
 """
 
+# =============================================================================
+# PROJECT DETAIL HTML
+# =============================================================================
+
 PROJECT_DETAIL_HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ project.name }} — Decision Timeline</title>
+    <title>{{ project.name }} -- Decision Timeline</title>
     <style>
+        """ + THEME_CSS + """
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f6f8; color: #1a1a1a; }
-        .top-bar { background: #2C3E50; color: white; padding: 16px 24px; display: flex; align-items: center; gap: 16px; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); transition: background 0.3s, color 0.3s; }
+        .top-bar { background: var(--bar-bg); color: var(--bar-text); padding: 16px 24px; display: flex; align-items: center; gap: 16px; }
         .top-bar a { color: #8cc4e8; text-decoration: none; font-size: 13px; }
         .top-bar a:hover { color: white; }
-        .top-bar h1 { font-size: 18px; font-weight: 600; }
+        .top-bar h1 { font-size: 18px; font-weight: 600; flex: 1; }
+        .btn-theme { background: transparent; border: 1px solid rgba(255,255,255,0.3); color: var(--bar-text); font-size: 12px; padding: 5px 10px; border-radius: 4px; cursor: pointer; }
+        .btn-theme:hover { background: rgba(255,255,255,0.1); }
         .container { max-width: 800px; margin: 0 auto; padding: 24px 20px; }
-        .header-card { background: white; border-radius: 8px; padding: 22px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
-        .header-card .name { font-size: 20px; font-weight: 700; color: #2C3E50; }
-        .header-card .meta { font-size: 12px; color: #888; margin-top: 4px; }
-        .progress-bar { height: 8px; background: #eee; border-radius: 4px; overflow: hidden; margin: 12px 0; max-width: 300px; }
+        .header-card { background: var(--bg-card); border-radius: 8px; padding: 22px; margin-bottom: 20px; box-shadow: 0 1px 3px var(--shadow); }
+        .header-card .name { font-size: 20px; font-weight: 700; color: var(--heading); }
+        .header-card .meta { font-size: 12px; color: var(--text-secondary); margin-top: 4px; }
+        .progress-bar { height: 8px; background: var(--progress-bg); border-radius: 4px; overflow: hidden; margin: 12px 0; max-width: 300px; }
         .progress-fill { height: 100%; border-radius: 4px; }
-        .summary { font-size: 13px; color: #444; line-height: 1.6; margin-top: 12px; }
-        .section-title { font-size: 14px; font-weight: 600; color: #2C3E50; margin: 24px 0 12px; }
+        .summary { font-size: 13px; color: var(--text); line-height: 1.6; margin-top: 12px; }
+        .section-title { font-size: 14px; font-weight: 600; color: var(--heading); margin: 24px 0 12px; }
         .timeline { position: relative; padding-left: 24px; }
-        .timeline::before { content: ''; position: absolute; left: 7px; top: 4px; bottom: 4px; width: 2px; background: #e0e0e0; }
+        .timeline::before { content: ''; position: absolute; left: 7px; top: 4px; bottom: 4px; width: 2px; background: var(--border); }
         .timeline-entry { position: relative; margin-bottom: 16px; }
-        .timeline-entry::before { content: ''; position: absolute; left: -20px; top: 6px; width: 10px; height: 10px; border-radius: 50%; border: 2px solid white; }
+        .timeline-entry::before { content: ''; position: absolute; left: -20px; top: 6px; width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--bg); }
         .timeline-entry.commit::before { background: #3498DB; }
         .timeline-entry.chat::before { background: #9B59B6; }
         .timeline-entry.log::before { background: #2ECC71; }
-        .timeline-entry .date { font-size: 11px; font-weight: 600; color: #888; }
-        .timeline-entry .source { font-size: 10px; color: #aaa; margin-left: 4px; }
-        .timeline-entry .text { font-size: 13px; color: #333; margin-top: 2px; line-height: 1.5; }
+        .timeline-entry .date { font-size: 11px; font-weight: 600; color: var(--text-secondary); }
+        .timeline-entry .source { font-size: 10px; color: var(--text-muted); margin-left: 4px; }
+        .timeline-entry .text { font-size: 13px; color: var(--text); margin-top: 2px; line-height: 1.5; }
         .thread-list { list-style: none; }
-        .thread-list li { padding: 8px 0; border-bottom: 1px solid #f0f0f0; font-size: 13px; color: #444; }
+        .thread-list li { padding: 8px 0; border-bottom: 1px solid var(--border-light); font-size: 13px; color: var(--text); }
         .thread-list li:last-child { border-bottom: none; }
         .tag { display: inline-block; padding: 1px 7px; border-radius: 3px; font-size: 10px; font-weight: 600; margin-right: 6px; }
         .tag-blocker { background: #fce4ec; color: #c62828; }
         .tag-question { background: #fff3e0; color: #e65100; }
         .tag-next { background: #e3f2fd; color: #1565c0; }
-        .tag-notbuilt { background: #f5f5f5; color: #616161; }
-        .card { background: white; border-radius: 8px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
-        footer { text-align: center; font-size: 11px; color: #aaa; margin-top: 40px; padding-bottom: 20px; }
+        .tag-notbuilt { background: var(--stat-bg); color: var(--text-secondary); }
+        .card { background: var(--bg-card); border-radius: 8px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 3px var(--shadow); }
+        footer { text-align: center; font-size: 11px; color: var(--text-muted); margin-top: 40px; padding-bottom: 20px; }
+        footer a { color: var(--text-muted); text-decoration: none; }
+        footer a:hover { color: var(--text-secondary); }
     </style>
+    <script>
+        (function() {
+            var t = localStorage.getItem('theme') || 'light';
+            document.documentElement.setAttribute('data-theme', t);
+        })();
+    </script>
 </head>
 <body>
     <div class="top-bar">
         <a href="/">&larr; Dashboard</a>
         <h1>{{ project.name }}</h1>
+        <button class="btn-theme" onclick="toggleTheme()" id="themeBtn"><span id="themeIcon"></span></button>
     </div>
     <div class="container">
         <!-- Project Header -->
@@ -483,7 +705,7 @@ PROJECT_DETAIL_HTML = """
                 </div>
                 {% endfor %}
                 {% if not project.timeline %}
-                <p style="font-size:13px; color:#999; padding: 12px 0;">No timeline entries yet.</p>
+                <p style="font-size:13px; color: var(--text-muted); padding: 12px 0;">No timeline entries yet.</p>
                 {% endif %}
             </div>
         </div>
@@ -507,9 +729,20 @@ PROJECT_DETAIL_HTML = """
         {% endif %}
 
         <footer>
-            <a href="/" style="color:#888; text-decoration:none;">&larr; Back to Dashboard</a>
+            <a href="/">&larr; Back to Dashboard</a>
         </footer>
     </div>
+    <script>
+        function toggleTheme() {
+            var cur = document.documentElement.getAttribute('data-theme');
+            var next = cur === 'dark' ? 'light' : 'dark';
+            document.documentElement.setAttribute('data-theme', next);
+            localStorage.setItem('theme', next);
+            document.getElementById('themeIcon').textContent = next === 'dark' ? 'Light' : 'Dark';
+        }
+        document.getElementById('themeIcon').textContent =
+            document.documentElement.getAttribute('data-theme') === 'dark' ? 'Light' : 'Dark';
+    </script>
 </body>
 </html>
 """
@@ -525,32 +758,63 @@ def dashboard():
     if not projects:
         projects = _load_cached_projects()
 
-    chart_data = _aggregate_activity(projects, mode='day')
-    project_cards = _project_activity_breakdown(projects)
+    ignored_names = _load_ignored()
 
-    total_events = sum(c['total_events'] for c in project_cards)
-    total_threads = sum(c['open_threads'] for c in project_cards)
-    total_blockers = sum(c['blockers'] for c in project_cards)
+    # Only count non-ignored projects in stats
+    visible = [p for p in projects if p.get('name', '') not in ignored_names]
+
+    chart_data = _aggregate_activity(visible, mode='day')
+    project_cards = _project_activity_breakdown(projects)  # all projects, for filtering
+
+    total_events = sum(c['total_events'] for c in project_cards if c['name'] not in ignored_names)
+    total_threads = sum(c['open_threads'] for c in project_cards if c['name'] not in ignored_names)
+    total_blockers = sum(c['blockers'] for c in project_cards if c['name'] not in ignored_names)
 
     return render_template_string(
         DASHBOARD_HTML,
-        total_projects=len(projects),
+        total_projects=len(visible),
         total_events=total_events,
         total_threads=total_threads,
         total_blockers=total_blockers,
         chart_data=chart_data,
         project_cards=project_cards,
+        ignored_names=ignored_names,
         scan_paths=_project_cache.get('scan_paths', '~'),
     )
 
 
 @app.route('/api/chart-data')
 def api_chart_data():
-    """API endpoint for chart mode switching (day/week/month)."""
     mode = request.args.get('mode', 'day')
-    projects = _project_cache.get('projects', [])
+    ignored_names = _load_ignored()
+    projects = [p for p in _project_cache.get('projects', [])
+                if p.get('name', '') not in ignored_names]
     data = _aggregate_activity(projects, mode=mode)
     return jsonify(data)
+
+
+@app.route('/api/ignore', methods=['POST'])
+def api_ignore():
+    """Add a project to the ignored list."""
+    data = request.get_json(force=True)
+    name = data.get('name', '')
+    if name:
+        ignored = _load_ignored()
+        ignored.add(name)
+        _save_ignored(ignored)
+    return jsonify({'ok': True, 'ignored': sorted(_load_ignored())})
+
+
+@app.route('/api/restore', methods=['POST'])
+def api_restore():
+    """Remove a project from the ignored list."""
+    data = request.get_json(force=True)
+    name = data.get('name', '')
+    if name:
+        ignored = _load_ignored()
+        ignored.discard(name)
+        _save_ignored(ignored)
+    return jsonify({'ok': True, 'ignored': sorted(_load_ignored())})
 
 
 @app.route('/project/<int:idx>')
@@ -566,7 +830,6 @@ def project_detail(idx):
 
 @app.route('/upload', methods=['POST'])
 def upload():
-    """Handle chat history upload and refresh data."""
     chat_history_path = None
     chat_file = request.files.get('chat_history')
     if chat_file and chat_file.filename:
@@ -587,7 +850,6 @@ def upload():
 
 @app.route('/generate-pdf')
 def generate_pdf():
-    """Generate and download the portfolio PDF."""
     projects = _project_cache.get('projects', [])
     if not projects:
         projects = _load_cached_projects()
@@ -614,7 +876,6 @@ def generate_pdf():
 
 
 if __name__ == '__main__':
-    # Auto-load projects on startup
     print("Pre-loading projects...")
     _load_cached_projects()
     total = len(_project_cache['projects'])
