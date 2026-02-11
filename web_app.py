@@ -39,6 +39,7 @@ RESOLVED_FILE = os.path.expanduser('~/.claudesync_resolved.json')
 AI_CONFIG_FILE = os.path.expanduser('~/.claudesync_ai.json')
 ARCHIVED_FILE = os.path.expanduser('~/.claudesync_archived.json')
 IMPORT_META_FILE = os.path.expanduser('~/.claudesync_import_meta.json')
+ITEM_ACTIONS_FILE = os.path.expanduser('~/.claudesync_item_actions.json')
 
 # Cache loaded projects so dashboard + drill-down share data
 _project_cache = {
@@ -155,6 +156,31 @@ def _load_import_meta():
 def _save_import_meta(meta):
     with open(IMPORT_META_FILE, 'w') as f:
         json.dump(meta, f, indent=2)
+
+
+# =============================================================================
+# ITEM ACTIONS PERSISTENCE (reassign / ignore on what's-next items)
+# =============================================================================
+# Format: { "item_key": {"action": "ignored"|"reassigned", "target_project": "..."} }
+
+def _load_item_actions():
+    if os.path.exists(ITEM_ACTIONS_FILE):
+        try:
+            with open(ITEM_ACTIONS_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_item_actions(actions):
+    with open(ITEM_ACTIONS_FILE, 'w') as f:
+        json.dump(actions, f, indent=2)
+
+
+def _item_key(project_name, item_type, item_text):
+    """Stable key for an item across sessions."""
+    return f"{project_name}::{item_type}::{item_text[:80]}"
 
 
 # =============================================================================
@@ -498,6 +524,7 @@ DASHBOARD_HTML = """
             <button class="btn btn-theme" onclick="toggleTheme()" id="themeBtn" title="Toggle dark mode">
                 <span id="themeIcon"></span>
             </button>
+            <a href="/view/whats-next" class="btn" style="background:#e67e22;">What's Next</a>
             <button class="btn btn-upload" onclick="document.getElementById('uploadModal').classList.add('show')">Upload Chat History</button>
             <button class="btn" style="background:#8e44ad;" onclick="document.getElementById('aiModal').classList.add('show')">AI Settings</button>
             <a href="/generate-pdf" class="btn btn-pdf">Generate PDF</a>
@@ -1429,9 +1456,31 @@ LIST_VIEW_HTML = """
         .tag-chat { background: #f3e5f5; color: #7b1fa2; }
         .tag-log { background: #e8f5e9; color: #2e7d32; }
         .section-header { font-size: 12px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; padding: 20px 0 8px; }
+        .section-header .badge { display: inline-block; background: var(--heading); color: white; font-size: 10px; padding: 1px 8px; border-radius: 10px; margin-left: 6px; vertical-align: middle; }
         .empty { font-size: 13px; color: var(--text-muted); padding: 20px; text-align: center; }
         .progress-bar { height: 5px; background: var(--progress-bg); border-radius: 3px; overflow: hidden; width: 80px; display: inline-block; vertical-align: middle; margin-left: 8px; }
         .progress-fill { height: 100%; border-radius: 3px; }
+        .btn-sm.btn-ignore { border-color: #95a5a6; color: #95a5a6; }
+        .btn-sm.btn-ignore:hover { background: #95a5a6; color: white; }
+        .btn-sm.btn-reassign { border-color: #8e44ad; color: #8e44ad; }
+        .btn-sm.btn-reassign:hover { background: #8e44ad; color: white; }
+        .btn-sm.btn-undo { border-color: #3498db; color: #3498db; }
+        .btn-sm.btn-undo:hover { background: #3498db; color: white; }
+        .btn-sm.btn-verify { border-color: #e67e22; color: #e67e22; }
+        .btn-sm.btn-verify:hover { background: #e67e22; color: white; }
+        .reassign-dropdown { display: none; position: absolute; right: 0; top: 100%; background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 4px 12px var(--shadow-hover); z-index: 50; min-width: 200px; max-height: 250px; overflow-y: auto; }
+        .reassign-dropdown.show { display: block; }
+        .reassign-dropdown a { display: block; padding: 8px 14px; font-size: 12px; color: var(--text); text-decoration: none; border-bottom: 1px solid var(--border-light); }
+        .reassign-dropdown a:hover { background: var(--stat-bg); }
+        .reassign-dropdown a:last-child { border-bottom: none; }
+        .actions { position: relative; }
+        .item-ignored { opacity: 0.4; }
+        .item-reassigned { border-left: 3px solid #8e44ad; }
+        .confidence-bar { display: inline-block; width: 50px; height: 4px; background: var(--progress-bg); border-radius: 2px; vertical-align: middle; margin-left: 6px; }
+        .confidence-fill { height: 100%; border-radius: 2px; }
+        .flag { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 9px; font-weight: 700; margin-left: 4px; }
+        .flag-low { background: #fce4ec; color: #c62828; }
+        .flag-ok { background: #e8f5e9; color: #2e7d32; }
         footer { text-align: center; font-size: 11px; color: var(--text-muted); margin-top: 30px; }
         footer a { color: var(--text-muted); text-decoration: none; }
     </style>
@@ -1470,6 +1519,26 @@ LIST_VIEW_HTML = """
             .then(r => r.json())
             .then(function() { location.reload(); });
         }
+
+        function toggleDropdown(id) {
+            var el = document.getElementById(id);
+            // Close all other dropdowns first
+            document.querySelectorAll('.reassign-dropdown.show').forEach(function(d) {
+                if (d.id !== id) d.classList.remove('show');
+            });
+            el.classList.toggle('show');
+        }
+
+        function reassignItem(key, targetProject) {
+            apiAction('/api/item-action', {key: key, action: 'reassigned', target_project: targetProject}, document.createElement('button'));
+        }
+
+        // Close dropdowns when clicking outside
+        document.addEventListener('click', function(e) {
+            if (!e.target.closest('.actions')) {
+                document.querySelectorAll('.reassign-dropdown.show').forEach(function(d) { d.classList.remove('show'); });
+            }
+        });
     </script>
 </body>
 </html>
@@ -1649,6 +1718,324 @@ def api_unarchive():
         archived.discard(name)
         _save_archived(archived)
     return jsonify({'ok': True})
+
+
+@app.route('/view/whats-next')
+def view_whats_next():
+    """Cross-project view: what needs to happen next for every project."""
+    projects = _project_cache.get('projects', [])
+    if not projects:
+        projects = _load_cached_projects()
+
+    ignored = _load_ignored()
+    archived = _load_archived()
+    resolved = _load_resolved()
+    item_actions = _load_item_actions()
+    ai_config = _load_ai_config()
+    has_ai = bool(ai_config.get('api_key'))
+
+    # Collect project names for reassign dropdown
+    project_names = [p.get('name', '') for p in projects
+                     if p.get('name', '') not in ignored and p.get('name', '') not in archived]
+
+    # Build sections
+    next_items = []      # Active items per project
+    flagged_items = []   # Items that have been reassigned (show in target project)
+    ignored_items = []   # Dismissed items
+
+    dropdown_counter = 0
+
+    for i, p in enumerate(projects):
+        name = p.get('name', '')
+        if name in ignored or name in archived:
+            continue
+
+        category = p.get('category_group', 'Uncategorized')
+        progress = p.get('progress', 0)
+        status = p.get('status', 'Unknown')
+
+        # Gather all actionable items for this project
+        project_items = []
+
+        # Next Steps (highest priority)
+        for step in p.get('next_steps', []):
+            key = _item_key(name, 'Next Step', step)
+            project_items.append({
+                'key': key, 'type': 'Next Step', 'text': step,
+                'project': name, 'project_idx': i,
+                'tag_class': 'tag-next', 'priority': 1,
+            })
+
+        # Blockers
+        for b in p.get('blockers', []):
+            key = _item_key(name, 'Blocker', b)
+            tkey = _thread_key(name, b)
+            if tkey in resolved:
+                continue
+            project_items.append({
+                'key': key, 'type': 'Blocker', 'text': b,
+                'project': name, 'project_idx': i,
+                'tag_class': 'tag-blocker', 'priority': 0,
+            })
+
+        # Open Questions
+        for q in p.get('open_questions', []):
+            key = _item_key(name, 'Open Question', q)
+            tkey = _thread_key(name, q)
+            if tkey in resolved:
+                continue
+            project_items.append({
+                'key': key, 'type': 'Open Question', 'text': q,
+                'project': name, 'project_idx': i,
+                'tag_class': 'tag-question', 'priority': 2,
+            })
+
+        # Not Yet Built
+        for nw in p.get('not_working', []):
+            key = _item_key(name, 'Not Yet Built', nw)
+            project_items.append({
+                'key': key, 'type': 'Not Yet Built', 'text': nw,
+                'project': name, 'project_idx': i,
+                'tag_class': 'tag-notbuilt', 'priority': 3,
+            })
+
+        # Sort by priority (blockers first, then next steps, questions, not built)
+        project_items.sort(key=lambda x: x['priority'])
+
+        for item in project_items:
+            action = item_actions.get(item['key'])
+            if action and action.get('action') == 'ignored':
+                ignored_items.append(item)
+            elif action and action.get('action') == 'reassigned':
+                item['reassigned_to'] = action.get('target_project', '')
+                flagged_items.append(item)
+            else:
+                next_items.append(item)
+
+    # Group next_items by project
+    from collections import OrderedDict
+    by_project = OrderedDict()
+    for item in next_items:
+        proj = item['project']
+        if proj not in by_project:
+            # Find the project data
+            pidx = item['project_idx']
+            p = projects[pidx]
+            by_project[proj] = {
+                'items': [],
+                'idx': pidx,
+                'category': p.get('category_group', ''),
+                'progress': p.get('progress', 0),
+                'status': p.get('status', ''),
+            }
+        by_project[proj]['items'].append(item)
+
+    # Build HTML
+    content = ''
+
+    # Verify all categories button
+    if has_ai:
+        content += '<div style="margin-bottom:16px; text-align:right;"><button class="btn-sm btn-verify" onclick="verifyAllCategories(this)" style="padding:6px 14px; font-size:11px;">Verify All Categories with AI</button></div>'
+
+    # Active items grouped by project
+    active_count = len(next_items)
+    content += f'<div class="section-header">Action Items <span class="badge">{active_count}</span></div>'
+
+    if by_project:
+        for proj_name, proj_data in by_project.items():
+            progress = proj_data['progress']
+            color = '#2ECC71' if progress > 75 else '#3498DB' if progress >= 50 else '#F1C40F' if progress >= 25 else '#E74C3C'
+            cat = proj_data['category']
+
+            content += f'''<div class="list-card" style="margin-bottom:14px;">
+                <div class="list-item" style="background:var(--stat-bg); padding:10px 18px;">
+                    <div class="main">
+                        <div class="title" style="font-size:14px;">
+                            <a href="/project/{proj_data['idx']}" style="color:inherit; text-decoration:none;">{proj_name}</a>
+                            <div class="progress-bar"><div class="progress-fill" style="width:{progress}%; background:{color};"></div></div>
+                            <span id="cat-flag-{proj_data['idx']}"></span>
+                        </div>
+                        <div class="subtitle">{cat} &middot; {proj_data['status']}</div>
+                    </div>
+                </div>'''
+
+            for item in proj_data['items']:
+                dropdown_counter += 1
+                dd_id = f'dd-{dropdown_counter}'
+                safe_key = item['key'].replace("'", "&#39;").replace('"', '&quot;')
+                safe_text = item['text'].replace("'", "&#39;").replace('"', '&quot;')
+
+                content += f'''<div class="list-item">
+                    <div class="main">
+                        <div class="title"><span class="tag {item['tag_class']}">{item['type']}</span> {item['text']}</div>
+                    </div>
+                    <div class="actions">
+                        <button class="btn-sm btn-resolve" onclick="apiAction('/api/resolve-thread', {{project:'{item['project'].replace(chr(39), "&#39;")}', text:'{safe_text[:100]}'}}, this)">Resolve</button>
+                        <button class="btn-sm btn-ignore" onclick="apiAction('/api/item-action', {{key:'{safe_key}', action:'ignored'}}, this)">Ignore</button>
+                        <button class="btn-sm btn-reassign" onclick="toggleDropdown('{dd_id}')">Reassign</button>
+                        <div class="reassign-dropdown" id="{dd_id}">'''
+
+                for pn in project_names:
+                    if pn != item['project']:
+                        safe_pn = pn.replace("'", "&#39;")
+                        content += f'<a href="#" onclick="event.preventDefault(); reassignItem(\'{safe_key}\', \'{safe_pn}\')">{pn}</a>'
+
+                content += '</div></div></div>'
+
+            content += '</div>'
+    else:
+        content += '<div class="empty">No action items across any project</div>'
+
+    # Reassigned items
+    if flagged_items:
+        content += f'<div class="section-header">Reassigned <span class="badge">{len(flagged_items)}</span></div>'
+        content += '<div class="list-card">'
+        for item in flagged_items:
+            safe_key = item['key'].replace("'", "&#39;").replace('"', '&quot;')
+            content += f'''<div class="list-item item-reassigned">
+                <div class="main">
+                    <div class="title"><span class="tag {item['tag_class']}">{item['type']}</span> {item['text']}</div>
+                    <div class="subtitle">From <strong>{item['project']}</strong> &rarr; <strong>{item.get('reassigned_to', '?')}</strong></div>
+                </div>
+                <div class="actions">
+                    <button class="btn-sm btn-undo" onclick="apiAction('/api/item-action', {{key:'{safe_key}', action:'undo'}}, this)">Undo</button>
+                </div>
+            </div>'''
+        content += '</div>'
+
+    # Ignored items (collapsed by default)
+    if ignored_items:
+        content += f'<div class="section-header">Ignored <span class="badge">{len(ignored_items)}</span></div>'
+        content += '<div class="list-card">'
+        for item in ignored_items:
+            safe_key = item['key'].replace("'", "&#39;").replace('"', '&quot;')
+            content += f'''<div class="list-item item-ignored">
+                <div class="main">
+                    <div class="title"><span class="tag {item['tag_class']}">{item['type']}</span> {item['text']}</div>
+                    <div class="subtitle">{item['project']}</div>
+                </div>
+                <div class="actions">
+                    <button class="btn-sm btn-undo" onclick="apiAction('/api/item-action', {{key:'{safe_key}', action:'undo'}}, this)">Restore</button>
+                </div>
+            </div>'''
+        content += '</div>'
+
+    # Add verify script
+    content += '''
+    <script>
+    function verifyAllCategories(btn) {
+        btn.disabled = true;
+        btn.textContent = 'Verifying...';
+        fetch('/api/verify-categories', { method: 'POST' })
+        .then(r => r.json())
+        .then(function(data) {
+            btn.textContent = 'Done';
+            if (data.results) {
+                data.results.forEach(function(r) {
+                    var el = document.getElementById('cat-flag-' + r.idx);
+                    if (el) {
+                        if (r.confidence === 'low') {
+                            el.innerHTML = '<span class="flag flag-low">AI: should be ' + r.suggested + '</span>';
+                        } else {
+                            el.innerHTML = '<span class="flag flag-ok">OK</span>';
+                        }
+                    }
+                });
+            } else if (data.error) {
+                btn.textContent = data.error;
+            }
+        });
+    }
+    </script>'''
+
+    return render_template_string(LIST_VIEW_HTML, title=f"What's Next ({active_count} items)", content=content)
+
+
+@app.route('/api/item-action', methods=['POST'])
+def api_item_action():
+    """Ignore, reassign, or undo an action on a what's-next item."""
+    data = request.get_json(force=True)
+    key = data.get('key', '')
+    action = data.get('action', '')
+
+    if not key:
+        return jsonify({'error': 'Missing key'}), 400
+
+    actions = _load_item_actions()
+
+    if action == 'undo':
+        actions.pop(key, None)
+    elif action == 'ignored':
+        actions[key] = {'action': 'ignored'}
+    elif action == 'reassigned':
+        target = data.get('target_project', '')
+        actions[key] = {'action': 'reassigned', 'target_project': target}
+    else:
+        return jsonify({'error': 'Unknown action'}), 400
+
+    _save_item_actions(actions)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/verify-categories', methods=['POST'])
+def api_verify_categories():
+    """Use AI to verify each project is in the right category."""
+    projects = _project_cache.get('projects', [])
+    ignored = _load_ignored()
+    archived = _load_archived()
+
+    active = [(i, p) for i, p in enumerate(projects)
+              if p.get('name', '') not in ignored and p.get('name', '') not in archived]
+
+    if not active:
+        return jsonify({'results': []})
+
+    # Build a single prompt with all projects for efficiency
+    lines = []
+    for i, p in active:
+        name = p.get('name', '')
+        cat = p.get('category_group', 'Uncategorized')
+        features = ', '.join(p.get('features', [])[:5]) or 'none listed'
+        summary = p.get('summary', '')[:150] or 'no description'
+        lines.append(f"- [{i}] \"{name}\" -> current: {cat} | features: {features} | summary: {summary}")
+
+    project_list = '\n'.join(lines)
+
+    prompt = f"""Review these project categorizations. Valid categories: Church, School, Product, Infrastructure, Personal, Research.
+
+For each project, respond with one line in this exact format:
+[idx] OK
+or
+[idx] LOW suggested_category
+
+Only output LOW if the project clearly belongs in a different category. Be conservative — if unsure, say OK.
+
+Projects:
+{project_list}"""
+
+    result = _call_ai(prompt, max_tokens=500)
+    if not result:
+        return jsonify({'error': 'AI not configured or call failed'})
+
+    # Parse response
+    results = []
+    for line in result.strip().split('\n'):
+        line = line.strip()
+        if not line or not line.startswith('['):
+            continue
+        try:
+            idx_str = line[1:line.index(']')]
+            idx = int(idx_str)
+            rest = line[line.index(']')+1:].strip()
+            if rest.startswith('OK'):
+                results.append({'idx': idx, 'confidence': 'ok', 'suggested': ''})
+            elif rest.startswith('LOW'):
+                suggested = rest[3:].strip()
+                results.append({'idx': idx, 'confidence': 'low', 'suggested': suggested})
+        except (ValueError, IndexError):
+            continue
+
+    return jsonify({'results': results})
 
 
 if __name__ == '__main__':

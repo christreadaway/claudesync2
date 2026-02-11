@@ -195,6 +195,37 @@ Projects flagged as "Possibly EOL" if:
 - Persisted to `~/.claudesync_resolved.json`
 - Resolved threads hidden from counts and displays
 
+### 9. What's Next View (`/view/whats-next`)
+
+Cross-project triage view showing every actionable item across all projects.
+
+**Grouped by project**, sorted by priority:
+1. Blockers (red)
+2. Next Steps (blue)
+3. Open Questions (orange)
+4. Not Yet Built (gray)
+
+**Per-item actions:**
+- **Resolve** — marks the thread as resolved (same as thread resolution)
+- **Ignore** — dismisses the item, moves to Ignored section with Restore button
+- **Reassign** — dropdown of all other projects, moves item to Reassigned section showing "From X -> Y", with Undo button
+
+**Sections:**
+- Active items (grouped by project with progress bar and category)
+- Reassigned items (with Undo)
+- Ignored items (with Restore)
+
+**Persistence:** `~/.claudesync_item_actions.json` stores ignore/reassign decisions.
+
+### 10. AI Category Verification
+
+"Verify All Categories with AI" button on What's Next page:
+- Sends all active projects (name, category, features, summary) to the AI
+- AI evaluates whether each project is in the right category
+- Valid categories: Church, School, Product, Infrastructure, Personal, Research
+- Results shown inline as flags: green "OK" or red "AI: should be [category]"
+- Conservative — only flags low confidence mismatches
+
 ---
 
 ## CLI Tools
@@ -234,12 +265,15 @@ python3 generate_status_pdf.py --scan-paths "~ ~/projects" --chat-history ~/expo
 | GET | `/view/events` | All events list |
 | GET | `/view/threads` | Open threads list |
 | GET | `/view/blockers` | Blockers list |
+| GET | `/view/whats-next` | Cross-project triage view |
 | GET | `/api/chart-data?mode=day\|week\|month` | Activity chart data |
 | POST | `/api/ignore` | Hide project `{name}` |
 | POST | `/api/restore` | Unhide project `{name}` |
 | POST | `/api/archive` | Archive project `{name}` |
 | POST | `/api/unarchive` | Unarchive project `{name}` |
 | POST | `/api/resolve-thread` | Resolve thread `{project, text}` |
+| POST | `/api/item-action` | Ignore/reassign/undo item `{key, action, target_project?}` |
+| POST | `/api/verify-categories` | AI-verify all project categories |
 | POST | `/api/enrich/<idx>` | AI-enrich single project |
 | GET/POST | `/api/ai-config` | Get/save AI configuration |
 | POST | `/upload` | Upload chat zip + reload |
@@ -393,6 +427,7 @@ numpy>=1.24.0
 ~/.claudesync_archived.json     # Archived project names
 ~/.claudesync_ai.json           # AI API config (url, key, model)
 ~/.claudesync_import_meta.json  # Last chat import metadata
+~/.claudesync_item_actions.json # Item ignore/reassign decisions
 ```
 
 ---
