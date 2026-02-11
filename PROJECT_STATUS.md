@@ -9,7 +9,7 @@
 | **Project Name** | Claude Project Sync v2 |
 | **Repository** | christreadaway/claudesync2 |
 | **Category** | Infrastructure |
-| **Progress** | 40% |
+| **Progress** | 60% |
 | **Status** | Active |
 | **Last Worked** | 2026-02-11 |
 | **Has GitHub Repo** | Yes |
@@ -20,23 +20,56 @@
 ## Current State
 
 ### What's Working
+- Web dashboard on localhost:5111 with full project portfolio view
+- Clickable stat cards drill into /view/projects, /events, /threads, /blockers
+- Project detail pages with full timeline and open threads
+- Chat history upload and fuzzy matching to projects
+- AI enrichment via Anthropic API (Haiku/Sonnet/Opus model selector)
+- Bulk AI analysis checkbox on upload ("Analyze chats with AI")
+- Loading overlay prevents double-clicks during Load & Refresh / PDF gen
+- Archive/unarchive projects, ignore/restore EOL projects, resolve threads
+- Dark/light theme with persistence
+- PDF generation with category grouping, timeline, threads, cross-project summary
+- Import metadata tracking (last import timestamp + filename)
 - All project repos cloned to both Mac and Windows PC
 - PROJECT_STATUS.md files initialized in all projects
-- MCP filesystem server connected on Mac (Claude Desktop can read/write all project dirs)
-- Daily status report PDF generator built (generate_status_pdf.py)
-- init_project_status.py script working
-- update_repos.py for pulling latest from GitHub
+- init_project_status.py, update_repos.py, sync_history.py CLI tools
 
 ### What's Not Working
-- MCP was not connecting on Mac until today (Feb 4)
 - Daily PDF report automation (LaunchAgent plist created but not tested)
+- No overarching "what's next" view across all projects
+- No AI verification of project categorization
 
 ### Blockers
-- None currently — MCP now working on Mac
+- None currently
 
 ---
 
 ## Progress Log
+
+### 2026-02-11 (Claude Code — Dashboard v5 Features)
+**What was built:**
+- Loading overlay with spinner for Load & Refresh and Generate PDF (prevents double-clicks)
+- AI chat analysis: bulk enrichment checkbox in upload modal, shared _call_ai() helper
+- Model dropdown (Haiku 4.5 default, Sonnet 4.5, Opus 4.6) with sensible defaults
+- Clickable stat cards linking to 4 drill-down list views
+- /view/projects with Archive/Unarchive buttons (Active + Archived sections)
+- /view/events with all timeline events, newest first, typed tags (Commit/Chat/Log)
+- /view/threads with Resolve buttons
+- /view/blockers filtered to blockers only
+- Import metadata persistence (timestamp + filename shown in upload modal)
+- Fixed Jinja2 auto-escaping bug that showed raw HTML on list view pages
+- Deleted stale PRODUCT_SPEC_2026-02-03_023152.md backup
+- Rewrote PRODUCT_SPEC.md from v1 (CLI-only) to v5 (full web dashboard)
+
+**What was figured out:**
+- Jinja2 auto-escapes {{ content }} by default — need |safe filter for pre-built HTML
+- Archived projects should be separate from Ignored (archive = user choice, ignore = EOL dismissal)
+
+**Next time:**
+- Overarching "what's next" view across all projects
+- AI verification of project categorization/placement
+- Reassign/ignore actions on individual items
 
 ### 2026-02-04 (Claude.ai Chat — Sacramental Records Integration)
 **Source:** Claude.ai project chat, current session
