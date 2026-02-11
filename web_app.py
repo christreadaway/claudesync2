@@ -108,7 +108,7 @@ def _load_ai_config():
                 return json.load(f)
         except Exception:
             pass
-    return {'api_url': '', 'api_key': '', 'model': 'claude-sonnet-4-5-20250929'}
+    return {'api_url': 'https://api.anthropic.com/v1/messages', 'api_key': '', 'model': 'claude-haiku-4-5-20251001'}
 
 
 def _save_ai_config(config):
@@ -434,6 +434,13 @@ DASHBOARD_HTML = """
         .modal .btn { padding: 10px 22px; font-size: 13px; }
         .btn-cancel { background: var(--stat-bg); color: var(--text-secondary); }
         .btn-cancel:hover { background: var(--progress-bg); }
+        /* Loading overlay */
+        .loading-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--modal-bg); z-index: 200; justify-content: center; align-items: center; flex-direction: column; gap: 16px; }
+        .loading-overlay.show { display: flex; }
+        .spinner { width: 36px; height: 36px; border: 3px solid var(--border); border-top-color: #3498DB; border-radius: 50%; animation: spin 0.8s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .loading-text { font-size: 14px; color: var(--bar-text); font-weight: 500; }
+        .modal select { width: 100%; padding: 9px 12px; border: 1px solid var(--input-border); border-radius: 5px; font-size: 13px; background: var(--input-bg); color: var(--text); }
     </style>
     <script>
         // Apply theme before paint to prevent flash
@@ -569,6 +576,12 @@ DASHBOARD_HTML = """
         </footer>
     </div>
 
+    <!-- Loading Overlay -->
+    <div class="loading-overlay" id="loadingOverlay">
+        <div class="spinner"></div>
+        <div class="loading-text" id="loadingText">Loading projects...</div>
+    </div>
+
     <!-- Upload Modal -->
     <div class="modal-overlay" id="uploadModal">
         <div class="modal">
@@ -580,9 +593,18 @@ DASHBOARD_HTML = """
                     <input type="file" name="chat_history" id="fileInput" accept=".zip,.md,.txt">
                 </div>
                 <label for="scan_paths">Scan Paths</label>
-                <input type="text" name="scan_paths" value="{{ scan_paths }}" placeholder="~ ~/projects">
+                <input type="text" name="scan_paths" id="scanPaths" value="{{ scan_paths }}" placeholder="~ ~/projects">
+                {% if ai_config.api_key %}
+                <label style="margin-top:14px; display:flex; align-items:center; gap:8px; cursor:pointer;">
+                    <input type="checkbox" name="ai_analyze" id="aiAnalyze" value="1" style="width:auto;">
+                    <span>Analyze chats with AI for richer project descriptions</span>
+                </label>
+                <p style="font-size:10px; color:var(--text-muted); margin-top:2px;">Uses {{ ai_config.model }} &mdash; costs a few cents per project</p>
+                {% else %}
+                <p style="font-size:11px; color:var(--text-muted); margin-top:14px;">Configure an API key in AI Settings to enable AI-powered chat analysis.</p>
+                {% endif %}
                 <div class="btn-row">
-                    <button type="submit" class="btn btn-upload">Load & Refresh</button>
+                    <button type="submit" class="btn btn-upload" id="uploadBtn">Load & Refresh</button>
                     <button type="button" class="btn btn-cancel" onclick="document.getElementById('uploadModal').classList.remove('show')">Cancel</button>
                 </div>
             </form>
@@ -605,7 +627,11 @@ DASHBOARD_HTML = """
                 {% if ai_config.api_key %}Currently set ({{ ai_config.api_key[:8] }}...){% else %}Not configured{% endif %}
             </p>
             <label for="ai_model">Model</label>
-            <input type="text" id="ai_model" placeholder="claude-sonnet-4-5-20250929" value="{{ ai_config.model }}">
+            <select id="ai_model">
+                <option value="claude-haiku-4-5-20251001" {{ 'selected' if ai_config.model == 'claude-haiku-4-5-20251001' }}>Haiku 4.5 (fastest, cheapest)</option>
+                <option value="claude-sonnet-4-5-20250929" {{ 'selected' if ai_config.model == 'claude-sonnet-4-5-20250929' }}>Sonnet 4.5 (balanced)</option>
+                <option value="claude-opus-4-6" {{ 'selected' if ai_config.model == 'claude-opus-4-6' }}>Opus 4.6 (most capable)</option>
+            </select>
             <div class="btn-row">
                 <button class="btn" style="background:#8e44ad;" onclick="saveAiConfig()">Save</button>
                 <button type="button" class="btn btn-cancel" onclick="document.getElementById('aiModal').classList.remove('show')">Cancel</button>
@@ -724,6 +750,24 @@ DASHBOARD_HTML = """
                 .then(r => r.json())
                 .then(() => location.reload());
         }
+
+        // ---- Loading overlay ----
+        function showLoading(text) {
+            document.getElementById('loadingText').textContent = text || 'Loading...';
+            document.getElementById('loadingOverlay').classList.add('show');
+        }
+
+        // Intercept upload form submit
+        document.querySelector('#uploadModal form').addEventListener('submit', function(e) {
+            showLoading('Loading projects... this may take a moment');
+            document.getElementById('uploadModal').classList.remove('show');
+            document.getElementById('uploadBtn').disabled = true;
+        });
+
+        // Intercept Generate PDF link
+        document.querySelector('a[href="/generate-pdf"]').addEventListener('click', function(e) {
+            showLoading('Generating PDF...');
+        });
 
         // ---- Drag and drop ----
         const dropZone = document.getElementById('dropZone');
@@ -950,6 +994,97 @@ PROJECT_DETAIL_HTML = """
 
 
 # =============================================================================
+# AI HELPERS
+# =============================================================================
+
+def _call_ai(prompt, max_tokens=300):
+    """Call the configured AI API. Returns text or None on failure."""
+    import urllib.request
+    import urllib.error
+
+    ai_config = _load_ai_config()
+    api_url = ai_config.get('api_url', '')
+    api_key = ai_config.get('api_key', '')
+    model = ai_config.get('model', 'claude-haiku-4-5-20251001')
+
+    if not api_url or not api_key:
+        return None
+
+    req_body = json.dumps({
+        'model': model,
+        'max_tokens': max_tokens,
+        'messages': [{'role': 'user', 'content': prompt}],
+    }).encode('utf-8')
+
+    req = urllib.request.Request(api_url, data=req_body)
+    req.add_header('Content-Type', 'application/json')
+    req.add_header('x-api-key', api_key)
+    req.add_header('anthropic-version', '2023-06-01')
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode('utf-8'))
+            return result.get('content', [{}])[0].get('text', '')
+    except Exception as e:
+        print(f"AI call failed: {e}")
+        return None
+
+
+def _ai_enrich_all_projects():
+    """Use AI to generate richer descriptions for all projects.
+
+    Sends each project's context (timeline, features, chat snippets,
+    threads) to the AI and updates the narrative in the cache.
+    Returns count of enriched projects.
+    """
+    projects = _project_cache.get('projects', [])
+    enriched = 0
+
+    for project in projects:
+        timeline = project.get('timeline', [])
+        if not timeline and not project.get('features'):
+            continue  # nothing to analyze
+
+        timeline_text = '\n'.join(
+            f"- {e.get('date', '?')}: [{e.get('source', '')}] {e.get('text', '')}"
+            for e in timeline[:15]
+        )
+        threads_text = '\n'.join(
+            f"- [{t}] {txt}" for t, txt in project.get('open_threads', [])
+        )
+        features_text = '\n'.join(f"- {f}" for f in project.get('features', []))
+        not_working = '\n'.join(f"- {f}" for f in project.get('not_working', []))
+
+        prompt = f"""Summarize this project in 3-5 clear sentences. Include what it does, current state, and what's actively happening.
+
+Project: {project.get('name', '')}
+Status: {project.get('status', 'Unknown')} ({project.get('progress', 0)}% complete)
+Category: {project.get('category_group', '')}
+
+What's working:
+{features_text or 'None listed'}
+
+What's not working yet:
+{not_working or 'None listed'}
+
+Recent activity:
+{timeline_text or 'No recent activity'}
+
+Open threads:
+{threads_text or 'None'}
+
+Be specific and factual. No filler language."""
+
+        result = _call_ai(prompt, max_tokens=250)
+        if result:
+            project['narrative'] = result
+            enriched += 1
+            print(f"  AI enriched: {project.get('name', '')}")
+
+    return enriched
+
+
+# =============================================================================
 # ROUTES
 # =============================================================================
 
@@ -1066,24 +1201,12 @@ def api_resolve_thread():
 @app.route('/api/enrich/<int:idx>', methods=['POST'])
 def api_enrich(idx):
     """Use AI to generate a richer project description."""
-    import urllib.request
-    import urllib.error
-
     projects = _project_cache.get('projects', [])
     if idx < 0 or idx >= len(projects):
         return jsonify({'error': 'Project not found'}), 404
 
     project = projects[idx]
-    ai_config = _load_ai_config()
 
-    api_url = ai_config.get('api_url', '')
-    api_key = ai_config.get('api_key', '')
-    model = ai_config.get('model', 'claude-sonnet-4-5-20250929')
-
-    if not api_url or not api_key:
-        return jsonify({'error': 'AI not configured. POST to /api/ai-config first.'})
-
-    # Build context from project data
     timeline_text = '\n'.join(
         f"- {e.get('date', '?')}: [{e.get('source', '')}] {e.get('text', '')}"
         for e in project.get('timeline', [])[:15]
@@ -1092,16 +1215,20 @@ def api_enrich(idx):
         f"- [{t}] {txt}" for t, txt in project.get('open_threads', [])
     )
     features_text = '\n'.join(f"- {f}" for f in project.get('features', []))
+    not_working = '\n'.join(f"- {f}" for f in project.get('not_working', []))
 
-    prompt = f"""Write a concise 3-5 sentence project description for "{project.get('name', '')}".
+    prompt = f"""Summarize this project in 3-5 clear sentences. Include what it does, current state, and what's actively happening.
 
-Current status: {project.get('status', 'Unknown')} ({project.get('progress', 0)}% complete)
+Project: {project.get('name', '')}
+Status: {project.get('status', 'Unknown')} ({project.get('progress', 0)}% complete)
 Category: {project.get('category_group', '')}
-
 Current description: {project.get('summary', 'None')}
 
 What's working:
 {features_text or 'None listed'}
+
+What's not working yet:
+{not_working or 'None listed'}
 
 Recent activity:
 {timeline_text or 'No recent activity'}
@@ -1109,30 +1236,14 @@ Recent activity:
 Open threads:
 {threads_text or 'None'}
 
-Write a clear, informative description that captures what this project is, its current state, and what's actively happening. Be specific, not generic."""
+Be specific and factual. No filler language."""
 
-    # Call the AI API (Anthropic Messages API format)
-    req_body = json.dumps({
-        'model': model,
-        'max_tokens': 300,
-        'messages': [{'role': 'user', 'content': prompt}],
-    }).encode('utf-8')
-
-    req = urllib.request.Request(api_url, data=req_body)
-    req.add_header('Content-Type', 'application/json')
-    req.add_header('x-api-key', api_key)
-    req.add_header('anthropic-version', '2023-06-01')
-
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read().decode('utf-8'))
-            text = result.get('content', [{}])[0].get('text', '')
-            return jsonify({'description': text})
-    except urllib.error.HTTPError as e:
-        body = e.read().decode('utf-8', errors='replace')
-        return jsonify({'error': f'API error {e.code}: {body[:200]}'})
-    except Exception as e:
-        return jsonify({'error': str(e)})
+    result = _call_ai(prompt, max_tokens=250)
+    if result:
+        project['narrative'] = result
+        return jsonify({'description': result})
+    else:
+        return jsonify({'error': 'AI not configured or call failed. Check AI Settings.'})
 
 
 @app.route('/api/ai-config', methods=['GET', 'POST'])
@@ -1168,12 +1279,21 @@ def upload():
         print(f"Chat history uploaded: {save_path}")
 
     scan_paths_str = request.form.get('scan_paths', '~').strip() or '~'
+    ai_analyze = request.form.get('ai_analyze') == '1'
 
     _load_cached_projects(scan_paths_str, chat_history_path)
 
+    enriched = 0
+    if ai_analyze:
+        enriched = _ai_enrich_all_projects()
+
     total = len(_project_cache['projects'])
-    flash(f'Loaded {total} projects.' +
-          (' Chat history integrated.' if chat_history_path else ''), 'success')
+    msg = f'Loaded {total} projects.'
+    if chat_history_path:
+        msg += ' Chat history integrated.'
+    if enriched > 0:
+        msg += f' AI enriched {enriched} project descriptions.'
+    flash(msg, 'success')
     return redirect(url_for('dashboard'))
 
 
