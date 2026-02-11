@@ -15,6 +15,7 @@ from datetime import datetime
 
 
 CATEGORIES = ['Infrastructure', 'School', 'Church', 'Product', 'Research', 'Personal']
+DEV_STATES = ['test', 'refine', 'continue']
 
 TEMPLATE = '''# PROJECT_STATUS: {name}
 
@@ -34,6 +35,7 @@ TEMPLATE = '''# PROJECT_STATUS: {name}
 | **Status** | {status} |
 | **Last Worked** | {date} |
 | **Has GitHub Repo** | {has_repo} |
+| **Dev State** | {dev_state} |
 
 ---
 
@@ -80,7 +82,8 @@ TEMPLATE = '''# PROJECT_STATUS: {name}
 '''
 
 
-def init_project_status(project_path, name, category, repo=None, progress=0, status='Not Started'):
+def init_project_status(project_path, name, category, repo=None, progress=0,
+                        status='Not Started', dev_state=''):
     """Initialize a PROJECT_STATUS.md file in the given project directory."""
 
     project_path = os.path.abspath(os.path.expanduser(project_path))
@@ -108,7 +111,8 @@ def init_project_status(project_path, name, category, repo=None, progress=0, sta
         progress=progress,
         status=status,
         date=today,
-        has_repo=has_repo
+        has_repo=has_repo,
+        dev_state=dev_state
     )
 
     with open(status_file, 'w') as f:
@@ -134,6 +138,8 @@ def main():
     parser.add_argument('--repo', '-r', default=None, help='GitHub repository')
     parser.add_argument('--progress', '-p', type=int, default=0, help='Initial progress (0-100)')
     parser.add_argument('--status', '-s', default='Not Started', help='Initial status string')
+    parser.add_argument('--dev-state', '-d', default='', choices=DEV_STATES + [''],
+                        help='Development state (test/refine/continue)')
 
     args = parser.parse_args()
 
@@ -142,7 +148,7 @@ def main():
         return
 
     init_project_status(args.project_path, args.name, args.category,
-                        args.repo, args.progress, args.status)
+                        args.repo, args.progress, args.status, args.dev_state)
 
 
 if __name__ == '__main__':

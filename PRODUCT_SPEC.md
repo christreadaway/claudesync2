@@ -1,71 +1,34 @@
-# Product Spec: Claude Project Sync v6
+# Product Spec: Claude Project Sync
 
 ## Product Overview
 
-**Product Name:** Claude Project Sync (claudesync2)
+**Product Name:** Claude Project Sync
 
-**Problem Statement:** Developers using Claude Code (CLI) work across many projects, but Claude.ai (web) has no visibility into project status, progress, or recent work. Each new conversation starts from zero context. Chat history contains valuable project intelligence that's trapped in export zips. There's no bridge between the two environments.
+**Problem Statement:** Developers using Claude Code (CLI) work across multiple projects, but Claude.ai (web interface) has no visibility into project status, progress, or recent work. Each new Claude.ai conversation starts from zero context. There's no bridge between the two environments.
 
 **Solution:** A local-first system that:
 1. Maintains per-project status files (`PROJECT_STATUS.md`)
-2. Runs a live web dashboard with real-time project data
-3. Parses Claude.ai chat history exports and matches conversations to initiatives
-4. Automatically enriches and classifies using the Anthropic API when a key is present
-5. Generates a downloadable PDF report for sharing with Claude.ai
-6. Tracks open threads, blockers, and decisions across all projects
-7. Uses AI to classify unmatched conversations into new or existing initiatives
-
----
-
-## Architecture
-
-```
-PROJECT_STATUS.md files (per-project, in each repo)
-        |
-        v
-generate_status_pdf.py — scanner, parser, chat matcher, PDF renderer
-        |
-        v
-web_app.py — Flask dashboard (localhost:5111)
-        |
-        ├── Dashboard (stats, chart, project cards, filters)
-        ├── Drill-down views (/view/projects, /events, /threads, /blockers)
-        ├── What's Next triage (/view/whats-next)
-        ├── Unmatched conversations (/view/unmatched)
-        ├── Project detail pages (/project/<idx>)
-        ├── Upload modal (chat history zip + scan paths)
-        ├── Background processing (threading + progress polling)
-        ├── AI integration (auto when key present, prompt when not)
-        └── PDF generation (/generate-pdf)
-```
-
-**Persistence layer** (all `~/.claudesync_*.json`):
-- `_ignored.json` — hidden/EOL project names
-- `_resolved.json` — resolved thread keys
-- `_archived.json` — archived project names
-- `_ai.json` — API config (url, key, model)
-- `_import_meta.json` — last chat import timestamp + filename
-- `_item_actions.json` — item ignore/reassign decisions (What's Next)
-- `_initiatives.json` — AI classification results for unmatched chats
+2. Generates a visual PDF dashboard from real project data
+3. Allows uploading the PDF to Claude.ai for instant context
 
 ---
 
 ## User Story
 
-**Who:** A developer managing 5-30+ projects, using Claude Code for development and Claude.ai for planning/research.
+**Who:** A developer managing 5-15+ projects, using Claude Code for development work and Claude.ai for planning, research, or conversation.
+
+**What they're trying to accomplish:**
+- Keep Claude.ai informed about what's been built across all projects
+- Quickly share project status without manual summarization
+- Track progress across multiple repositories
+- Maintain continuity between Claude Code sessions and Claude.ai conversations
 
 **Workflow:**
-1. Developer works in Claude Code — commits happen on `claude/*` branches, `PROJECT_STATUS.md` files get updated
-2. Developer opens `http://localhost:5111` in their browser
-3. Clicks "Upload Chat History" — drops in a Claude.ai export zip + scan paths
-4. **If API key exists:** AI enrichment + initiative classification runs automatically in the background
-5. **If no API key:** A prompt appears asking "Enable AI-Enhanced Results?" with an API key field — OK to save and enable, Skip to proceed without
-6. App stays fully usable during processing — top-nav progress bar shows step-by-step status
-7. Dashboard populates with all projects, activity charts, thread counts, blockers
-8. Clicks into any project for full timeline and open threads
-9. Checks "What's Next" for cross-project triage of all action items
-10. Checks "Unmatched Conversations" to see chat that couldn't be auto-matched + AI suggestions
-11. Clicks "Generate PDF" for a downloadable report to share with Claude.ai
+1. Developer works in Claude Code on various projects (commits happen on `claude/*` branches)
+2. At any time, developer runs `python3 generate_status_pdf.py`
+3. PDF is generated with all project statuses and recent commits
+4. Developer uploads PDF to Claude.ai conversation
+5. Claude.ai now has full context on all projects
 
 ---
 
@@ -73,324 +36,174 @@ web_app.py — Flask dashboard (localhost:5111)
 
 ### 1. Project Status Files (`PROJECT_STATUS.md`)
 
-Each project directory contains a `PROJECT_STATUS.md` with:
-- Metadata table (name, repo, category, progress %, status, last worked, last synced)
-- "What's Working" bullet list
-- "What's Not Working" bullet list
-- "Blockers" bullet list
-- "Progress Log" with dated session entries (`### YYYY-MM-DD`)
-- "Open Design Questions" markdown table
-- "Next Steps" numbered/bulleted list
-- "Reusable Assets" table
+Each project directory contains a `PROJECT_STATUS.md` file with:
+- Project metadata (name, repo, category, progress %, status)
+- "What's Working" section for documenting features
+- Progress log for session-by-session updates
 
-**Critical Design Decision:** `CLAUDE.md` contains ONLY behavioral instructions for Claude Code. Status data belongs ONLY in `PROJECT_STATUS.md`. These must never be mixed.
+**Critical Design Decision:** `CLAUDE.md` contains ONLY behavioral instructions for Claude Code. Status data belongs ONLY in `PROJECT_STATUS.md` and PDF reports. These must never be mixed.
 
-### 2. Web Dashboard (`web_app.py`)
+### 2. PDF Dashboard Generator (`generate_status_pdf.py`)
 
-Flask app running on `localhost:5111`. Fully local — nothing leaves the machine.
+Generates a 2-page PDF report:
 
-**Dashboard page (`/`):**
-- 5 clickable stat cards: Projects, Events, Threads, Blockers, Unmatched Chats — each links to a drill-down view
-- Stacked bar chart (Chart.js) showing activity across all projects, toggleable by Day/Week/Month
-- Filter bar: Active, Possibly EOL, Ignored
-- Project card grid (responsive, 320px min) with:
-  - Progress bar (color-coded by %)
-  - Activity counts (commits, chats, logs)
-  - Last 3 decisions
-  - First 3 open threads with color-coded tags
-  - EOL detection with Ignore button
-- Dark/light theme toggle (persisted in localStorage)
-- Top-bar buttons: What's Next, Upload Chat History, AI Settings, Generate PDF
-- Upload Chat History modal
-- AI Settings modal (manual override for url/key/model)
+**Page 1: Dashboard**
+- Project progress bar chart (all projects, sorted by progress)
+- Pie chart showing GitHub repo status
+- Bar chart showing projects by category
+- Tables listing projects with/without repos
 
-**Drill-down list views:**
-- `/view/projects` — all projects, split into Active and Archived sections, with Archive/Unarchive buttons
-- `/view/events` — all timeline events across all projects, newest first, tagged by type (Commit/Chat/Log)
-- `/view/threads` — all open threads with Resolve buttons, grouped by project
-- `/view/blockers` — filtered to blocker-type threads only, with Resolve buttons
-- `/view/whats-next` — cross-project triage (see Section 9)
-- `/view/unmatched` — unmatched chat conversations + AI classification (see Section 11)
+**Page 2: Recent Work (2-column layout)**
+- Each project shows name and progress percentage
+- Last 5 meaningful commits from git history
+- Scans ALL branches (including `claude/*` feature branches)
+- Filters out garbage commits
 
-**Project detail page (`/project/<idx>`):**
-- Header card with metadata, progress bar, narrative description
-- Full decision timeline with dated entries, source tags, colored bullets
-- Open threads card with Resolve buttons
-- "Enrich with AI" button (when API key configured)
+### 3. Project Initializer (`init_project_status.py`)
 
-### 3. Non-Blocking Background Processing
-
-All heavy work (scanning, parsing, chat matching, AI enrichment, AI classification) runs in a **background thread**. The app stays fully usable during processing.
-
-**Top-nav progress bar:**
-- Slim bar below the top bar, visible only during processing
-- Shows spinner + step name + detail message
-- Steps: Scanning → Parsing → Reading Chat → Matching Chat → AI Enrichment → AI Classifying → Building → Done
-- Progress track fills based on current step
-- Auto-reloads the page 1.5s after completion
-- Error state shown in red if something fails
-
-**Implementation:** Background thread + `/api/progress` polling every 500ms. No SSE or WebSockets needed.
-
-### 4. Chat History Integration
-
-**Upload flow:**
-- User exports chat history from Claude.ai (zip file)
-- Uploads via drag-and-drop or file picker in the Upload modal
-- System extracts .md/.txt/.json files from the zip
-- Two-tier matching:
-  1. **Per-conversation:** If ANY paragraph in a chat file mentions a project, that whole file counts as a conversation event for that project
-  2. **Per-paragraph:** Best-scoring paragraphs become detailed timeline entries with excerpts
-- Import timestamp and filename saved for reference
-
-**Matching algorithm:**
-- Builds search terms per project: name variants, without version, squashed, first words, longest word
-- Scores paragraphs by: term frequency * term length, length bonus, descriptive word bonus
-- Deduplicates by word overlap ratio (>0.65 = skip)
-- Keeps up to 50 snippets per project
-- Minimum paragraph length: 30 characters
-- Code ratio filter: skip if >60% code lines
-
-**Unmatched tracking:**
-- Chat files that don't match any project are collected with excerpts
-- Stored in chat stats for the AI classification step
-- Shown on the dashboard as an "Unmatched Chats" stat card
-
-### 5. AI Integration
-
-**Automatic behavior:**
-- **When API key exists:** AI runs automatically on every Load & Refresh — no opt-in needed
-  - Enriches all project descriptions
-  - Classifies all unmatched chat conversations into initiatives
-- **When no API key exists:** A prompt modal appears on Load asking "Enable AI-Enhanced Results?"
-  - Shows what AI does (enrichment, classification, verification)
-  - API key input field
-  - **OK:** saves the key to `~/.claudesync_ai.json`, proceeds with AI enabled
-  - **Skip:** proceeds without AI
-
-**AI Settings modal** (manual override):
-- API URL (default: `https://api.anthropic.com/v1/messages`)
-- API Key (stored locally, masked in UI)
-- Model dropdown: Haiku 4.5 (default, cheapest), Sonnet 4.5 (balanced), Opus 4.6 (most capable)
-
-**Enrichment modes:**
-- **Bulk enrichment** — during Load & Refresh background task
-- **Per-project enrichment** — "Enrich with AI" button on project detail page
-
-**Enrichment prompt:**
-- Sends: project name, status, progress, category, features, not-working, recent timeline, open threads
-- Asks for: 3-5 sentence summary covering what it does, current state, what's happening
-- max_tokens: 250, timeout: 30s
-
-### 6. PDF Generator (`generate_status_pdf.py`)
-
-Generates a multi-page PDF grouped by category:
-
-**Per-project block:**
-- Header with progress % and status
-- Meta line: last active, last synced
-- Narrative paragraph
-- Recent Activity (last 5 timeline items, human-readable dates)
-- Open Threads (max 6, color-coded tags, truncated to 120 chars)
-
-**Cross-project section:**
-- "What's Left Unfinished" — shows all projects with open threads
-- Grouped by project name, first 4 threads per project
-- Color-coded by thread type
-
-**Category ordering:** Church, School, Product, Infrastructure, Personal, Research
-
-### 7. EOL Detection
-
-Projects flagged as "Possibly EOL" if:
-- Status contains: abandoned, archived, deprecated, eol, merged, completed, sunset, dead
-- No activity in 90+ days
-- 0% progress AND no timeline entries
-
-### 8. Archive & Ignore System
-
-**Ignore** (for EOL projects on dashboard):
-- Ignore button on EOL-flagged cards
-- Persisted to `~/.claudesync_ignored.json`
-- Restore button to bring back
-
-**Archive** (on /view/projects):
-- Archive button per project
-- Archived projects excluded from dashboard stats and chart
-- Persisted to `~/.claudesync_archived.json`
-- Unarchive to restore
-
-### 9. Thread Resolution
-
-- Resolve button on threads in detail pages and list views
-- Thread key: `project_name::thread_text[:100]`
-- Persisted to `~/.claudesync_resolved.json`
-- Resolved threads hidden from counts and displays
-
-### 10. What's Next View (`/view/whats-next`)
-
-Cross-project triage view showing every actionable item across all projects.
-
-**Grouped by project**, sorted by priority:
-1. Blockers (red)
-2. Next Steps (blue)
-3. Open Questions (orange)
-4. Not Yet Built (gray)
-
-**Per-item actions:**
-- **Resolve** — marks the thread as resolved
-- **Ignore** — dismisses the item, moves to Ignored section with Restore button
-- **Reassign** — dropdown of all other projects, moves item to Reassigned section showing "From X → Y", with Undo button
-
-**Sections:**
-- Active items (grouped by project with progress bar and category)
-- Reassigned items (with Undo)
-- Ignored items (with Restore)
-
-**AI Category Verification:**
-- "Verify All Categories with AI" button at top of page
-- Sends all projects to AI in a single call
-- Flags low-confidence categorizations inline: red "AI: should be [category]" or green "OK"
-
-**Persistence:** `~/.claudesync_item_actions.json`
-
-### 11. Unmatched Conversations & Initiative Classification (`/view/unmatched`)
-
-Shows chat conversations that weren't automatically matched to any project by fuzzy name matching.
-
-**Stats bar:** Unmatched Conversations, New Initiatives Suggested, Matched to Existing, Skipped (small talk)
-
-**AI classification** (runs automatically during Load & Refresh when key is present):
-- Sends unmatched conversations to AI in batches of 15
-- AI responds per conversation with:
-  - `MATCH initiative_name` — belongs to an existing project/initiative
-  - `NEW suggested_initiative_name` — suggests a new 2-5 word initiative name
-  - `SKIP` — too vague, greetings, small talk
-- Results grouped by suggested initiative with conversation excerpts
-- Can also be triggered manually via "Classify with AI" button
-
-**Persistence:** `~/.claudesync_initiatives.json`
-
----
-
-## CLI Tools
-
-### `init_project_status.py`
+CLI tool to create `PROJECT_STATUS.md` in a project:
 ```bash
 python3 init_project_status.py ~/myproject --name "My Project" --category School
 ```
-Options: `--name` (required), `--category`, `--repo`, `--progress`, `--status`
 
-### `update_repos.py`
+Options:
+- `--name` (required): Project display name
+- `--category`: Infrastructure, School, Church, Product, Research, Personal
+- `--repo`: GitHub repository (user/repo format)
+- `--progress`: Initial progress percentage (0-100)
+- `--status`: Initial status string
+
+### 4. Repository Updater (`update_repos.py`)
+
+Auto-detects GitHub repos from local git directories:
 ```bash
 python3 update_repos.py          # Auto-detect all
 python3 update_repos.py --list   # Show current status
-python3 update_repos.py --project "Name" --repo "user/repo"
+python3 update_repos.py --project "Name" --repo "user/repo"  # Manual update
 ```
 
-### `sync_history.py`
-```bash
-python3 sync_history.py --assets  # Build SHARED_ASSETS.md registry
-```
-
-### `generate_status_pdf.py` (standalone CLI)
-```bash
-python3 generate_status_pdf.py --scan-paths "~ ~/projects" --chat-history ~/export.zip
-```
+Reads `git remote get-url origin` from each project directory and updates the `PROJECT_STATUS.md` files automatically.
 
 ---
 
-## API Endpoints
+## Inputs and Outputs
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/` | Dashboard |
-| GET | `/project/<idx>` | Project detail |
-| GET | `/view/projects` | All projects list |
-| GET | `/view/events` | All events list |
-| GET | `/view/threads` | Open threads list |
-| GET | `/view/blockers` | Blockers list |
-| GET | `/view/whats-next` | Cross-project triage view |
-| GET | `/view/unmatched` | Unmatched conversations + AI classification |
-| GET | `/api/progress` | Background task status (running, step, detail) |
-| GET | `/api/chart-data?mode=day\|week\|month` | Activity chart data |
-| POST | `/api/ignore` | Hide project `{name}` |
-| POST | `/api/restore` | Unhide project `{name}` |
-| POST | `/api/archive` | Archive project `{name}` |
-| POST | `/api/unarchive` | Unarchive project `{name}` |
-| POST | `/api/resolve-thread` | Resolve thread `{project, text}` |
-| POST | `/api/item-action` | Ignore/reassign/undo item `{key, action, target_project?}` |
-| POST | `/api/verify-categories` | AI-verify all project categories |
-| POST | `/api/classify-unmatched` | AI-classify unmatched chat conversations |
-| POST | `/api/enrich/<idx>` | AI-enrich single project |
-| GET/POST | `/api/ai-config` | Get/save AI configuration |
-| POST | `/upload` | Upload chat zip, start background processing (returns JSON) |
-| GET | `/generate-pdf` | Download PDF report |
+### Inputs
+
+| Input | Source | Description |
+|-------|--------|-------------|
+| `PROJECT_STATUS.md` files | Each project directory | Metadata and status |
+| Git commit history | Local git repos | Recent work (all branches) |
+| Git remote URLs | Local git repos | Repository identification |
+
+### Outputs
+
+| Output | Format | Description |
+|--------|--------|-------------|
+| PDF Dashboard | `~/claudesync2/status_report_YYYY-MM-DD.pdf` | Visual report for Claude.ai |
+| Console output | Text | Progress and debug info |
+
+### What the User Sees
+
+1. **On generation:** Console shows projects found, commits extracted
+2. **In PDF Page 1:** Charts and tables summarizing all projects
+3. **In PDF Page 2:** 2-column layout with project names and last 5 commits each
+4. **In Claude.ai:** Full context after uploading PDF
 
 ---
 
-## Data Model
+## Business Rules and Logic
 
-### Project Object
-```python
+### Commit Filtering
+
+**Skip these patterns** (case-insensitive):
+- `add files via upload`
+- `initial commit`, `first commit`, `init commit`
+- `create readme`, `update readme`
+- `delete `, `remove `
+- `merge branch`, `merge pull request`
+- `wip`, `fix typo`, `minor fix`, `small fix`, `quick fix`
+- `bump version`, `update dependencies`, `update package`
+- `lint fix`, `format code`, `cleanup`, `refactor`
+
+**Additional filters:**
+- Skip commits shorter than 15 characters
+- Scan ALL branches (`git log --all`)
+- Return first 5 meaningful commits found
+
+### Project Discovery
+
+**Scan locations:**
+- Home directory (`~`)
+- Max depth: 2 levels
+
+**Skip directories:**
+- `node_modules`, `.git`, `__pycache__`, `venv`, `.venv`
+- `dist`, `build`, `.next`, `coverage`
+- `Library`, `.Trash`, `Applications`
+- `Pictures`, `Music`, `Movies`, `Documents`
+
+### Repository Detection
+
+A project "has a repo" if:
+- `Has GitHub Repo` field is "Yes" AND
+- `Repository` field is not empty AND
+- `Repository` field does not contain "not yet" or similar placeholder text
+
+### Progress Color Coding
+
+| Progress | Color |
+|----------|-------|
+| > 75% | Green (#2ECC71) |
+| 50-75% | Blue (#3498DB) |
+| 25-49% | Yellow (#F1C40F) |
+| < 25% | Red (#E74C3C) |
+
+### Development State (Dev State)
+
+Projects can be tagged with a development state that reflects their current workflow status. These are color-coded in the PDF dashboard.
+
+| State | Color | Description |
+|-------|-------|-------------|
+| `test` | Orange (#E67E22) | Push with no evidence of testing |
+| `refine` | Blue (#3498DB) | Chat abandoned — user satisfied or riffing on features |
+| `continue` | Red (#E74C3C) | Tests ongoing, not fully resolved |
+
+**Custom states** can be added via `~/.claudesync/config.json`:
+```json
 {
-    'name': str,
-    'file_path': str,             # Path to PROJECT_STATUS.md
-    'project_path': str,          # Project directory
-    'repo': str,                  # GitHub user/repo
-    'category': str,              # Raw category
-    'category_group': str,        # Normalized (Church, School, Product, etc.)
-    'progress': int,              # 0-100
-    'status': str,                # Not Started, In Progress, Beta, Complete, etc.
-    'has_repo': str,              # Yes/No
-    'has_github_repo': bool,      # Computed
-    'last_worked': str,           # YYYY-MM-DD
-    'last_synced': str,           # YYYY-MM-DD
-    'summary': str,               # Description from status file
-    'narrative': str,             # AI-generated or summary-derived
-    'features': [str],            # What's Working items
-    'not_working': [str],         # What's Not Working items
-    'blockers': [str],            # Blockers
-    'next_steps': [str],          # Next Steps
-    'open_questions': [str],      # Design Questions from tables
-    'progress_log': [dict],       # Dated entries from Progress Log section
-    'git_commits': [dict],        # Recent commits from git history
-    'timeline': [dict],           # Merged timeline (progress + git + chat)
-    'open_threads': [(str,str)],  # (type, text) — all unfinished items
-    'chat_conversations': int,    # Number of chat files that mentioned this project
+  "custom_dev_states": {
+    "blocked": {
+      "label": "Blocked",
+      "description": "Waiting on external dependency",
+      "color": "#8E44AD"
+    }
+  }
 }
 ```
 
-### Timeline Entry
-```python
-{'date': 'YYYY-MM-DD', 'source': str, 'text': str}
-```
+**AI-powered assessment:** When an Anthropic API key is configured, the system uses Claude to analyze each project's commit history and progress log to automatically suggest a dev state for projects that don't have one set manually.
 
-### Thread Types
-- **Blocker** (red) — from Blockers section
-- **Open Question** (orange) — from Design Questions table
-- **Next Step** (blue) — from Next Steps section
-- **Not Yet Built** (gray) — from What's Not Working section
+### API Key Management
 
-### Background Task State
-```python
-{
-    'running': bool,
-    'step': str,       # scanning, parsing, reading_chat, matching_chat, ai_enrichment, ai_classify, building, done
-    'detail': str,     # Human-readable progress message
-    'error': str,      # Error message if failed
-    'result_msg': str, # Summary message on completion
-}
-```
+The system checks for an API key in this order:
+1. `~/.claudesync/config.json` (`anthropic_api_key` field)
+2. `ANTHROPIC_API_KEY` environment variable
+3. Interactive prompt (if running in a terminal)
+
+Set a key via CLI: `python3 generate_status_pdf.py --set-key sk-ant-...`
 
 ---
 
-## PROJECT_STATUS.md Schema
+## Data Requirements
+
+### PROJECT_STATUS.md Schema
 
 ```markdown
 # PROJECT_STATUS: [Project Name]
 
 ## Metadata
+
 | Field | Value |
 |-------|-------|
 | **Project Name** | [Name] |
@@ -400,61 +213,137 @@ python3 generate_status_pdf.py --scan-paths "~ ~/projects" --chat-history ~/expo
 | **Status** | [Not Started/In Progress/Beta/Complete/Shelved] |
 | **Last Worked** | [YYYY-MM-DD] |
 | **Has GitHub Repo** | [Yes/No] |
-| **Last Synced to Claude.ai** | [YYYY-MM-DD] |
+| **Dev State** | [test/refine/continue or custom] |
 
 ## Current State
+
 ### What's Working
+- [Feature 1]
+- [Feature 2]
+
 ### What's Not Working
+- [Issue 1]
+
 ### Blockers
+- [Blocker 1]
 
 ## Progress Log
-### YYYY-MM-DD (Source Description)
 
-## Open Design Questions
-| Question | Status | Notes |
+### [YYYY-MM-DD]
+**What was built:**
+- [Deliverable]
 
-## Next Steps
+**What was figured out:**
+- [Learning]
 
-## Reusable Assets
-| Asset | Description | Tags |
+**Still stuck on:**
+- [Challenge]
+
+**Next time:**
+- [Next step]
+```
+
+### Parsed Data Structure
+
+```python
+project = {
+    'name': str,
+    'file_path': str,
+    'project_path': str,
+    'repo': str,
+    'category': str,
+    'progress': int,
+    'status': str,
+    'has_repo': str,
+    'has_github_repo': bool,
+    'features': list[str],      # From "What's Working"
+    'recent_commits': list[str], # From git log --all
+    'dev_state': str,           # test/refine/continue (or custom)
+}
 ```
 
 ---
 
-## Progress Color Coding
+## Integrations and Dependencies
 
-| Progress | Color |
-|----------|-------|
-| > 75% | Green (#2ECC71) |
-| 50-75% | Blue (#3498DB) |
-| 25-49% | Yellow (#F1C40F) |
-| < 25% | Red (#E74C3C) |
+### Python Dependencies
 
----
-
-## Theming
-
-Light and dark themes via CSS custom properties on `[data-theme]`. Persisted in localStorage, applied before paint to prevent flash. Toggle button in top bar on every page.
-
----
-
-## Dependencies
-
-### Python
 ```
-flask
 reportlab>=4.0.0
 matplotlib>=3.7.0
 numpy>=1.24.0
 ```
 
-### System
-- Python 3.8+
-- Git (commit history + remote detection)
-- macOS or Linux
+### System Dependencies
 
-### Optional
-- Anthropic API key (for AI enrichment + classification)
+- Python 3.8+
+- Git (for commit history and remote detection)
+- macOS or Linux (Windows untested)
+
+### External Integrations
+
+| System | Integration Type | Purpose |
+|--------|-----------------|---------|
+| Git | Local CLI | Read commit history, detect remotes |
+| GitHub | URL parsing only | Extract user/repo from remote URLs |
+| Claude.ai | Manual PDF upload | Provide context to conversations |
+
+**Optional:** Anthropic API key for AI-powered dev state assessment. Not required for core functionality.
+
+---
+
+## Out of Scope (For Now)
+
+1. **Automatic Claude.ai upload** - User must manually upload PDF
+2. **Real-time sync** - PDF is point-in-time snapshot
+3. **Claude Code hooks** - No automatic triggering on session end
+4. **Progress auto-calculation** - User must manually set progress % (dev state IS auto-assessed via AI)
+5. **Multi-user support** - Single developer use case only
+6. **Cloud storage** - All data is local
+7. **Windows support** - Untested, may work
+8. **Automatic PROJECT_STATUS.md updates** - Claude Code doesn't auto-update status files yet
+
+---
+
+## Open Design Questions
+
+1. **Auto-update trigger:** Should there be a Claude Code hook that auto-updates PROJECT_STATUS.md at session end?
+
+2. **Progress calculation:** Can progress % be auto-calculated from commits, test coverage, or other metrics?
+
+3. **Scheduled generation:** Should PDF auto-generate daily via launchd/cron?
+
+4. **Deep project scanning:** Should we scan deeper than 2 levels for monorepos?
+
+5. **Commit deduplication:** Same commit message across branches shows once or multiple times?
+
+6. **Feature extraction:** "What's Working" section is often empty - better source for features?
+
+---
+
+## Success Criteria
+
+### Functional Success
+
+- [ ] `init_project_status.py` creates valid PROJECT_STATUS.md files
+- [ ] `update_repos.py` correctly detects git remotes for all projects
+- [ ] `generate_status_pdf.py` finds all PROJECT_STATUS.md files (max depth 2)
+- [ ] PDF shows commits from ALL branches, not just main
+- [ ] Garbage commits are filtered out
+- [ ] PDF renders correctly in Preview and Claude.ai
+
+### User Experience Success
+
+- [ ] New project setup takes < 30 seconds
+- [ ] PDF generation takes < 10 seconds for 15 projects
+- [ ] PDF upload to Claude.ai provides useful context
+- [ ] 2-column layout fits 10+ projects on page 2
+
+### Data Quality Success
+
+- [ ] At least 3-5 meaningful commits shown per active project
+- [ ] No "Add files via upload" or "Initial commit" garbage
+- [ ] Projects with no meaningful commits show "No recent work logged"
 
 ---
 
@@ -462,64 +351,42 @@ numpy>=1.24.0
 
 ```
 ~/claudesync2/
-├── web_app.py                  # Flask dashboard (2652 lines)
-├── generate_status_pdf.py      # Scanner, parser, chat matcher, PDF renderer (1238 lines)
-├── init_project_status.py      # Project initializer CLI
-├── update_repos.py             # Batch repo updater CLI
-├── sync_history.py             # Asset registry builder
-├── requirements.txt            # Python dependencies
-├── .gitignore
-├── CLAUDE.md                   # Claude Code behavioral instructions
-├── PRODUCT_SPEC.md             # This document
-├── PROJECT_STATUS.md           # This project's own status
-├── README.md
+├── generate_status_pdf.py    # Main PDF generator
+├── init_project_status.py    # Project initializer
+├── update_repos.py           # Batch repo updater
+├── requirements.txt          # Python dependencies
+├── .gitignore               # Ignore __pycache__, PDFs
 ├── templates/
-│   ├── CLAUDE.md               # Template for new projects
-│   └── PROJECT_STATUS.md       # Template for new projects
-├── daily_status_report.sh      # Shell script for cron/launchd
-└── com.ctreada.dailystatusreport.plist  # macOS LaunchAgent
-```
-
-### Persistence Files (in `~/`)
-```
-~/.claudesync_ignored.json      # Hidden project names
-~/.claudesync_resolved.json     # Resolved thread keys
-~/.claudesync_archived.json     # Archived project names
-~/.claudesync_ai.json           # AI API config (url, key, model)
-~/.claudesync_import_meta.json  # Last chat import metadata
-~/.claudesync_item_actions.json # Item ignore/reassign decisions
-~/.claudesync_initiatives.json  # AI classification of unmatched chats
+│   ├── CLAUDE.md            # Instructions-only template
+│   └── PROJECT_STATUS.md    # Status file template
+├── PRODUCT_SPEC.md          # This document
+└── status_report_*.pdf      # Generated reports (gitignored)
 ```
 
 ---
 
-## Quick Start
+## Quick Start for Developers
 
 ```bash
-# Install
+# Clone and setup
+git clone https://github.com/christreadaway/claudesync2.git ~/claudesync2
 cd ~/claudesync2
 pip3 install -r requirements.txt
 
-# Run the dashboard
-python3 web_app.py
-# Open http://localhost:5111
+# Initialize a project
+python3 init_project_status.py ~/myproject --name "My Project" --category Personal
 
-# Or generate PDF from CLI
-python3 generate_status_pdf.py --scan-paths ~ --chat-history ~/export.zip
+# Auto-detect repos for all projects
+python3 update_repos.py
+
+# Generate PDF
+python3 generate_status_pdf.py
+
+# View PDF
+open ~/claudesync2/status_report_$(date +%Y-%m-%d).pdf
 ```
 
 ---
 
-## Out of Scope (For Now)
-
-1. **Automatic Claude.ai upload** — user must manually upload PDF
-2. **Real-time sync** — PDF/dashboard is point-in-time snapshot
-3. **Progress auto-calculation** — user sets progress % manually
-4. **Multi-user support** — single developer only
-5. **Cloud storage** — all data is local, nothing leaves the machine
-6. **Windows support** — untested
-
----
-
-*Last updated: 2026-02-11*
-*Version: 6.0*
+*Last updated: 2026-02-03*
+*Version: 1.0*

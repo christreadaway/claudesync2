@@ -16,6 +16,7 @@
 | **Status** | [Not Started/In Progress/Beta/Complete/Shelved] |
 | **Last Worked** | [YYYY-MM-DD] |
 | **Has GitHub Repo** | [Yes/No] |
+| **Dev State** | [test/refine/continue] |
 
 ---
 
