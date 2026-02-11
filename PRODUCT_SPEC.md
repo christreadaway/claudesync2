@@ -1,4 +1,4 @@
-# Product Spec: Claude Project Sync v6
+# Product Spec: Claude Project Sync v7
 
 ## Product Overview
 
@@ -74,7 +74,7 @@ web_app.py — Flask dashboard (localhost:5111)
 ### 1. Project Status Files (`PROJECT_STATUS.md`)
 
 Each project directory contains a `PROJECT_STATUS.md` with:
-- Metadata table (name, repo, category, progress %, status, last worked, last synced)
+- Metadata table (name, repo, category, progress %, status, last worked, last synced, dev state)
 - "What's Working" bullet list
 - "What's Not Working" bullet list
 - "Blockers" bullet list
@@ -114,6 +114,8 @@ Flask app running on `localhost:5111`. Fully local — nothing leaves the machin
 
 **Project detail page (`/project/<idx>`):**
 - Header card with metadata, progress bar, narrative description
+- Dev state dropdown (test/refine/continue) with color-coded badge
+- "AI Assess" button to auto-classify dev state using AI
 - Full decision timeline with dated entries, source tags, colored bullets
 - Open threads card with Resolve buttons
 - "Enrich with AI" button (when API key configured)
@@ -220,14 +222,44 @@ Projects flagged as "Possibly EOL" if:
 - Persisted to `~/.claudesync_archived.json`
 - Unarchive to restore
 
-### 9. Thread Resolution
+### 9. Dev State Tracking
+
+Each project can be assigned a development state reflecting its current work status:
+
+| State | Color | Meaning |
+|-------|-------|---------|
+| **test** | Orange (#E67E22) | Code was pushed with no evidence of testing. Needs testing. |
+| **refine** | Blue (#3498DB) | User satisfied or riffing/exploring. Chat abandoned in good state. |
+| **continue** | Red (#E74C3C) | Active testing ongoing but not resolved. Work in progress. |
+
+**Dashboard display:**
+- Color-coded badge next to project name on cards and detail page
+- Left border accent on project cards matching dev state color
+- Dark mode variants for all badge colors
+
+**Setting dev state:**
+- Dropdown on project detail page (test/refine/continue/none)
+- Persisted to `PROJECT_STATUS.md` via `| **Dev State** | value |` metadata row
+- If the field doesn't exist in the file, it's auto-inserted after the Status row
+
+**AI assessment:**
+- "AI Assess" button on project detail page
+- Sends project timeline + threads to AI
+- AI responds with state classification + reasoning
+- Auto-selects the suggested state in the dropdown
+
+**API endpoints:**
+- `POST /api/dev-state/<idx>` — set dev state `{dev_state: "test|refine|continue|"}`
+- `POST /api/ai-assess-state/<idx>` — AI classifies dev state, returns `{dev_state, reason}`
+
+### 10. Thread Resolution
 
 - Resolve button on threads in detail pages and list views
 - Thread key: `project_name::thread_text[:100]`
 - Persisted to `~/.claudesync_resolved.json`
 - Resolved threads hidden from counts and displays
 
-### 10. What's Next View (`/view/whats-next`)
+### 11. What's Next View (`/view/whats-next`)
 
 Cross-project triage view showing every actionable item across all projects.
 
@@ -254,7 +286,7 @@ Cross-project triage view showing every actionable item across all projects.
 
 **Persistence:** `~/.claudesync_item_actions.json`
 
-### 11. Unmatched Conversations & Initiative Classification (`/view/unmatched`)
+### 12. Unmatched Conversations & Initiative Classification (`/view/unmatched`)
 
 Shows chat conversations that weren't automatically matched to any project by fuzzy name matching.
 
@@ -323,6 +355,8 @@ python3 generate_status_pdf.py --scan-paths "~ ~/projects" --chat-history ~/expo
 | POST | `/api/verify-categories` | AI-verify all project categories |
 | POST | `/api/classify-unmatched` | AI-classify unmatched chat conversations |
 | POST | `/api/enrich/<idx>` | AI-enrich single project |
+| POST | `/api/dev-state/<idx>` | Set project dev state (test/refine/continue) |
+| POST | `/api/ai-assess-state/<idx>` | AI-classify project dev state |
 | GET/POST | `/api/ai-config` | Get/save AI configuration |
 | POST | `/upload` | Upload chat zip, start background processing (returns JSON) |
 | GET | `/generate-pdf` | Download PDF report |
@@ -342,6 +376,7 @@ python3 generate_status_pdf.py --scan-paths "~ ~/projects" --chat-history ~/expo
     'category_group': str,        # Normalized (Church, School, Product, etc.)
     'progress': int,              # 0-100
     'status': str,                # Not Started, In Progress, Beta, Complete, etc.
+    'dev_state': str,             # test, refine, continue, or empty
     'has_repo': str,              # Yes/No
     'has_github_repo': bool,      # Computed
     'last_worked': str,           # YYYY-MM-DD
@@ -401,6 +436,7 @@ python3 generate_status_pdf.py --scan-paths "~ ~/projects" --chat-history ~/expo
 | **Last Worked** | [YYYY-MM-DD] |
 | **Has GitHub Repo** | [Yes/No] |
 | **Last Synced to Claude.ai** | [YYYY-MM-DD] |
+| **Dev State** | [test/refine/continue] |
 
 ## Current State
 ### What's Working
@@ -429,6 +465,14 @@ python3 generate_status_pdf.py --scan-paths "~ ~/projects" --chat-history ~/expo
 | 50-75% | Blue (#3498DB) |
 | 25-49% | Yellow (#F1C40F) |
 | < 25% | Red (#E74C3C) |
+
+## Dev State Color Coding
+
+| State | Color | Badge | Card Border |
+|-------|-------|-------|-------------|
+| test | Orange (#E67E22) | Orange bg/text | Left orange border |
+| refine | Blue (#3498DB) | Blue bg/text | Left blue border |
+| continue | Red (#E74C3C) | Red bg/text | Left red border |
 
 ---
 
@@ -522,4 +566,4 @@ python3 generate_status_pdf.py --scan-paths ~ --chat-history ~/export.zip
 ---
 
 *Last updated: 2026-02-11*
-*Version: 6.0*
+*Version: 7.0*
