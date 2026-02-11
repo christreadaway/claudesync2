@@ -35,6 +35,8 @@ app.secret_key = os.urandom(24)
 
 UPLOAD_DIR = tempfile.mkdtemp(prefix='claudesync_')
 IGNORED_FILE = os.path.expanduser('~/.claudesync_ignored.json')
+RESOLVED_FILE = os.path.expanduser('~/.claudesync_resolved.json')
+AI_CONFIG_FILE = os.path.expanduser('~/.claudesync_ai.json')
 
 # Cache loaded projects so dashboard + drill-down share data
 _project_cache = {
@@ -63,6 +65,56 @@ def _save_ignored(names):
     """Save ignored project names to disk."""
     with open(IGNORED_FILE, 'w') as f:
         json.dump(sorted(names), f, indent=2)
+
+
+# =============================================================================
+# RESOLVED THREADS PERSISTENCE
+# =============================================================================
+
+def _load_resolved():
+    """Load resolved thread keys from disk.
+
+    Keys are 'project_name::thread_text' to uniquely identify threads.
+    """
+    if os.path.exists(RESOLVED_FILE):
+        try:
+            with open(RESOLVED_FILE, 'r') as f:
+                return set(json.load(f))
+        except Exception:
+            pass
+    return set()
+
+
+def _save_resolved(keys):
+    """Save resolved thread keys to disk."""
+    with open(RESOLVED_FILE, 'w') as f:
+        json.dump(sorted(keys), f, indent=2)
+
+
+def _thread_key(project_name, thread_text):
+    """Build a unique key for a thread."""
+    return f'{project_name}::{thread_text[:100]}'
+
+
+# =============================================================================
+# AI CONFIG PERSISTENCE
+# =============================================================================
+
+def _load_ai_config():
+    """Load AI API configuration."""
+    if os.path.exists(AI_CONFIG_FILE):
+        try:
+            with open(AI_CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {'api_url': '', 'api_key': '', 'model': 'claude-sonnet-4-5-20250929'}
+
+
+def _save_ai_config(config):
+    """Save AI API configuration."""
+    with open(AI_CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=2)
 
 
 # =============================================================================
@@ -205,15 +257,25 @@ def _aggregate_activity(projects, mode='day'):
 
 def _project_activity_breakdown(projects):
     """Per-project activity counts for the project cards."""
+    resolved = _load_resolved()
     breakdown = []
     for p in projects:
+        name = p.get('name', 'Unknown')
         timeline = p.get('timeline', [])
         commits = sum(1 for e in timeline if 'commit' in e.get('source', '').lower())
         chats = sum(1 for e in timeline if 'chat' in e.get('source', '').lower())
         logs = len(timeline) - commits - chats
 
+        # Recent decisions (last 3 timeline entries)
+        recent = timeline[:3] if timeline else []
+
+        # Open threads, excluding resolved ones
+        all_threads = p.get('open_threads', [])
+        active_threads = [(t, txt) for t, txt in all_threads
+                          if _thread_key(name, txt) not in resolved]
+
         breakdown.append({
-            'name': p.get('name', 'Unknown'),
+            'name': name,
             'progress': p.get('progress', 0),
             'status': p.get('status', ''),
             'category': p.get('category_group', ''),
@@ -222,8 +284,11 @@ def _project_activity_breakdown(projects):
             'commits': commits,
             'chats': chats,
             'logs': logs,
-            'open_threads': len(p.get('open_threads', [])),
-            'blockers': sum(1 for t, _ in p.get('open_threads', []) if t == 'Blocker'),
+            'open_threads': len(active_threads),
+            'all_threads': len(all_threads),
+            'blockers': sum(1 for t, _ in active_threads if t == 'Blocker'),
+            'recent_decisions': recent,
+            'loose_ends': active_threads[:3],
             'eol_reason': _detect_eol(p),
         })
 
@@ -330,6 +395,18 @@ DASHBOARD_HTML = """
         .badge-blocker { background: #fce4ec; color: #c62828; }
         .badge-eol { background: var(--eol-bg); color: var(--eol-text); border: 1px solid var(--eol-border); }
 
+        /* Recent decisions + loose ends on cards */
+        .card-section { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border-light); }
+        .card-section-title { font-size: 10px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+        .mini-entry { font-size: 11px; color: var(--text-secondary); line-height: 1.4; padding: 2px 0; }
+        .mini-date { font-size: 10px; color: var(--text-muted); margin-right: 4px; }
+        .mini-thread { font-size: 11px; color: var(--text-secondary); line-height: 1.4; padding: 2px 0; }
+        .mini-tag { font-size: 9px; font-weight: 600; padding: 1px 5px; border-radius: 3px; margin-right: 4px; }
+        .mini-tag-blocker { background: #fce4ec; color: #c62828; }
+        .mini-tag-openquestion { background: #fff3e0; color: #e65100; }
+        .mini-tag-nextstep { background: #e3f2fd; color: #1565c0; }
+        .mini-tag-notbuiltyet { background: var(--stat-bg); color: var(--text-secondary); }
+
         /* EOL bar inside project card */
         .eol-bar { display: flex; align-items: center; justify-content: space-between; background: var(--eol-bg); border: 1px solid var(--eol-border); border-radius: 5px; padding: 6px 10px; margin-top: 10px; font-size: 11px; color: var(--eol-text); }
         .eol-bar .reason { flex: 1; }
@@ -374,6 +451,7 @@ DASHBOARD_HTML = """
                 <span id="themeIcon"></span>
             </button>
             <button class="btn btn-upload" onclick="document.getElementById('uploadModal').classList.add('show')">Upload Chat History</button>
+            <button class="btn" style="background:#8e44ad;" onclick="document.getElementById('aiModal').classList.add('show')">AI Settings</button>
             <a href="/generate-pdf" class="btn btn-pdf">Generate PDF</a>
         </div>
     </div>
@@ -450,6 +528,25 @@ DASHBOARD_HTML = """
                     <span class="badge badge-blocker">{{ p.blockers }} blocker{{ 's' if p.blockers != 1 }}</span>
                     {% endif %}
                 </div>
+                {% if p.recent_decisions %}
+                <div class="card-section">
+                    <div class="card-section-title">Recent decisions</div>
+                    {% for d in p.recent_decisions %}
+                    <div class="mini-entry"><span class="mini-date">{{ d.date }}</span> {{ d.text[:80] }}{% if d.text|length > 80 %}...{% endif %}</div>
+                    {% endfor %}
+                </div>
+                {% endif %}
+                {% if p.loose_ends %}
+                <div class="card-section">
+                    <div class="card-section-title">Open loose ends</div>
+                    {% for t_type, t_text in p.loose_ends %}
+                    <div class="mini-thread">
+                        <span class="mini-tag mini-tag-{{ t_type|lower|replace(' ', '') }}">{{ t_type }}</span>
+                        {{ t_text[:70] }}{% if t_text|length > 70 %}...{% endif %}
+                    </div>
+                    {% endfor %}
+                </div>
+                {% endif %}
                 {% if p.eol_reason and p.name not in ignored_names %}
                 <div class="eol-bar">
                     <span class="reason">{{ p.eol_reason }}</span>
@@ -492,7 +589,46 @@ DASHBOARD_HTML = """
         </div>
     </div>
 
+    <!-- AI Settings Modal -->
+    <div class="modal-overlay" id="aiModal">
+        <div class="modal">
+            <h2>AI Description Enrichment</h2>
+            <p style="font-size:12px; color:var(--text-secondary); margin-bottom:14px;">
+                Configure an Anthropic API endpoint so the dashboard can generate richer project descriptions.
+                Your key is stored locally in ~/.claudesync_ai.json.
+            </p>
+            <label for="ai_url">API URL</label>
+            <input type="text" id="ai_url" placeholder="https://api.anthropic.com/v1/messages" value="{{ ai_config.api_url }}">
+            <label for="ai_key">API Key</label>
+            <input type="text" id="ai_key" placeholder="sk-ant-..." value="">
+            <p style="font-size:10px; color:var(--text-muted); margin-top:2px;">
+                {% if ai_config.api_key %}Currently set ({{ ai_config.api_key[:8] }}...){% else %}Not configured{% endif %}
+            </p>
+            <label for="ai_model">Model</label>
+            <input type="text" id="ai_model" placeholder="claude-sonnet-4-5-20250929" value="{{ ai_config.model }}">
+            <div class="btn-row">
+                <button class="btn" style="background:#8e44ad;" onclick="saveAiConfig()">Save</button>
+                <button type="button" class="btn btn-cancel" onclick="document.getElementById('aiModal').classList.remove('show')">Cancel</button>
+            </div>
+        </div>
+    </div>
+
     <script>
+        function saveAiConfig() {
+            var body = {
+                api_url: document.getElementById('ai_url').value,
+                model: document.getElementById('ai_model').value,
+            };
+            var key = document.getElementById('ai_key').value;
+            if (key) body.api_key = key;
+            fetch('/api/ai-config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) })
+            .then(r => r.json())
+            .then(function() {
+                document.getElementById('aiModal').classList.remove('show');
+                location.reload();
+            });
+        }
+
         // ---- Dark mode ----
         function toggleTheme() {
             var cur = document.documentElement.getAttribute('data-theme');
@@ -646,14 +782,23 @@ PROJECT_DETAIL_HTML = """
         .timeline-entry .source { font-size: 10px; color: var(--text-muted); margin-left: 4px; }
         .timeline-entry .text { font-size: 13px; color: var(--text); margin-top: 2px; line-height: 1.5; }
         .thread-list { list-style: none; }
-        .thread-list li { padding: 8px 0; border-bottom: 1px solid var(--border-light); font-size: 13px; color: var(--text); }
+        .thread-list li { padding: 10px 0; border-bottom: 1px solid var(--border-light); font-size: 13px; color: var(--text); display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
         .thread-list li:last-child { border-bottom: none; }
+        .thread-content { flex: 1; }
+        .thread-meta { font-size: 10px; color: var(--text-muted); margin-top: 2px; }
         .tag { display: inline-block; padding: 1px 7px; border-radius: 3px; font-size: 10px; font-weight: 600; margin-right: 6px; }
         .tag-blocker { background: #fce4ec; color: #c62828; }
         .tag-question { background: #fff3e0; color: #e65100; }
         .tag-next { background: #e3f2fd; color: #1565c0; }
         .tag-notbuilt { background: var(--stat-bg); color: var(--text-secondary); }
+        .btn-resolve { padding: 3px 10px; border: 1px solid var(--border); border-radius: 4px; font-size: 10px; font-weight: 600; cursor: pointer; background: var(--bg); color: var(--text-secondary); white-space: nowrap; }
+        .btn-resolve:hover { background: #d4edda; color: #155724; border-color: #c3e6cb; }
+        .resolved-count { font-size: 11px; color: var(--text-muted); margin-top: 8px; }
         .card { background: var(--bg-card); border-radius: 8px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 3px var(--shadow); }
+        .btn-ai { display: inline-block; padding: 6px 14px; border: 1px solid #9B59B6; background: transparent; color: #9B59B6; border-radius: 5px; font-size: 11px; font-weight: 600; cursor: pointer; margin-top: 10px; }
+        .btn-ai:hover { background: #9B59B6; color: white; }
+        .btn-ai.loading { opacity: 0.5; pointer-events: none; }
+        .ai-result { margin-top: 10px; padding: 12px; background: var(--stat-bg); border-radius: 6px; font-size: 13px; line-height: 1.6; color: var(--text); white-space: pre-wrap; }
         footer { text-align: center; font-size: 11px; color: var(--text-muted); margin-top: 40px; padding-bottom: 20px; }
         footer a { color: var(--text-muted); text-decoration: none; }
         footer a:hover { color: var(--text-secondary); }
@@ -686,7 +831,11 @@ PROJECT_DETAIL_HTML = """
             </div>
             <div class="meta">{{ project.progress }}% complete</div>
             {% if project.narrative %}
-            <div class="summary">{{ project.narrative }}</div>
+            <div class="summary" id="projectDescription">{{ project.narrative }}</div>
+            {% endif %}
+            {% if ai_configured %}
+            <button class="btn-ai" id="aiEnrichBtn" onclick="enrichDescription()">Enrich description with AI</button>
+            <div class="ai-result" id="aiResult" style="display:none;"></div>
             {% endif %}
         </div>
 
@@ -711,20 +860,27 @@ PROJECT_DETAIL_HTML = """
         </div>
 
         <!-- Open Threads -->
-        {% if project.open_threads %}
+        {% if active_threads or resolved_count > 0 %}
         <div class="card">
-            <div class="section-title">Open Threads ({{ project.open_threads | length }})</div>
-            <ul class="thread-list">
-                {% for thread_type, thread_text in project.open_threads %}
-                <li>
-                    {% if thread_type == 'Blocker' %}<span class="tag tag-blocker">Blocker</span>
-                    {% elif thread_type == 'Open Question' %}<span class="tag tag-question">Question</span>
-                    {% elif thread_type == 'Next Step' %}<span class="tag tag-next">Next</span>
-                    {% else %}<span class="tag tag-notbuilt">{{ thread_type }}</span>{% endif %}
-                    {{ thread_text }}
+            <div class="section-title">Open Threads ({{ active_threads | length }})</div>
+            <ul class="thread-list" id="threadList">
+                {% for thread_type, thread_text in active_threads %}
+                <li id="thread-{{ loop.index0 }}">
+                    <div class="thread-content">
+                        {% if thread_type == 'Blocker' %}<span class="tag tag-blocker">Blocker</span>
+                        {% elif thread_type == 'Open Question' %}<span class="tag tag-question">Question</span>
+                        {% elif thread_type == 'Next Step' %}<span class="tag tag-next">Next</span>
+                        {% else %}<span class="tag tag-notbuilt">{{ thread_type }}</span>{% endif %}
+                        {{ thread_text }}
+                        <div class="thread-meta">{{ project.name }}</div>
+                    </div>
+                    <button class="btn-resolve" onclick="resolveThread('{{ project.name }}', '{{ thread_text[:100]|e }}', this)">Resolve</button>
                 </li>
                 {% endfor %}
             </ul>
+            {% if resolved_count > 0 %}
+            <div class="resolved-count">{{ resolved_count }} thread{{ 's' if resolved_count != 1 }} previously resolved</div>
+            {% endif %}
         </div>
         {% endif %}
 
@@ -742,6 +898,51 @@ PROJECT_DETAIL_HTML = """
         }
         document.getElementById('themeIcon').textContent =
             document.documentElement.getAttribute('data-theme') === 'dark' ? 'Light' : 'Dark';
+
+        function resolveThread(projectName, threadText, btn) {
+            btn.textContent = 'Resolving...';
+            btn.disabled = true;
+            fetch('/api/resolve-thread', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({project: projectName, text: threadText})
+            })
+            .then(r => r.json())
+            .then(function() {
+                var li = btn.closest('li');
+                li.style.opacity = '0.3';
+                li.style.textDecoration = 'line-through';
+                btn.textContent = 'Resolved';
+            });
+        }
+
+        function enrichDescription() {
+            var btn = document.getElementById('aiEnrichBtn');
+            var result = document.getElementById('aiResult');
+            btn.classList.add('loading');
+            btn.textContent = 'Thinking...';
+            result.style.display = 'none';
+
+            fetch('/api/enrich/{{ project_idx }}', { method: 'POST' })
+            .then(r => r.json())
+            .then(function(data) {
+                btn.classList.remove('loading');
+                btn.textContent = 'Enrich description with AI';
+                if (data.description) {
+                    result.textContent = data.description;
+                    result.style.display = 'block';
+                } else if (data.error) {
+                    result.textContent = 'Error: ' + data.error;
+                    result.style.display = 'block';
+                }
+            })
+            .catch(function() {
+                btn.classList.remove('loading');
+                btn.textContent = 'Enrich description with AI';
+                result.textContent = 'Failed to connect to AI API';
+                result.style.display = 'block';
+            });
+        }
     </script>
 </body>
 </html>
@@ -770,6 +971,8 @@ def dashboard():
     total_threads = sum(c['open_threads'] for c in project_cards if c['name'] not in ignored_names)
     total_blockers = sum(c['blockers'] for c in project_cards if c['name'] not in ignored_names)
 
+    ai_config = _load_ai_config()
+
     return render_template_string(
         DASHBOARD_HTML,
         total_projects=len(visible),
@@ -780,6 +983,7 @@ def dashboard():
         project_cards=project_cards,
         ignored_names=ignored_names,
         scan_paths=_project_cache.get('scan_paths', '~'),
+        ai_config=ai_config,
     )
 
 
@@ -825,7 +1029,132 @@ def project_detail(idx):
         return redirect(url_for('dashboard'))
 
     project = projects[idx]
-    return render_template_string(PROJECT_DETAIL_HTML, project=project)
+    resolved = _load_resolved()
+    name = project.get('name', '')
+
+    all_threads = project.get('open_threads', [])
+    active_threads = [(t, txt) for t, txt in all_threads
+                      if _thread_key(name, txt) not in resolved]
+    resolved_count = len(all_threads) - len(active_threads)
+
+    ai_config = _load_ai_config()
+    ai_configured = bool(ai_config.get('api_url') and ai_config.get('api_key'))
+
+    return render_template_string(
+        PROJECT_DETAIL_HTML,
+        project=project,
+        project_idx=idx,
+        active_threads=active_threads,
+        resolved_count=resolved_count,
+        ai_configured=ai_configured,
+    )
+
+
+@app.route('/api/resolve-thread', methods=['POST'])
+def api_resolve_thread():
+    """Mark a thread as resolved."""
+    data = request.get_json(force=True)
+    project_name = data.get('project', '')
+    thread_text = data.get('text', '')
+    if project_name and thread_text:
+        resolved = _load_resolved()
+        resolved.add(_thread_key(project_name, thread_text))
+        _save_resolved(resolved)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/enrich/<int:idx>', methods=['POST'])
+def api_enrich(idx):
+    """Use AI to generate a richer project description."""
+    import urllib.request
+    import urllib.error
+
+    projects = _project_cache.get('projects', [])
+    if idx < 0 or idx >= len(projects):
+        return jsonify({'error': 'Project not found'}), 404
+
+    project = projects[idx]
+    ai_config = _load_ai_config()
+
+    api_url = ai_config.get('api_url', '')
+    api_key = ai_config.get('api_key', '')
+    model = ai_config.get('model', 'claude-sonnet-4-5-20250929')
+
+    if not api_url or not api_key:
+        return jsonify({'error': 'AI not configured. POST to /api/ai-config first.'})
+
+    # Build context from project data
+    timeline_text = '\n'.join(
+        f"- {e.get('date', '?')}: [{e.get('source', '')}] {e.get('text', '')}"
+        for e in project.get('timeline', [])[:15]
+    )
+    threads_text = '\n'.join(
+        f"- [{t}] {txt}" for t, txt in project.get('open_threads', [])
+    )
+    features_text = '\n'.join(f"- {f}" for f in project.get('features', []))
+
+    prompt = f"""Write a concise 3-5 sentence project description for "{project.get('name', '')}".
+
+Current status: {project.get('status', 'Unknown')} ({project.get('progress', 0)}% complete)
+Category: {project.get('category_group', '')}
+
+Current description: {project.get('summary', 'None')}
+
+What's working:
+{features_text or 'None listed'}
+
+Recent activity:
+{timeline_text or 'No recent activity'}
+
+Open threads:
+{threads_text or 'None'}
+
+Write a clear, informative description that captures what this project is, its current state, and what's actively happening. Be specific, not generic."""
+
+    # Call the AI API (Anthropic Messages API format)
+    req_body = json.dumps({
+        'model': model,
+        'max_tokens': 300,
+        'messages': [{'role': 'user', 'content': prompt}],
+    }).encode('utf-8')
+
+    req = urllib.request.Request(api_url, data=req_body)
+    req.add_header('Content-Type', 'application/json')
+    req.add_header('x-api-key', api_key)
+    req.add_header('anthropic-version', '2023-06-01')
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode('utf-8'))
+            text = result.get('content', [{}])[0].get('text', '')
+            return jsonify({'description': text})
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8', errors='replace')
+        return jsonify({'error': f'API error {e.code}: {body[:200]}'})
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/ai-config', methods=['GET', 'POST'])
+def api_ai_config():
+    """Get or set AI API configuration."""
+    if request.method == 'GET':
+        config = _load_ai_config()
+        # Mask the key for display
+        if config.get('api_key'):
+            config['api_key_masked'] = config['api_key'][:8] + '...'
+        return jsonify(config)
+
+    data = request.get_json(force=True)
+    config = _load_ai_config()
+    if 'api_url' in data:
+        config['api_url'] = data['api_url']
+    if 'api_key' in data:
+        config['api_key'] = data['api_key']
+    if 'model' in data:
+        config['model'] = data['model']
+    _save_ai_config(config)
+    return jsonify({'ok': True})
 
 
 @app.route('/upload', methods=['POST'])
