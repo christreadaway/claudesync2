@@ -2,17 +2,19 @@
 """
 Claude Project Sync - Project Portfolio PDF Generator
 
-Generates a narrative portfolio PDF by SCANNING PROJECT_STATUS.md files.
-No hardcoded data - reads from your actual projects.
+Generates a narrative portfolio PDF by SCANNING PROJECT_STATUS.md files
+and optionally integrating Claude chat history exports.
 
-Output format matches the "Project Portfolio Status" style:
-- Title header with name, date, project count
-- Projects grouped by category (Church, School, Product, Infrastructure)
-- Each project has a bold header with progress/status and a narrative paragraph
+The PDF bridges context between Claude Code and Claude.ai chat by showing:
+- Project summaries with progress/status
+- Timestamped activity timeline (from Progress Log + chat history)
+- Open threads: blockers, unresolved questions, next steps
+- Cross-project view of everything left unfinished
 
 Usage:
     python3 generate_status_pdf.py [--output /path/to/output.pdf]
-    python3 generate_status_pdf.py --scan-paths ~/projects ~/work
+    python3 generate_status_pdf.py --chat-history ~/claude-export.zip
+    python3 generate_status_pdf.py --scan-paths ~/projects ~/work -v
 """
 
 import argparse
@@ -26,17 +28,18 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, PageBreak, KeepTogether
+    SimpleDocTemplate, Paragraph, Spacer, PageBreak, KeepTogether,
+    HRFlowable
 )
 from reportlab.lib.enums import TA_CENTER
 
 
 # =============================================================================
-# DYNAMIC PROJECT SCANNING - Reads from PROJECT_STATUS.md files
+# CONFIGURATION
 # =============================================================================
 
 DEFAULT_SCAN_PATHS = [
-    os.path.expanduser('~'),  # Home directory (top level)
+    os.path.expanduser('~'),
 ]
 
 SKIP_DIRS = {
@@ -45,17 +48,10 @@ SKIP_DIRS = {
     'Applications', 'Pictures', 'Music', 'Movies', 'Documents'
 }
 
-# Category display order and grouping
 CATEGORY_ORDER = [
-    'Church',
-    'School',
-    'Product',
-    'Infrastructure',
-    'Personal',
-    'Research',
+    'Church', 'School', 'Product', 'Infrastructure', 'Personal', 'Research',
 ]
 
-# Map variations to canonical category names for grouping
 CATEGORY_MAP = {
     'church': 'Church',
     'church / catholic tech': 'Church',
@@ -70,16 +66,12 @@ CATEGORY_MAP = {
 
 
 # =============================================================================
-# CHAT HISTORY INTEGRATION - Reads from exported Claude chat files
+# CHAT HISTORY INTEGRATION
 # =============================================================================
 
 def load_chat_files(chat_path):
-    """Load text content from a zip file or directory of .md/.txt files.
-
-    Returns a list of dicts: [{'filename': str, 'content': str}, ...]
-    """
+    """Load text content from a zip file, directory, or single file."""
     chat_files = []
-
     if chat_path is None:
         return chat_files
 
@@ -92,9 +84,13 @@ def load_chat_files(chat_path):
                     try:
                         raw = zf.read(name)
                         text = raw.decode('utf-8', errors='replace')
+                        # Try to get file modification time from zip
+                        info = zf.getinfo(name)
+                        mod_time = datetime(*info.date_time) if info.date_time else None
                         chat_files.append({
                             'filename': os.path.basename(name),
-                            'content': text
+                            'content': text,
+                            'date': mod_time,
                         })
                     except Exception:
                         continue
@@ -106,20 +102,23 @@ def load_chat_files(chat_path):
                     try:
                         with open(fpath, 'r', errors='replace') as f:
                             text = f.read()
+                        mod_time = datetime.fromtimestamp(os.path.getmtime(fpath))
                         chat_files.append({
                             'filename': fname,
-                            'content': text
+                            'content': text,
+                            'date': mod_time,
                         })
                     except Exception:
                         continue
     else:
-        # Single file
         try:
             with open(chat_path, 'r', errors='replace') as f:
                 text = f.read()
+            mod_time = datetime.fromtimestamp(os.path.getmtime(chat_path))
             chat_files.append({
                 'filename': os.path.basename(chat_path),
-                'content': text
+                'content': text,
+                'date': mod_time,
             })
         except Exception:
             pass
@@ -128,32 +127,23 @@ def load_chat_files(chat_path):
 
 
 def _build_search_terms(project_name):
-    """Build a list of search patterns from a project name.
-
-    'Sacramental Records' -> ['sacramental records', 'sacramentalrecords', 'sacramental']
-    'Claude Project Sync v2' -> ['claude project sync', 'claudeprojectsync', 'claudesync']
-    """
+    """Build fuzzy search patterns from a project name."""
     name_lower = project_name.lower().strip()
-
     terms = set()
     terms.add(name_lower)
 
-    # Remove version suffixes for matching
     no_version = re.sub(r'\s*v\d+(\.\d+)*\s*$', '', name_lower).strip()
     if no_version and len(no_version) > 3:
         terms.add(no_version)
 
-    # Squashed (no spaces)
     squashed = name_lower.replace(' ', '')
     if len(squashed) > 5:
         terms.add(squashed)
 
-    # First two significant words (for "Sacramental Records" -> "sacramental records")
     words = [w for w in name_lower.split() if len(w) > 2 and w not in ('the', 'and', 'for', 'app')]
     if len(words) >= 2:
         terms.add(words[0] + ' ' + words[1])
 
-    # Single longest word if distinctive enough
     if words:
         longest = max(words, key=len)
         if len(longest) >= 8:
@@ -163,115 +153,31 @@ def _build_search_terms(project_name):
 
 
 def _split_into_paragraphs(text):
-    """Split text into meaningful paragraphs.
-
-    Handles markdown conversations with --- separators, blank lines, etc.
-    Filters out very short or code-heavy blocks.
-    """
-    # Strip common role markers used in chat exports
-    # (Human:, Assistant:, User:, Claude:, etc.)
+    """Split chat text into meaningful paragraphs, filtering out code blocks."""
     cleaned = re.sub(r'^(Human|Assistant|User|Claude|System)\s*:', '', text, flags=re.MULTILINE)
-
-    # Split on double newlines or --- separators
     raw_blocks = re.split(r'\n\s*\n|\n---+\n', cleaned)
 
     paragraphs = []
     for block in raw_blocks:
         block = block.strip()
-        if not block:
+        if not block or block.startswith('```') or len(block) < 50:
             continue
 
-        # Skip code blocks (```...```)
-        if block.startswith('```'):
-            continue
-
-        # Skip very short blocks (headers, single words)
-        if len(block) < 50:
-            continue
-
-        # Skip blocks that are mostly code or commands
         code_line_count = sum(1 for line in block.split('\n')
                               if line.strip().startswith(('$', '>', '#!', 'import ', 'from ', 'def ', 'class ')))
         total_lines = len(block.split('\n'))
         if total_lines > 1 and code_line_count / total_lines > 0.5:
             continue
 
-        # Clean markdown formatting for readability
         clean = block.replace('**', '').replace('`', '')
-        clean = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', clean)  # links -> text
-        clean = re.sub(r'^#+\s+', '', clean, flags=re.MULTILINE)  # remove headers
-        clean = re.sub(r'\n+', ' ', clean).strip()  # join into one line
+        clean = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', clean)
+        clean = re.sub(r'^#+\s+', '', clean, flags=re.MULTILINE)
+        clean = re.sub(r'\n+', ' ', clean).strip()
 
         if len(clean) >= 50:
             paragraphs.append(clean)
 
     return paragraphs
-
-
-def match_chat_to_projects(chat_files, projects, verbose=False):
-    """Match chat history content to projects and extract the best snippets.
-
-    Returns a dict: {project_name: [snippet1, snippet2, ...]}
-    Each snippet is the most relevant paragraph about that project found in chats.
-    """
-    project_snippets = {}
-
-    for project in projects:
-        name = project.get('name', '')
-        if not name:
-            continue
-
-        search_terms = _build_search_terms(name)
-        scored_paragraphs = []
-
-        for chat in chat_files:
-            paragraphs = _split_into_paragraphs(chat['content'])
-
-            for para in paragraphs:
-                para_lower = para.lower()
-
-                # Score based on how many search terms appear
-                score = 0
-                for term in search_terms:
-                    count = para_lower.count(term)
-                    if count > 0:
-                        # Longer terms are more specific, worth more
-                        score += count * len(term)
-
-                if score > 0:
-                    # Bonus for longer, more descriptive paragraphs (up to 500 chars)
-                    length_bonus = min(len(para), 500) / 100
-                    # Bonus for descriptive language
-                    descriptive_words = ['project', 'build', 'feature', 'implement',
-                                         'design', 'status', 'progress', 'complete',
-                                         'working', 'develop', 'launch', 'deploy']
-                    desc_bonus = sum(1 for w in descriptive_words if w in para_lower)
-                    total_score = score + length_bonus + desc_bonus
-                    scored_paragraphs.append((total_score, para))
-
-        # Sort by score descending, take top snippets
-        scored_paragraphs.sort(key=lambda x: x[0], reverse=True)
-
-        # Pick the best 1-2 snippets, avoid redundancy
-        best = []
-        for _score, para in scored_paragraphs:
-            # Skip if too similar to an already-picked snippet
-            is_redundant = any(
-                _overlap_ratio(para, existing) > 0.5
-                for existing in best
-            )
-            if not is_redundant:
-                best.append(para)
-                if len(best) >= 2:
-                    break
-
-        if best:
-            project_snippets[name] = best
-            if verbose:
-                print(f"  Chat match for '{name}': {len(scored_paragraphs)} candidates, "
-                      f"kept {len(best)} snippets")
-
-    return project_snippets
 
 
 def _overlap_ratio(a, b):
@@ -285,26 +191,108 @@ def _overlap_ratio(a, b):
     return len(intersection) / smaller if smaller > 0 else 0.0
 
 
+def match_chat_to_projects(chat_files, projects, verbose=False):
+    """Match chat history to projects. Returns dict of snippets and dated entries."""
+    project_chat_data = {}
+
+    for project in projects:
+        name = project.get('name', '')
+        if not name:
+            continue
+
+        search_terms = _build_search_terms(name)
+        scored_paragraphs = []
+
+        for chat in chat_files:
+            paragraphs = _split_into_paragraphs(chat['content'])
+            chat_date = chat.get('date')
+            chat_filename = chat.get('filename', '')
+
+            for para in paragraphs:
+                para_lower = para.lower()
+                score = 0
+                for term in search_terms:
+                    count = para_lower.count(term)
+                    if count > 0:
+                        score += count * len(term)
+
+                if score > 0:
+                    length_bonus = min(len(para), 500) / 100
+                    descriptive_words = ['project', 'build', 'feature', 'implement',
+                                         'design', 'status', 'progress', 'complete',
+                                         'working', 'develop', 'launch', 'deploy']
+                    desc_bonus = sum(1 for w in descriptive_words if w in para_lower)
+                    total_score = score + length_bonus + desc_bonus
+                    scored_paragraphs.append((total_score, para, chat_date, chat_filename))
+
+        scored_paragraphs.sort(key=lambda x: x[0], reverse=True)
+
+        # Best snippets for narrative
+        best_snippets = []
+        # Dated entries for timeline
+        dated_entries = []
+
+        for _score, para, chat_date, chat_filename in scored_paragraphs:
+            is_redundant = any(_overlap_ratio(para, existing) > 0.5 for existing in best_snippets)
+            if not is_redundant:
+                best_snippets.append(para)
+
+                # Create a dated timeline entry from chat
+                if chat_date:
+                    date_str = chat_date.strftime('%Y-%m-%d')
+                else:
+                    date_str = 'Unknown date'
+                # Use chat filename as source hint
+                source_hint = chat_filename.replace('.md', '').replace('.txt', '').replace('_', ' ')
+                summary_line = para[:150]
+                if len(para) > 150:
+                    last_period = summary_line.rfind('.')
+                    if last_period > 80:
+                        summary_line = summary_line[:last_period + 1]
+                    else:
+                        summary_line = summary_line + '...'
+
+                dated_entries.append({
+                    'date': date_str,
+                    'source': f'Claude.ai Chat — {source_hint}',
+                    'text': summary_line,
+                })
+
+                if len(best_snippets) >= 3:
+                    break
+
+        if best_snippets or dated_entries:
+            project_chat_data[name] = {
+                'snippets': best_snippets,
+                'timeline_entries': dated_entries,
+            }
+            if verbose:
+                print(f"  Chat match for '{name}': {len(scored_paragraphs)} candidates, "
+                      f"kept {len(best_snippets)} snippets, {len(dated_entries)} timeline entries")
+
+    return project_chat_data
+
+
+# =============================================================================
+# PROJECT STATUS FILE PARSING
+# =============================================================================
+
 def find_project_status_files(scan_paths=None, max_depth=2):
     """Find all PROJECT_STATUS.md files in scan paths."""
     if scan_paths is None:
         scan_paths = DEFAULT_SCAN_PATHS
 
     status_files = []
-
     for base_path in scan_paths:
         base_path = os.path.expanduser(base_path)
         if not os.path.isdir(base_path):
             continue
 
         for root, dirs, files in os.walk(base_path):
-            # Calculate depth
             depth = root.replace(base_path, '').count(os.sep)
             if depth >= max_depth:
-                dirs[:] = []  # Don't go deeper
+                dirs[:] = []
                 continue
-
-            # Skip certain directories
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
 
             for fname in files:
@@ -342,17 +330,15 @@ def extract_list_items(content, header_pattern, max_items=10):
 
 
 def extract_section_text(content, header_pattern):
-    """Extract the full text content under a markdown header, stopping at the next header."""
+    """Extract full text content under a markdown header."""
     match = re.search(
         header_pattern + r'\s*\n(.*?)(?=\n## |\n---|\Z)',
         content, re.DOTALL
     )
     if match:
         text = match.group(1).strip()
-        # Clean up markdown artifacts
         text = text.replace('**', '')
-        text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)  # links -> text
-        # Remove bullet prefixes for a cleaner paragraph
+        text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
         lines = []
         for line in text.split('\n'):
             line = line.strip()
@@ -364,80 +350,120 @@ def extract_section_text(content, header_pattern):
     return ''
 
 
+def extract_progress_log(content):
+    """Parse the ## Progress Log section into dated entries.
+
+    Returns a list of dicts: [{'date': str, 'source': str, 'text': str}, ...]
+    sorted newest first.
+    """
+    entries = []
+
+    # Find the Progress Log section
+    log_match = re.search(r'## Progress Log\s*\n(.*?)(?=\n## |\n---\s*\n\*Last|\Z)',
+                          content, re.DOTALL)
+    if not log_match:
+        return entries
+
+    log_text = log_match.group(1)
+
+    # Split on ### headers which are date entries
+    # Pattern: ### 2026-02-04 (Claude.ai Chat — Topic)
+    # or: ### 2026-02-04 (Claude Code)
+    # or: ### 2025-12-17
+    entry_pattern = r'###\s+(\d{4}-\d{2}-\d{2})(?:\s+\(([^)]*)\))?\s*\n'
+    parts = re.split(entry_pattern, log_text)
+
+    # parts[0] is before first match (usually empty), then groups of 3: date, source, body
+    i = 1
+    while i < len(parts):
+        date_str = parts[i].strip() if i < len(parts) else ''
+        source = parts[i + 1].strip() if i + 1 < len(parts) and parts[i + 1] else ''
+        body = parts[i + 2].strip() if i + 2 < len(parts) else ''
+        i += 3
+
+        if not date_str:
+            continue
+
+        # Clean up the body: extract source line and bullet points
+        body_lines = []
+        for line in body.split('\n'):
+            line = line.strip()
+            if line.startswith('**Source:**'):
+                # Already captured source from header; skip or supplement
+                if not source:
+                    source = line.replace('**Source:**', '').strip()
+                continue
+            if line.startswith('- ') or line.startswith('* '):
+                line = line.lstrip('-* ').strip()
+            if line:
+                line = line.replace('**', '')
+                body_lines.append(line)
+
+        if body_lines:
+            # Combine into a summary, keeping it concise
+            combined = ' '.join(body_lines)
+            # Trim to ~250 chars for the timeline view
+            if len(combined) > 250:
+                trimmed = combined[:250]
+                last_period = trimmed.rfind('.')
+                if last_period > 150:
+                    combined = trimmed[:last_period + 1]
+                else:
+                    combined = trimmed + '...'
+
+            entries.append({
+                'date': date_str,
+                'source': source or 'Unknown',
+                'text': combined,
+            })
+
+    return entries
+
+
+def extract_open_questions(content):
+    """Extract open design questions from markdown tables."""
+    questions = []
+
+    # Look for tables with | # | Question | pattern
+    table_match = re.search(
+        r'## Open Design Questions.*?\n\|.*?\|.*?\|.*?\n\|[-\s|]+\n((?:\|.*\n)*)',
+        content, re.DOTALL
+    )
+    if table_match:
+        rows = table_match.group(1).strip().split('\n')
+        for row in rows:
+            cells = [c.strip() for c in row.split('|') if c.strip()]
+            if len(cells) >= 2:
+                question = cells[1].strip()
+                if question and len(question) > 10:
+                    questions.append(question)
+
+    return questions
+
+
 def extract_next_steps(content):
     """Extract next steps from status file."""
-    items = extract_list_items(content, r'## Next Steps', 5)
+    items = extract_list_items(content, r'## Next Steps', 8)
     if not items:
-        items = extract_list_items(content, r'### Next Steps', 5)
+        items = extract_list_items(content, r'### Next Steps', 8)
+
+    # Also try numbered lists
+    if not items:
+        match = re.search(r'## Next Steps\s*\n((?:\d+\.\s+.+\n?)+)', content, re.MULTILINE)
+        if match:
+            for line in match.group(1).split('\n'):
+                line = line.strip()
+                line = re.sub(r'^\d+\.\s+', '', line).strip()
+                if line and len(line) > 5:
+                    items.append(line.replace('**', ''))
+                    if len(items) >= 8:
+                        break
+
     return items
 
 
-def build_project_narrative(project, chat_snippets=None):
-    """Build a narrative paragraph for a project from its status data.
-
-    If chat_snippets are provided, they supplement the status file content
-    to create richer descriptions.
-    """
-    parts = []
-
-    # Use summary if available
-    summary = project.get('summary', '')
-    if summary:
-        parts.append(summary)
-
-    # Add working features if we need more content
-    features = project.get('features', [])
-    if features and not summary:
-        if len(features) >= 3:
-            parts.append(
-                'Current capabilities include: ' +
-                ', '.join(features[:5]).rstrip('.') + '.'
-            )
-        else:
-            for f in features:
-                parts.append(f.rstrip('.') + '.')
-
-    # Add blockers
-    blockers = project.get('blockers', [])
-    if blockers:
-        parts.append('Blockers: ' + '; '.join(blockers).rstrip('.') + '.')
-
-    # Add next steps
-    next_steps = project.get('next_steps', [])
-    if next_steps:
-        step_text = 'Next step is ' + next_steps[0].rstrip('.').lower() + '.'
-        if len(next_steps) > 1:
-            step_text = ('Next steps include ' +
-                         ', '.join(s.rstrip('.').lower() for s in next_steps[:3]) + '.')
-        parts.append(step_text)
-
-    # Supplement with chat history snippets
-    if chat_snippets:
-        name = project.get('name', '')
-        snippets = chat_snippets.get(name, [])
-        if snippets:
-            # Combine existing narrative text to check for redundancy
-            existing_text = ' '.join(parts).lower()
-            for snippet in snippets:
-                # Only add if it brings genuinely new information
-                if _overlap_ratio(snippet, existing_text) < 0.4:
-                    # Trim to reasonable length for the PDF
-                    trimmed = snippet[:600]
-                    if len(snippet) > 600:
-                        # Cut at last sentence boundary
-                        last_period = trimmed.rfind('.')
-                        if last_period > 300:
-                            trimmed = trimmed[:last_period + 1]
-                    parts.append(trimmed)
-
-    if not parts:
-        return 'Status file exists but no detailed description available yet.'
-
-    return ' '.join(parts)
-
-
 def parse_project_status(file_path):
-    """Parse a PROJECT_STATUS.md file and extract metadata."""
+    """Parse a PROJECT_STATUS.md file and extract all metadata including temporal data."""
     try:
         with open(file_path, 'r') as f:
             content = f.read()
@@ -447,20 +473,22 @@ def parse_project_status(file_path):
             'project_path': os.path.dirname(file_path),
         }
 
-        # Extract project name
+        # Project name
         name_match = re.search(r'# PROJECT_STATUS:\s*(.+)', content)
         if name_match:
             project['name'] = name_match.group(1).strip()
         else:
             project['name'] = os.path.basename(os.path.dirname(file_path))
 
-        # Extract from metadata table
+        # Metadata table
         patterns = {
             'repo': r'\*\*Repository\*\*\s*\|\s*(.+)',
             'category': r'\*\*Category\*\*\s*\|\s*(.+)',
             'progress': r'\*\*Progress\*\*\s*\|\s*(\d+)',
             'status': r'\*\*Status\*\*\s*\|\s*(.+)',
             'has_repo': r'\*\*Has GitHub Repo\*\*\s*\|\s*(.+)',
+            'last_worked': r'\*\*Last Worked\*\*\s*\|\s*(.+)',
+            'last_synced': r'\*\*Last Synced to Claude\.ai\*\*\s*\|\s*(.+)',
         }
 
         for key, pattern in patterns.items():
@@ -472,18 +500,20 @@ def parse_project_status(file_path):
                 else:
                     project[key] = value
 
-        # Set defaults
+        # Defaults
         project.setdefault('progress', 0)
         project.setdefault('status', 'Unknown')
         project.setdefault('category', 'Personal')
         project.setdefault('repo', '')
         project.setdefault('has_repo', 'No')
+        project.setdefault('last_worked', '')
+        project.setdefault('last_synced', '')
 
-        # Normalize category for grouping
+        # Normalize category
         raw_cat = project['category'].lower().strip()
         project['category_group'] = CATEGORY_MAP.get(raw_cat, project['category'])
 
-        # Determine if has repo
+        # Has repo?
         has_repo = project.get('has_repo', 'No').lower()
         project['has_github_repo'] = has_repo == 'yes' or (
             project['repo']
@@ -491,7 +521,7 @@ def parse_project_status(file_path):
             and 'none' not in project['repo'].lower()
         )
 
-        # Extract project summary/description
+        # Summary/description
         summary = extract_section_text(content, r'## Project Summary')
         if not summary:
             summary = extract_section_text(content, r'## Description')
@@ -499,39 +529,42 @@ def parse_project_status(file_path):
             summary = extract_section_text(content, r'## Notes')
         project['summary'] = summary
 
-        # Extract features from "What's Working" section
+        # Features
         features = extract_list_items(content, r"### What's Working", 10)
         if len(features) < 3:
             features.extend(extract_list_items(content, r"### What Exists", 10))
-        if len(features) < 3:
-            features.extend(extract_list_items(content, r'\*\*What was built:\*\*', 5))
-
-        # Dedupe while preserving order
         seen = set()
-        unique_features = []
+        unique = []
         for f in features:
             if f.lower() not in seen:
                 seen.add(f.lower())
-                unique_features.append(f)
-        project['features'] = unique_features
+                unique.append(f)
+        project['features'] = unique
 
-        # Extract blockers
+        # Blockers
         blockers = extract_list_items(content, r'### Blockers', 5)
-        # Filter out "none" type blockers
         blockers = [b for b in blockers if 'none' not in b.lower()[:10]]
         project['blockers'] = blockers
 
-        # Extract not working
+        # Not working / doesn't exist yet
         not_working = extract_list_items(content, r"### What's Not Working", 5)
         if not not_working:
             not_working = extract_list_items(content, r"### What Doesn't Exist Yet", 5)
         project['not_working'] = not_working
 
-        # Extract next steps
+        # Next steps
         project['next_steps'] = extract_next_steps(content)
 
-        # Narrative is built later after chat history is loaded
+        # Open design questions
+        project['open_questions'] = extract_open_questions(content)
+
+        # Progress log (temporal data!)
+        project['progress_log'] = extract_progress_log(content)
+
+        # Narrative and timeline built later after chat history is loaded
         project['narrative'] = ''
+        project['timeline'] = []
+        project['open_threads'] = []
 
         return project
 
@@ -540,12 +573,113 @@ def parse_project_status(file_path):
         return None
 
 
-def load_projects(scan_paths=None, chat_history_path=None, verbose=False):
-    """Load all projects from PROJECT_STATUS.md files.
+# =============================================================================
+# NARRATIVE + TIMELINE BUILDING
+# =============================================================================
 
-    If chat_history_path is provided, also loads chat exports and matches
-    them to projects to supplement the narrative descriptions.
+def build_project_narrative(project, chat_data=None):
+    """Build the summary narrative paragraph."""
+    parts = []
+
+    summary = project.get('summary', '')
+    if summary:
+        parts.append(summary)
+
+    features = project.get('features', [])
+    if features and not summary:
+        if len(features) >= 3:
+            parts.append('Current capabilities include: ' +
+                         ', '.join(features[:5]).rstrip('.') + '.')
+        else:
+            for f in features:
+                parts.append(f.rstrip('.') + '.')
+
+    # Supplement with chat snippets
+    if chat_data:
+        snippets = chat_data.get('snippets', [])
+        existing_text = ' '.join(parts).lower()
+        for snippet in snippets:
+            if _overlap_ratio(snippet, existing_text) < 0.4:
+                trimmed = snippet[:600]
+                if len(snippet) > 600:
+                    last_period = trimmed.rfind('.')
+                    if last_period > 300:
+                        trimmed = trimmed[:last_period + 1]
+                parts.append(trimmed)
+
+    if not parts:
+        return 'Status file exists but no detailed description available yet.'
+
+    return ' '.join(parts)
+
+
+def build_project_timeline(project, chat_data=None):
+    """Merge progress log entries with chat-sourced dated entries into one timeline.
+
+    Returns entries sorted newest-first.
     """
+    timeline = []
+
+    # Add progress log entries
+    for entry in project.get('progress_log', []):
+        timeline.append(entry.copy())
+
+    # Add chat-sourced entries
+    if chat_data:
+        for entry in chat_data.get('timeline_entries', []):
+            # Check for redundancy against existing timeline
+            is_redundant = any(
+                entry['date'] == existing['date'] and
+                _overlap_ratio(entry['text'], existing['text']) > 0.4
+                for existing in timeline
+            )
+            if not is_redundant:
+                timeline.append(entry.copy())
+
+    # Sort by date descending (newest first)
+    def sort_key(e):
+        try:
+            return datetime.strptime(e['date'], '%Y-%m-%d')
+        except (ValueError, TypeError):
+            return datetime.min
+
+    timeline.sort(key=sort_key, reverse=True)
+
+    return timeline
+
+
+def build_open_threads(project):
+    """Collect all unfinished items into a single list of open threads.
+
+    Sources: blockers, open questions, not working, next steps.
+    """
+    threads = []
+
+    # Blockers are highest priority
+    for b in project.get('blockers', []):
+        threads.append(('Blocker', b))
+
+    # Open design questions
+    for q in project.get('open_questions', []):
+        threads.append(('Open Question', q))
+
+    # Things not working / not built yet
+    for nw in project.get('not_working', [])[:3]:
+        threads.append(('Not Yet Built', nw))
+
+    # Next steps (what was left to do)
+    for ns in project.get('next_steps', []):
+        threads.append(('Next Step', ns))
+
+    return threads
+
+
+# =============================================================================
+# LOAD AND ASSEMBLE
+# =============================================================================
+
+def load_projects(scan_paths=None, chat_history_path=None, verbose=False):
+    """Load all projects, merge with chat history, build timelines."""
     status_files = find_project_status_files(scan_paths)
 
     if verbose:
@@ -554,107 +688,203 @@ def load_projects(scan_paths=None, chat_history_path=None, verbose=False):
             print(f"  - {sf}")
 
     all_projects = []
-
     for sf in status_files:
         project = parse_project_status(sf)
         if project:
             all_projects.append(project)
 
-    # Load chat history and match to projects
-    chat_snippets = {}
+    # Load chat history
+    chat_project_data = {}
     if chat_history_path:
         print(f"Loading chat history from: {chat_history_path}")
         chat_files = load_chat_files(chat_history_path)
         print(f"  Loaded {len(chat_files)} chat files")
         if chat_files:
-            chat_snippets = match_chat_to_projects(chat_files, all_projects, verbose=verbose)
-            print(f"  Matched chat context to {len(chat_snippets)} projects")
+            chat_project_data = match_chat_to_projects(chat_files, all_projects, verbose=verbose)
+            print(f"  Matched chat context to {len(chat_project_data)} projects")
 
-    # Build narratives (now with chat context available)
+    # Build narratives, timelines, and open threads
     for project in all_projects:
-        project['narrative'] = build_project_narrative(project, chat_snippets)
+        name = project.get('name', '')
+        chat_data = chat_project_data.get(name)
+
+        project['narrative'] = build_project_narrative(project, chat_data)
+        project['timeline'] = build_project_timeline(project, chat_data)
+        project['open_threads'] = build_open_threads(project)
+
         if verbose:
             print(f"\n{project['name']}:")
             print(f"  Category: {project['category_group']}")
-            print(f"  Summary: {project.get('summary', '')[:60]}...")
-            has_chat = project['name'] in chat_snippets
+            print(f"  Timeline entries: {len(project['timeline'])}")
+            print(f"  Open threads: {len(project['open_threads'])}")
+            has_chat = name in chat_project_data
             print(f"  Chat context: {'Yes' if has_chat else 'No'}")
-            print(f"  Narrative: {project.get('narrative', '')[:80]}...")
 
-    # Sort by progress descending within each group
     all_projects.sort(key=lambda x: x['progress'], reverse=True)
-
     return all_projects
 
 
 # =============================================================================
-# PDF GENERATION - Narrative Portfolio Format
+# PDF GENERATION
 # =============================================================================
 
+def _render_project_block(p, styles_dict):
+    """Build the PDF elements for a single project."""
+    elements = []
+
+    progress = p.get('progress', 0)
+    status = p.get('status', '')
+    name = p.get('name', 'Unknown')
+    last_worked = p.get('last_worked', '')
+    last_synced = p.get('last_synced', '')
+
+    # --- Project Header ---
+    detail_parts = []
+    if progress > 0:
+        detail_parts.append(f"{progress}%")
+    if status:
+        detail_parts.append(status)
+    if detail_parts:
+        header_text = f"{name} — {' | '.join(detail_parts)}"
+    else:
+        header_text = name
+
+    elements.append(Paragraph(header_text, styles_dict['project_header']))
+
+    # Last active / last synced subline
+    meta_parts = []
+    if last_worked:
+        meta_parts.append(f"Last active: {last_worked}")
+    if last_synced:
+        meta_parts.append(f"Last synced to Claude.ai: {last_synced}")
+    if meta_parts:
+        elements.append(Paragraph(' | '.join(meta_parts), styles_dict['meta']))
+
+    # --- Summary Narrative ---
+    narrative = p.get('narrative', 'No description available.')
+    elements.append(Paragraph(narrative, styles_dict['narrative']))
+
+    # --- Recent Activity Timeline ---
+    timeline = p.get('timeline', [])
+    if timeline:
+        elements.append(Spacer(1, 4))
+        elements.append(Paragraph('Recent Activity:', styles_dict['section_label']))
+        for entry in timeline[:5]:  # Show last 5 entries
+            date_str = entry.get('date', '?')
+            source = entry.get('source', '')
+            text = entry.get('text', '')
+
+            # Format: "Feb 4 (Claude.ai Chat) — Did the thing..."
+            try:
+                dt = datetime.strptime(date_str, '%Y-%m-%d')
+                display_date = dt.strftime('%b %d')
+            except (ValueError, TypeError):
+                display_date = date_str
+
+            source_tag = f' ({source})' if source else ''
+            line = f"<b>{display_date}</b>{source_tag} — {text}"
+            elements.append(Paragraph(line, styles_dict['timeline_entry']))
+
+    # --- Open Threads ---
+    open_threads = p.get('open_threads', [])
+    if open_threads:
+        elements.append(Spacer(1, 4))
+        elements.append(Paragraph('Open Threads:', styles_dict['section_label']))
+        for thread_type, thread_text in open_threads[:6]:  # Cap at 6
+            # Color-code by type
+            if thread_type == 'Blocker':
+                tag = '<font color="#E74C3C">[Blocker]</font>'
+            elif thread_type == 'Open Question':
+                tag = '<font color="#E67E22">[Question]</font>'
+            elif thread_type == 'Next Step':
+                tag = '<font color="#3498DB">[Next]</font>'
+            else:
+                tag = f'<font color="#7F8C8D">[{thread_type}]</font>'
+
+            # Trim long text
+            display_text = thread_text[:120]
+            if len(thread_text) > 120:
+                display_text += '...'
+
+            elements.append(Paragraph(f"{tag} {display_text}", styles_dict['thread_entry']))
+
+    return elements
+
+
 def create_pdf(output_path, all_projects):
-    """Generate the narrative portfolio PDF."""
+    """Generate the full portfolio PDF with temporal tracking."""
     doc = SimpleDocTemplate(
         output_path,
         pagesize=letter,
-        rightMargin=0.65*inch,
-        leftMargin=0.65*inch,
+        rightMargin=0.6*inch,
+        leftMargin=0.6*inch,
         topMargin=0.5*inch,
         bottomMargin=0.5*inch
     )
 
     styles = getSampleStyleSheet()
 
-    # Title: "Chris Treadaway — Project Portfolio Status"
-    title_style = ParagraphStyle(
+    s = {}  # our custom styles dict
+
+    s['title'] = ParagraphStyle(
         'PortfolioTitle', parent=styles['Heading1'],
         fontSize=18, textColor=colors.HexColor('#1a1a1a'),
-        spaceAfter=2, fontName='Helvetica-Bold',
-        alignment=TA_CENTER
+        spaceAfter=2, fontName='Helvetica-Bold', alignment=TA_CENTER
     )
-
-    # Subtitle: date and project count
-    subtitle_style = ParagraphStyle(
+    s['subtitle'] = ParagraphStyle(
         'PortfolioSubtitle', parent=styles['Normal'],
         fontSize=10, textColor=colors.HexColor('#555555'),
         alignment=TA_CENTER, spaceAfter=16
     )
-
-    # Category headers: "Church Projects", "School Projects", etc.
-    category_style = ParagraphStyle(
+    s['category'] = ParagraphStyle(
         'CategoryHeader', parent=styles['Heading2'],
         fontSize=14, textColor=colors.HexColor('#2C3E50'),
-        spaceBefore=16, spaceAfter=8,
-        fontName='Helvetica-Bold',
-        borderWidth=0, borderPadding=0,
+        spaceBefore=16, spaceAfter=8, fontName='Helvetica-Bold',
     )
-
-    # Project name + progress: "Ministry Fair App — 60% | Needs Testing"
-    project_header_style = ParagraphStyle(
+    s['project_header'] = ParagraphStyle(
         'ProjectHeader', parent=styles['Heading3'],
         fontSize=10, textColor=colors.HexColor('#1a1a1a'),
-        spaceBefore=10, spaceAfter=3,
-        fontName='Helvetica-Bold',
+        spaceBefore=10, spaceAfter=1, fontName='Helvetica-Bold',
     )
-
-    # Project narrative paragraph
-    narrative_style = ParagraphStyle(
+    s['meta'] = ParagraphStyle(
+        'ProjectMeta', parent=styles['Normal'],
+        fontSize=7, textColor=colors.HexColor('#888888'),
+        spaceAfter=4, fontName='Helvetica-Oblique',
+    )
+    s['narrative'] = ParagraphStyle(
         'Narrative', parent=styles['Normal'],
         fontSize=9, textColor=colors.HexColor('#333333'),
-        leading=13, spaceAfter=6,
-        fontName='Helvetica',
+        leading=13, spaceAfter=4, fontName='Helvetica',
     )
-
-    # Separator line style
-    separator_style = ParagraphStyle(
-        'Separator', parent=styles['Normal'],
-        fontSize=2, spaceAfter=4, spaceBefore=4,
+    s['section_label'] = ParagraphStyle(
+        'SectionLabel', parent=styles['Normal'],
+        fontSize=8, textColor=colors.HexColor('#2C3E50'),
+        spaceAfter=2, fontName='Helvetica-Bold',
     )
-
-    # Footer
-    footer_style = ParagraphStyle(
+    s['timeline_entry'] = ParagraphStyle(
+        'TimelineEntry', parent=styles['Normal'],
+        fontSize=7.5, textColor=colors.HexColor('#444444'),
+        leading=10, leftIndent=8, spaceAfter=2, fontName='Helvetica',
+    )
+    s['thread_entry'] = ParagraphStyle(
+        'ThreadEntry', parent=styles['Normal'],
+        fontSize=7.5, textColor=colors.HexColor('#444444'),
+        leading=10, leftIndent=8, spaceAfter=2, fontName='Helvetica',
+    )
+    s['footer'] = ParagraphStyle(
         'Footer', parent=styles['Normal'],
         fontSize=8, textColor=colors.HexColor('#999999'),
         alignment=TA_CENTER, spaceBefore=20
+    )
+    s['cross_project_header'] = ParagraphStyle(
+        'CrossProjectHeader', parent=styles['Heading2'],
+        fontSize=13, textColor=colors.HexColor('#2C3E50'),
+        spaceBefore=12, spaceAfter=6, fontName='Helvetica-Bold',
+    )
+    s['cross_project_name'] = ParagraphStyle(
+        'CrossProjectName', parent=styles['Normal'],
+        fontSize=9, textColor=colors.HexColor('#1a1a1a'),
+        spaceBefore=6, spaceAfter=2, fontName='Helvetica-Bold',
     )
 
     elements = []
@@ -664,129 +894,114 @@ def create_pdf(output_path, all_projects):
     date_str = now.strftime('%B %d, %Y')
     total_projects = len(all_projects)
 
-    # Build category summary for subtitle
     cat_counts = {}
     for p in all_projects:
         cat = p.get('category_group', 'Personal')
         cat_counts[cat] = cat_counts.get(cat, 0) + 1
 
-    cat_parts = []
-    for cat in CATEGORY_ORDER:
-        if cat in cat_counts:
-            cat_parts.append(cat)
-    cat_summary = ', '.join(cat_parts[:-1])
+    cat_parts = [cat for cat in CATEGORY_ORDER if cat in cat_counts]
     if len(cat_parts) > 1:
-        cat_summary += ' &amp; ' + cat_parts[-1]
+        cat_summary = ', '.join(cat_parts[:-1]) + ' &amp; ' + cat_parts[-1]
     elif cat_parts:
         cat_summary = cat_parts[0]
+    else:
+        cat_summary = ''
 
-    elements.append(Paragraph(
-        'Chris Treadaway — Project Portfolio Status',
-        title_style
-    ))
+    elements.append(Paragraph('Chris Treadaway — Project Portfolio Status', s['title']))
     elements.append(Paragraph(
         f'{date_str} | {total_projects} Projects Across {cat_summary}',
-        subtitle_style
+        s['subtitle']
     ))
 
-    # === GROUP PROJECTS BY CATEGORY ===
+    # === PROJECTS BY CATEGORY ===
     grouped = {}
     for p in all_projects:
         cat = p.get('category_group', 'Personal')
-        if cat not in grouped:
-            grouped[cat] = []
-        grouped[cat].append(p)
+        grouped.setdefault(cat, []).append(p)
 
-    # Sort within each category by progress descending
     for cat in grouped:
         grouped[cat].sort(key=lambda x: x['progress'], reverse=True)
 
-    # Render categories in order
+    rendered_cats = set()
+
     for cat in CATEGORY_ORDER:
         if cat not in grouped:
             continue
 
         projects = grouped[cat]
 
-        # Category header with suffix "Projects" (except Personal)
         if cat in ('Infrastructure', 'Personal'):
-            cat_label = 'Infrastructure &amp; Personal Projects'
-            # Merge personal into infrastructure section
             if cat == 'Personal':
-                continue  # handled when we hit Infrastructure
+                continue  # merged with Infrastructure
+            cat_label = 'Infrastructure &amp; Personal Projects'
             if 'Personal' in grouped:
                 projects = projects + grouped['Personal']
+            rendered_cats.add('Infrastructure')
+            rendered_cats.add('Personal')
         else:
             cat_label = f'{cat} Projects'
+            rendered_cats.add(cat)
 
-        elements.append(Paragraph(cat_label, category_style))
+        elements.append(Paragraph(cat_label, s['category']))
 
-        # Render each project
         for p in projects:
-            progress = p.get('progress', 0)
-            status = p.get('status', '')
-            name = p.get('name', 'Unknown')
+            project_elements = _render_project_block(p, s)
+            elements.append(KeepTogether(project_elements))
 
-            # Format progress display
-            if progress > 0:
-                progress_str = f"{progress}%"
-            else:
-                progress_str = ''
-
-            # Build header: "Project Name — 60% | Status"
-            header_parts = [name]
-            detail_parts = []
-            if progress_str:
-                detail_parts.append(progress_str)
-            if status:
-                detail_parts.append(status)
-
-            if detail_parts:
-                header_text = f"{name} — {' | '.join(detail_parts)}"
-            else:
-                header_text = name
-
-            narrative = p.get('narrative', 'No description available.')
-
-            # KeepTogether prevents orphaned headers
-            project_block = [
-                Paragraph(header_text, project_header_style),
-                Paragraph(narrative, narrative_style),
-            ]
-            elements.append(KeepTogether(project_block))
-
-    # Handle categories not in CATEGORY_ORDER
+    # Handle any categories not in CATEGORY_ORDER
     for cat in grouped:
-        if cat not in CATEGORY_ORDER and cat != 'Personal':
-            elements.append(Paragraph(f'{cat} Projects', category_style))
+        if cat not in rendered_cats:
+            elements.append(Paragraph(f'{cat} Projects', s['category']))
             for p in grouped[cat]:
-                progress = p.get('progress', 0)
-                status = p.get('status', '')
-                name = p.get('name', 'Unknown')
-                detail_parts = []
-                if progress > 0:
-                    detail_parts.append(f"{progress}%")
-                if status:
-                    detail_parts.append(status)
-                if detail_parts:
-                    header_text = f"{name} — {' | '.join(detail_parts)}"
+                project_elements = _render_project_block(p, s)
+                elements.append(KeepTogether(project_elements))
+
+    # === CROSS-PROJECT: WHAT'S LEFT UNFINISHED ===
+    projects_with_threads = [(p['name'], p['open_threads'])
+                              for p in all_projects if p.get('open_threads')]
+
+    if projects_with_threads:
+        elements.append(Spacer(1, 0.15*inch))
+        elements.append(HRFlowable(width="100%", thickness=1,
+                                    color=colors.HexColor('#BDC3C7'),
+                                    spaceBefore=8, spaceAfter=8))
+        elements.append(Paragraph(
+            "What's Left Unfinished Across All Projects",
+            s['cross_project_header']
+        ))
+
+        for proj_name, threads in projects_with_threads:
+            elements.append(Paragraph(proj_name, s['cross_project_name']))
+            for thread_type, thread_text in threads[:4]:
+                if thread_type == 'Blocker':
+                    tag = '<font color="#E74C3C">[Blocker]</font>'
+                elif thread_type == 'Open Question':
+                    tag = '<font color="#E67E22">[Question]</font>'
+                elif thread_type == 'Next Step':
+                    tag = '<font color="#3498DB">[Next]</font>'
                 else:
-                    header_text = name
-                narrative = p.get('narrative', 'No description available.')
-                project_block = [
-                    Paragraph(header_text, project_header_style),
-                    Paragraph(narrative, narrative_style),
-                ]
-                elements.append(KeepTogether(project_block))
+                    tag = f'<font color="#7F8C8D">[{thread_type}]</font>'
+
+                display_text = thread_text[:100]
+                if len(thread_text) > 100:
+                    display_text += '...'
+                elements.append(Paragraph(f"{tag} {display_text}", s['thread_entry']))
 
     # Footer
     elements.append(Spacer(1, 0.3*inch))
-    elements.append(Paragraph('If this tool saves you time: Venmo @ctreada', footer_style))
+    elements.append(Paragraph('If this tool saves you time: Venmo @ctreada', s['footer']))
 
     doc.build(elements)
     print(f"PDF generated: {output_path}")
     print(f"  {total_projects} projects across {len(grouped)} categories")
+    total_timeline = sum(len(p.get('timeline', [])) for p in all_projects)
+    total_threads = sum(len(p.get('open_threads', [])) for p in all_projects)
+    print(f"  {total_timeline} timeline entries, {total_threads} open threads")
 
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
@@ -802,7 +1017,6 @@ def main():
                         help='Show detailed debug output')
     args = parser.parse_args()
 
-    # Load projects dynamically
     print("Scanning for PROJECT_STATUS.md files...")
     all_projects = load_projects(
         args.scan_paths,
@@ -818,7 +1032,6 @@ def main():
 
     print(f"Found {len(all_projects)} projects")
 
-    # Generate PDF
     if args.output is None:
         today = datetime.now().strftime('%Y-%m-%d')
         output_dir = os.path.expanduser('~/Downloads')
