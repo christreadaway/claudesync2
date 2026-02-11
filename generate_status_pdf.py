@@ -707,7 +707,7 @@ def main():
         today = datetime.now().strftime('%Y-%m-%d')
         output_dir = os.path.expanduser('~/Downloads')
         os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, f'status_report_{today}.pdf')
+        output_path = os.path.join(output_dir, f'Project_Portfolio_Status_{today}.pdf')
     else:
         output_path = os.path.expanduser(args.output)
 
