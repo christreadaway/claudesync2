@@ -369,4 +369,4 @@ Created initial one-page proposal covering core concept, three-party multi-sig a
 
 ---
 
-*Last updated: 2026-02-04*
+*Last updated: 2026-02-11*

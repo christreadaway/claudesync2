@@ -68,8 +68,11 @@ def find_project_status_files(scan_paths=None, max_depth=2):
             # Skip certain directories
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
 
-            if 'PROJECT_STATUS.md' in files:
-                status_files.append(os.path.join(root, 'PROJECT_STATUS.md'))
+            for fname in files:
+                if fname == 'PROJECT_STATUS.md' or (
+                    fname.startswith('PROJECT_STATUS_') and fname.endswith('.md')
+                ):
+                    status_files.append(os.path.join(root, fname))
 
     return status_files
 
@@ -95,6 +98,8 @@ def extract_list_items(content, header_pattern, max_items=3):
                     len(item) < 10
                 )
                 if item and not is_placeholder:
+                    # Strip markdown bold markers
+                    item = item.replace('**', '')
                     items.append(item)
                     if len(items) >= max_items:
                         break
@@ -191,7 +196,7 @@ def parse_project_status(file_path):
         for key, pattern in patterns.items():
             match = re.search(pattern, content)
             if match:
-                value = match.group(1).strip()
+                value = match.group(1).strip().rstrip('|').strip()
                 if key == 'progress':
                     project[key] = int(value)
                 else:
@@ -207,11 +212,17 @@ def parse_project_status(file_path):
         # Determine if has repo
         has_repo = project.get('has_repo', 'No').lower()
         project['has_github_repo'] = has_repo == 'yes' or (
-            project['repo'] and 'not' not in project['repo'].lower()
+            project['repo']
+            and 'not' not in project['repo'].lower()
+            and 'none' not in project['repo'].lower()
         )
 
         # Extract features from "What's Working" section (most specific)
         features = extract_list_items(content, r"### What's Working", 5)
+
+        # Also try "What Exists" (used by some status files)
+        if len(features) < 3:
+            features.extend(extract_list_items(content, r"### What Exists", 5))
 
         # If not enough, try "What was built" entries
         if len(features) < 3:
@@ -226,8 +237,12 @@ def parse_project_status(file_path):
                 unique_features.append(f)
         project['features'] = unique_features[:5]
 
-        # Get recent commits for additional context
-        project['recent_commits'] = get_recent_commits(project['project_path'], 5)
+        # Get recent commits only if this project has its own git repo
+        project_git_dir = os.path.join(project['project_path'], '.git')
+        if project['has_github_repo'] and os.path.isdir(project_git_dir):
+            project['recent_commits'] = get_recent_commits(project['project_path'], 5)
+        else:
+            project['recent_commits'] = []
 
         return project
 
@@ -613,10 +628,15 @@ def create_pdf(output_path, projects):
         ))
 
         commits = p.get('recent_commits', [])
+        features = p.get('features', [])
         if commits:
             for commit in commits[:5]:
                 display_commit = commit[:55] + '...' if len(commit) > 55 else commit
                 cell_content.append(Paragraph(f"› {display_commit}", commit_style))
+        elif features:
+            for feat in features[:5]:
+                display_feat = feat[:55] + '...' if len(feat) > 55 else feat
+                cell_content.append(Paragraph(f"› {display_feat}", commit_style))
         else:
             cell_content.append(Paragraph('No recent work logged', no_data_style))
 
