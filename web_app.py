@@ -1502,7 +1502,7 @@ def _ai_enrich_all_projects():
     threads) to the AI and updates the narrative in the cache.
     Returns count of enriched projects.
     """
-    projects = _project_cache.get('projects', [])
+    projects = _get_projects()
     enriched = 0
 
     for project in projects:
@@ -1614,7 +1614,7 @@ def api_progress():
 def api_chart_data():
     mode = request.args.get('mode', 'day')
     ignored_names = _load_ignored()
-    projects = [p for p in _project_cache.get('projects', [])
+    projects = [p for p in _get_projects()
                 if p.get('name', '') not in ignored_names]
     data = _aggregate_activity(projects, mode=mode)
     return jsonify(data)
@@ -1765,6 +1765,8 @@ def api_set_dev_state(idx):
 
     data = request.get_json(force=True)
     new_state = data.get('dev_state', '').strip().lower()
+    if new_state and new_state not in ('test', 'refine', 'continue'):
+        return jsonify({'error': f'Invalid dev_state: must be test, refine, continue, or empty'}), 400
     project = projects[idx]
     project['dev_state'] = new_state
 
@@ -1888,7 +1890,7 @@ def upload():
 
 @app.route('/generate-pdf')
 def generate_pdf():
-    projects = _project_cache.get('projects', [])
+    projects = _get_projects()
     if not projects:
         projects = _load_cached_projects()
 
@@ -2051,7 +2053,7 @@ LIST_VIEW_HTML = """
 
 @app.route('/view/projects')
 def view_projects():
-    projects = _project_cache.get('projects', [])
+    projects = _get_projects()
     archived = _load_archived()
     ignored = _load_ignored()
 
@@ -2097,7 +2099,7 @@ def view_projects():
 
 @app.route('/view/events')
 def view_events():
-    projects = _project_cache.get('projects', [])
+    projects = _get_projects()
     ignored = _load_ignored()
 
     all_events = []
@@ -2138,7 +2140,7 @@ def view_events():
 
 @app.route('/view/threads')
 def view_threads():
-    projects = _project_cache.get('projects', [])
+    projects = _get_projects()
     resolved = _load_resolved()
     ignored = _load_ignored()
 
@@ -2171,7 +2173,7 @@ def view_threads():
 
 @app.route('/view/blockers')
 def view_blockers():
-    projects = _project_cache.get('projects', [])
+    projects = _get_projects()
     resolved = _load_resolved()
     ignored = _load_ignored()
 
@@ -2227,7 +2229,7 @@ def api_unarchive():
 @app.route('/view/whats-next')
 def view_whats_next():
     """Cross-project view: what needs to happen next for every project."""
-    projects = _project_cache.get('projects', [])
+    projects = _get_projects()
     if not projects:
         projects = _load_cached_projects()
 
@@ -2484,7 +2486,7 @@ def api_item_action():
 @app.route('/api/verify-categories', methods=['POST'])
 def api_verify_categories():
     """Use AI to verify each project is in the right category."""
-    projects = _project_cache.get('projects', [])
+    projects = _get_projects()
     ignored = _load_ignored()
     archived = _load_archived()
 
@@ -2569,7 +2571,7 @@ def api_classify_unmatched():
     if not unmatched:
         return jsonify({'error': 'No unmatched conversations found. Upload chat history first.'})
 
-    projects = _project_cache.get('projects', [])
+    projects = _get_projects()
     project_names = [p.get('name', '') for p in projects if p.get('name')]
 
     # Process in batches of 15 for token efficiency
