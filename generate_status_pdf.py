@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-Claude Project Sync - PDF Dashboard Generator
+Claude Project Sync - Project Portfolio PDF Generator
 
-Generates a visual PDF report by SCANNING PROJECT_STATUS.md files.
+Generates a narrative portfolio PDF by SCANNING PROJECT_STATUS.md files.
 No hardcoded data - reads from your actual projects.
+
+Output format matches the "Project Portfolio Status" style:
+- Title header with name, date, project count
+- Projects grouped by category (Church, School, Product, Infrastructure)
+- Each project has a bold header with progress/status and a narrative paragraph
 
 Usage:
     python3 generate_status_pdf.py [--output /path/to/output.pdf]
@@ -14,21 +19,15 @@ import argparse
 import os
 import re
 from datetime import datetime
-from io import BytesIO
-
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import numpy as np
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
+    SimpleDocTemplate, Paragraph, Spacer, PageBreak, KeepTogether
 )
-from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+from reportlab.lib.enums import TA_CENTER
 
 
 # =============================================================================
@@ -43,6 +42,29 @@ SKIP_DIRS = {
     'node_modules', '.git', '__pycache__', 'venv', '.venv',
     'dist', 'build', '.next', 'coverage', 'Library', '.Trash',
     'Applications', 'Pictures', 'Music', 'Movies', 'Documents'
+}
+
+# Category display order and grouping
+CATEGORY_ORDER = [
+    'Church',
+    'School',
+    'Product',
+    'Infrastructure',
+    'Personal',
+    'Research',
+]
+
+# Map variations to canonical category names for grouping
+CATEGORY_MAP = {
+    'church': 'Church',
+    'church / catholic tech': 'Church',
+    'catholic tech': 'Church',
+    'school': 'School',
+    'education': 'School',
+    'product': 'Product',
+    'infrastructure': 'Infrastructure',
+    'personal': 'Personal',
+    'research': 'Research',
 }
 
 
@@ -77,19 +99,16 @@ def find_project_status_files(scan_paths=None, max_depth=2):
     return status_files
 
 
-def extract_list_items(content, header_pattern, max_items=3):
+def extract_list_items(content, header_pattern, max_items=10):
     """Extract bullet points following a header pattern."""
     items = []
-    # Find the header and get content after it
     match = re.search(header_pattern + r'\s*\n((?:[-*]\s+.+\n?)+)', content, re.MULTILINE)
     if match:
         list_text = match.group(1)
-        # Extract individual items
         for line in list_text.split('\n'):
             line = line.strip()
             if line.startswith('-') or line.startswith('*'):
                 item = line.lstrip('-* ').strip()
-                # Skip placeholder items
                 placeholder_words = ['describe', 'nothing yet', 'none yet', 'tbd', 'todo',
                                      'list ', 'add ', 'initial project', 'project structure']
                 is_placeholder = (
@@ -98,7 +117,6 @@ def extract_list_items(content, header_pattern, max_items=3):
                     len(item) < 10
                 )
                 if item and not is_placeholder:
-                    # Strip markdown bold markers
                     item = item.replace('**', '')
                     items.append(item)
                     if len(items) >= max_items:
@@ -106,64 +124,76 @@ def extract_list_items(content, header_pattern, max_items=3):
     return items
 
 
-def get_recent_commits(project_dir, max_commits=5):
-    """Get recent meaningful commit messages from git log."""
-    import subprocess
+def extract_section_text(content, header_pattern):
+    """Extract the full text content under a markdown header, stopping at the next header."""
+    match = re.search(
+        header_pattern + r'\s*\n(.*?)(?=\n## |\n---|\Z)',
+        content, re.DOTALL
+    )
+    if match:
+        text = match.group(1).strip()
+        # Clean up markdown artifacts
+        text = text.replace('**', '')
+        text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)  # links -> text
+        # Remove bullet prefixes for a cleaner paragraph
+        lines = []
+        for line in text.split('\n'):
+            line = line.strip()
+            if line.startswith('- ') or line.startswith('* '):
+                line = line[2:]
+            if line:
+                lines.append(line)
+        return ' '.join(lines)
+    return ''
 
-    # Garbage commit patterns to skip
-    skip_patterns = [
-        'add files via upload',
-        'initial commit',
-        'first commit',
-        'init commit',
-        'create readme',
-        'update readme',
-        'delete ',
-        'remove ',
-        'merge branch',
-        'merge pull request',
-        'wip',
-        'fix typo',
-        'minor fix',
-        'small fix',
-        'quick fix',
-        'bump version',
-        'update dependencies',
-        'update package',
-        'lint fix',
-        'format code',
-        'cleanup',
-        'refactor',
-    ]
 
-    try:
-        # Scan ALL commits across ALL branches to find meaningful ones
-        result = subprocess.run(
-            ['git', 'log', '--all', '--pretty=format:%s'],
-            cwd=project_dir,
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        if result.returncode == 0:
-            commits = []
-            for line in result.stdout.strip().split('\n'):
-                line = line.strip()
-                if not line or len(line) < 15:
-                    continue
+def extract_next_steps(content):
+    """Extract next steps from status file."""
+    items = extract_list_items(content, r'## Next Steps', 5)
+    if not items:
+        items = extract_list_items(content, r'### Next Steps', 5)
+    return items
 
-                # Check against skip patterns
-                line_lower = line.lower()
-                is_garbage = any(pattern in line_lower for pattern in skip_patterns)
 
-                if not is_garbage:
-                    commits.append(line)
-                    if len(commits) >= max_commits:
-                        break
-            return commits
-    except Exception:
-        pass
-    return []
+def build_project_narrative(project):
+    """Build a narrative paragraph for a project from its status data."""
+    parts = []
+
+    # Use summary if available
+    summary = project.get('summary', '')
+    if summary:
+        parts.append(summary)
+
+    # Add working features if we need more content
+    features = project.get('features', [])
+    if features and not summary:
+        if len(features) >= 3:
+            parts.append(
+                'Current capabilities include: ' +
+                ', '.join(features[:5]).rstrip('.') + '.'
+            )
+        else:
+            for f in features:
+                parts.append(f.rstrip('.') + '.')
+
+    # Add blockers
+    blockers = project.get('blockers', [])
+    if blockers:
+        parts.append('Blockers: ' + '; '.join(blockers).rstrip('.') + '.')
+
+    # Add next steps
+    next_steps = project.get('next_steps', [])
+    if next_steps:
+        step_text = 'Next step is ' + next_steps[0].rstrip('.').lower() + '.'
+        if len(next_steps) > 1:
+            step_text = ('Next steps include ' +
+                         ', '.join(s.rstrip('.').lower() for s in next_steps[:3]) + '.')
+        parts.append(step_text)
+
+    if not parts:
+        return 'Status file exists but no detailed description available yet.'
+
+    return ' '.join(parts)
 
 
 def parse_project_status(file_path):
@@ -209,6 +239,10 @@ def parse_project_status(file_path):
         project.setdefault('repo', '')
         project.setdefault('has_repo', 'No')
 
+        # Normalize category for grouping
+        raw_cat = project['category'].lower().strip()
+        project['category_group'] = CATEGORY_MAP.get(raw_cat, project['category'])
+
         # Determine if has repo
         has_repo = project.get('has_repo', 'No').lower()
         project['has_github_repo'] = has_repo == 'yes' or (
@@ -217,16 +251,20 @@ def parse_project_status(file_path):
             and 'none' not in project['repo'].lower()
         )
 
-        # Extract features from "What's Working" section (most specific)
-        features = extract_list_items(content, r"### What's Working", 5)
+        # Extract project summary/description
+        summary = extract_section_text(content, r'## Project Summary')
+        if not summary:
+            summary = extract_section_text(content, r'## Description')
+        if not summary:
+            summary = extract_section_text(content, r'## Notes')
+        project['summary'] = summary
 
-        # Also try "What Exists" (used by some status files)
+        # Extract features from "What's Working" section
+        features = extract_list_items(content, r"### What's Working", 10)
         if len(features) < 3:
-            features.extend(extract_list_items(content, r"### What Exists", 5))
-
-        # If not enough, try "What was built" entries
+            features.extend(extract_list_items(content, r"### What Exists", 10))
         if len(features) < 3:
-            features.extend(extract_list_items(content, r'\*\*What was built:\*\*', 3))
+            features.extend(extract_list_items(content, r'\*\*What was built:\*\*', 5))
 
         # Dedupe while preserving order
         seen = set()
@@ -235,14 +273,25 @@ def parse_project_status(file_path):
             if f.lower() not in seen:
                 seen.add(f.lower())
                 unique_features.append(f)
-        project['features'] = unique_features[:5]
+        project['features'] = unique_features
 
-        # Get recent commits only if this project has its own git repo
-        project_git_dir = os.path.join(project['project_path'], '.git')
-        if project['has_github_repo'] and os.path.isdir(project_git_dir):
-            project['recent_commits'] = get_recent_commits(project['project_path'], 5)
-        else:
-            project['recent_commits'] = []
+        # Extract blockers
+        blockers = extract_list_items(content, r'### Blockers', 5)
+        # Filter out "none" type blockers
+        blockers = [b for b in blockers if 'none' not in b.lower()[:10]]
+        project['blockers'] = blockers
+
+        # Extract not working
+        not_working = extract_list_items(content, r"### What's Not Working", 5)
+        if not not_working:
+            not_working = extract_list_items(content, r"### What Doesn't Exist Yet", 5)
+        project['not_working'] = not_working
+
+        # Extract next steps
+        project['next_steps'] = extract_next_steps(content)
+
+        # Build narrative
+        project['narrative'] = build_project_narrative(project)
 
         return project
 
@@ -260,426 +309,228 @@ def load_projects(scan_paths=None, verbose=False):
         for sf in status_files:
             print(f"  - {sf}")
 
-    with_repos = []
-    without_repos = []
+    all_projects = []
 
     for sf in status_files:
         project = parse_project_status(sf)
         if project:
             if verbose:
-                features = project.get('features', [])
-                commits = project.get('recent_commits', [])
                 print(f"\n{project['name']}:")
-                print(f"  Features: {len(features)}")
-                for f in features[:2]:
-                    print(f"    - {f[:50]}...")
-                print(f"  Commits: {len(commits)}")
-                for c in commits[:2]:
-                    print(f"    - {c[:50]}...")
+                print(f"  Category: {project['category_group']}")
+                print(f"  Summary: {project.get('summary', '')[:60]}...")
+                print(f"  Narrative: {project.get('narrative', '')[:60]}...")
+            all_projects.append(project)
 
-            if project['has_github_repo']:
-                with_repos.append(project)
-            else:
-                without_repos.append(project)
-
-    # Sort by progress descending
-    with_repos.sort(key=lambda x: x['progress'], reverse=True)
-    without_repos.sort(key=lambda x: x['progress'], reverse=True)
-
-    return {'with_repos': with_repos, 'without_repos': without_repos}
-
-
-# =============================================================================
-# CHART GENERATION
-# =============================================================================
-
-def get_progress_color(progress):
-    """Return color based on progress percentage."""
-    if progress > 75:
-        return '#2ECC71'  # Green
-    elif progress >= 50:
-        return '#3498DB'  # Blue
-    elif progress >= 25:
-        return '#F1C40F'  # Yellow
-    else:
-        return '#E74C3C'  # Red
-
-
-def create_progress_chart(projects):
-    """Create horizontal bar chart showing all project progress."""
-    all_projects = projects['with_repos'] + projects['without_repos']
-
-    if not all_projects:
-        # Return empty chart if no projects
-        fig, ax = plt.subplots(figsize=(6, 2))
-        ax.text(0.5, 0.5, 'No projects found.\nRun init_project_status.py to add projects.',
-                ha='center', va='center', fontsize=10)
-        ax.axis('off')
-        buf = BytesIO()
-        plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
-        plt.close()
-        buf.seek(0)
-        return buf
-
+    # Sort by progress descending within each group
     all_projects.sort(key=lambda x: x['progress'], reverse=True)
 
-    names = [p['name'] for p in all_projects]
-    progress = [p['progress'] for p in all_projects]
-    colors_list = [get_progress_color(p) for p in progress]
-
-    # Adjust figure height based on number of projects
-    fig_height = max(3, min(8, len(names) * 0.4))
-    fig, ax = plt.subplots(figsize=(6, fig_height))
-
-    y_pos = np.arange(len(names))
-    bars = ax.barh(y_pos, progress, color=colors_list, height=0.7)
-
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(names, fontsize=8)
-    ax.invert_yaxis()
-    ax.set_xlim(0, 100)
-    ax.set_xlabel('Progress %', fontsize=9)
-    ax.set_title('Project Progress Overview', fontsize=11, fontweight='bold')
-
-    for bar, pct in zip(bars, progress):
-        ax.text(bar.get_width() + 2, bar.get_y() + bar.get_height()/2,
-                f'{pct}%', va='center', fontsize=7)
-
-    plt.tight_layout()
-    buf = BytesIO()
-    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
-    plt.close()
-    buf.seek(0)
-    return buf
-
-
-def create_repo_pie_chart(projects):
-    """Create pie chart showing GitHub repo status."""
-    has_repo = len(projects['with_repos'])
-    no_repo = len(projects['without_repos'])
-
-    if has_repo == 0 and no_repo == 0:
-        fig, ax = plt.subplots(figsize=(3.5, 3))
-        ax.text(0.5, 0.5, 'No projects', ha='center', va='center')
-        ax.axis('off')
-        buf = BytesIO()
-        plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
-        plt.close()
-        buf.seek(0)
-        return buf
-
-    fig, ax = plt.subplots(figsize=(3.5, 3))
-    sizes = [has_repo, no_repo]
-    labels = [f'Has Repo ({has_repo})', f'No Repo ({no_repo})']
-    colors_list = ['#2ECC71', '#E74C3C']
-
-    # Handle case where one is zero
-    if has_repo == 0:
-        sizes = [no_repo]
-        labels = [f'No Repo ({no_repo})']
-        colors_list = ['#E74C3C']
-    elif no_repo == 0:
-        sizes = [has_repo]
-        labels = [f'Has Repo ({has_repo})']
-        colors_list = ['#2ECC71']
-
-    ax.pie(sizes, labels=labels, colors=colors_list,
-           autopct='%1.0f%%', shadow=False, startangle=90,
-           textprops={'fontsize': 8})
-    ax.set_title('GitHub Repo Status', fontsize=10, fontweight='bold')
-
-    plt.tight_layout()
-    buf = BytesIO()
-    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
-    plt.close()
-    buf.seek(0)
-    return buf
-
-
-def create_category_chart(projects):
-    """Create bar chart showing projects by category."""
-    all_projects = projects['with_repos'] + projects['without_repos']
-
-    if not all_projects:
-        fig, ax = plt.subplots(figsize=(3.5, 2.5))
-        ax.text(0.5, 0.5, 'No projects', ha='center', va='center')
-        ax.axis('off')
-        buf = BytesIO()
-        plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
-        plt.close()
-        buf.seek(0)
-        return buf
-
-    categories = {}
-    for p in all_projects:
-        cat = p.get('category', 'Personal')
-        categories[cat] = categories.get(cat, 0) + 1
-
-    sorted_cats = sorted(categories.items(), key=lambda x: x[1], reverse=True)
-    names = [c[0] for c in sorted_cats]
-    counts = [c[1] for c in sorted_cats]
-
-    cat_colors = {
-        'Infrastructure': '#3498DB',
-        'School': '#2ECC71',
-        'Church': '#9B59B6',
-        'Product': '#E67E22',
-        'Research': '#1ABC9C',
-        'Personal': '#95A5A6'
-    }
-    colors_list = [cat_colors.get(n, '#7F8C8D') for n in names]
-
-    fig, ax = plt.subplots(figsize=(3.5, 2.5))
-    x_pos = np.arange(len(names))
-    bars = ax.bar(x_pos, counts, color=colors_list, width=0.6)
-
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels(names, fontsize=7, rotation=45, ha='right')
-    ax.set_ylabel('Count', fontsize=8)
-    ax.set_title('Projects by Category', fontsize=10, fontweight='bold')
-    ax.set_ylim(0, max(counts) + 1)
-
-    for bar, count in zip(bars, counts):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
-                str(count), ha='center', va='bottom', fontsize=8)
-
-    plt.tight_layout()
-    buf = BytesIO()
-    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
-    plt.close()
-    buf.seek(0)
-    return buf
+    return all_projects
 
 
 # =============================================================================
-# PDF GENERATION
+# PDF GENERATION - Narrative Portfolio Format
 # =============================================================================
 
-def create_pdf(output_path, projects):
-    """Generate the complete PDF dashboard."""
+def create_pdf(output_path, all_projects):
+    """Generate the narrative portfolio PDF."""
     doc = SimpleDocTemplate(
         output_path,
         pagesize=letter,
-        rightMargin=0.5*inch,
-        leftMargin=0.5*inch,
+        rightMargin=0.65*inch,
+        leftMargin=0.65*inch,
         topMargin=0.5*inch,
         bottomMargin=0.5*inch
     )
 
     styles = getSampleStyleSheet()
 
+    # Title: "Chris Treadaway — Project Portfolio Status"
     title_style = ParagraphStyle(
-        'CustomTitle', parent=styles['Heading1'],
-        fontSize=20, textColor=colors.HexColor('#2C3E50'), spaceAfter=6
+        'PortfolioTitle', parent=styles['Heading1'],
+        fontSize=18, textColor=colors.HexColor('#1a1a1a'),
+        spaceAfter=2, fontName='Helvetica-Bold',
+        alignment=TA_CENTER
     )
+
+    # Subtitle: date and project count
     subtitle_style = ParagraphStyle(
-        'Subtitle', parent=styles['Normal'],
-        fontSize=10, textColor=colors.HexColor('#7F8C8D'), alignment=TA_RIGHT
+        'PortfolioSubtitle', parent=styles['Normal'],
+        fontSize=10, textColor=colors.HexColor('#555555'),
+        alignment=TA_CENTER, spaceAfter=16
     )
-    section_style = ParagraphStyle(
-        'Section', parent=styles['Heading2'],
+
+    # Category headers: "Church Projects", "School Projects", etc.
+    category_style = ParagraphStyle(
+        'CategoryHeader', parent=styles['Heading2'],
         fontSize=14, textColor=colors.HexColor('#2C3E50'),
-        spaceBefore=12, spaceAfter=6
+        spaceBefore=16, spaceAfter=8,
+        fontName='Helvetica-Bold',
+        borderWidth=0, borderPadding=0,
     )
-    subsection_style = ParagraphStyle(
-        'Subsection', parent=styles['Heading3'],
-        fontSize=11, textColor=colors.HexColor('#34495E'),
-        spaceBefore=8, spaceAfter=4
+
+    # Project name + progress: "Ministry Fair App — 60% | Needs Testing"
+    project_header_style = ParagraphStyle(
+        'ProjectHeader', parent=styles['Heading3'],
+        fontSize=10, textColor=colors.HexColor('#1a1a1a'),
+        spaceBefore=10, spaceAfter=3,
+        fontName='Helvetica-Bold',
     )
+
+    # Project narrative paragraph
+    narrative_style = ParagraphStyle(
+        'Narrative', parent=styles['Normal'],
+        fontSize=9, textColor=colors.HexColor('#333333'),
+        leading=13, spaceAfter=6,
+        fontName='Helvetica',
+    )
+
+    # Separator line style
+    separator_style = ParagraphStyle(
+        'Separator', parent=styles['Normal'],
+        fontSize=2, spaceAfter=4, spaceBefore=4,
+    )
+
+    # Footer
     footer_style = ParagraphStyle(
         'Footer', parent=styles['Normal'],
-        fontSize=9, textColor=colors.HexColor('#95A5A6'), alignment=TA_CENTER
+        fontSize=8, textColor=colors.HexColor('#999999'),
+        alignment=TA_CENTER, spaceBefore=20
     )
 
     elements = []
 
-    # Header
+    # === HEADER ===
     now = datetime.now()
-    date_str = now.strftime('%B %d, %Y at %I:%M %p')
-    total_projects = len(projects['with_repos']) + len(projects['without_repos'])
+    date_str = now.strftime('%B %d, %Y')
+    total_projects = len(all_projects)
 
-    header_data = [
-        [Paragraph('<b>Project Status Report</b>', title_style),
-         Paragraph(f'Generated: {date_str}<br/>{total_projects} projects found', subtitle_style)]
-    ]
-    header_table = Table(header_data, colWidths=[4*inch, 3*inch])
-    header_table.setStyle(TableStyle([
-        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
-    ]))
-    elements.append(header_table)
-    elements.append(Spacer(1, 0.2*inch))
+    # Build category summary for subtitle
+    cat_counts = {}
+    for p in all_projects:
+        cat = p.get('category_group', 'Personal')
+        cat_counts[cat] = cat_counts.get(cat, 0) + 1
 
-    elements.append(Paragraph('Dashboard', section_style))
-    elements.append(Spacer(1, 0.1*inch))
+    cat_parts = []
+    for cat in CATEGORY_ORDER:
+        if cat in cat_counts:
+            cat_parts.append(cat)
+    cat_summary = ', '.join(cat_parts[:-1])
+    if len(cat_parts) > 1:
+        cat_summary += ' &amp; ' + cat_parts[-1]
+    elif cat_parts:
+        cat_summary = cat_parts[0]
 
-    # Charts
-    progress_chart = create_progress_chart(projects)
-    pie_chart = create_repo_pie_chart(projects)
-    category_chart = create_category_chart(projects)
+    elements.append(Paragraph(
+        'Chris Treadaway — Project Portfolio Status',
+        title_style
+    ))
+    elements.append(Paragraph(
+        f'{date_str} | {total_projects} Projects Across {cat_summary}',
+        subtitle_style
+    ))
 
-    # Adjust chart height based on project count
-    chart_height = max(3, min(5, total_projects * 0.35)) * inch
-    progress_img = Image(progress_chart, width=4*inch, height=chart_height)
-    pie_img = Image(pie_chart, width=2.8*inch, height=2.2*inch)
-    category_img = Image(category_chart, width=2.8*inch, height=1.8*inch)
+    # === GROUP PROJECTS BY CATEGORY ===
+    grouped = {}
+    for p in all_projects:
+        cat = p.get('category_group', 'Personal')
+        if cat not in grouped:
+            grouped[cat] = []
+        grouped[cat].append(p)
 
-    right_charts = Table([[pie_img], [category_img]], colWidths=[3*inch])
-    right_charts.setStyle(TableStyle([
-        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-    ]))
+    # Sort within each category by progress descending
+    for cat in grouped:
+        grouped[cat].sort(key=lambda x: x['progress'], reverse=True)
 
-    chart_table = Table([[progress_img, right_charts]], colWidths=[4.2*inch, 3.3*inch])
-    chart_table.setStyle(TableStyle([('VALIGN', (0, 0), (-1, -1), 'TOP')]))
-    elements.append(chart_table)
-    elements.append(Spacer(1, 0.2*inch))
+    # Render categories in order
+    for cat in CATEGORY_ORDER:
+        if cat not in grouped:
+            continue
 
-    # Table styles
-    table_header_style = TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2C3E50')),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, 0), 9),
-        ('FONTSIZE', (0, 1), (-1, -1), 8),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
-        ('TOPPADDING', (0, 0), (-1, 0), 8),
-        ('BOTTOMPADDING', (0, 1), (-1, -1), 4),
-        ('TOPPADDING', (0, 1), (-1, -1), 4),
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#BDC3C7')),
-        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F8F9FA')]),
-    ])
+        projects = grouped[cat]
 
-    # Projects WITH repos
-    if projects['with_repos']:
-        elements.append(Paragraph('Projects with GitHub Repositories', subsection_style))
-        with_repos_data = [['Project', 'Repository', 'Status', 'Progress']]
-        for p in projects['with_repos']:
-            with_repos_data.append([
-                p['name'],
-                p.get('repo', ''),
-                p.get('status', ''),
-                f"{p.get('progress', 0)}%"
-            ])
+        # Category header with suffix "Projects" (except Personal)
+        if cat in ('Infrastructure', 'Personal'):
+            cat_label = 'Infrastructure &amp; Personal Projects'
+            # Merge personal into infrastructure section
+            if cat == 'Personal':
+                continue  # handled when we hit Infrastructure
+            if 'Personal' in grouped:
+                projects = projects + grouped['Personal']
+        else:
+            cat_label = f'{cat} Projects'
 
-        with_repos_table = Table(with_repos_data, colWidths=[1.5*inch, 2.5*inch, 1.3*inch, 0.8*inch])
-        with_repos_table.setStyle(table_header_style)
-        elements.append(with_repos_table)
-        elements.append(Spacer(1, 0.15*inch))
+        elements.append(Paragraph(cat_label, category_style))
 
-    # Projects WITHOUT repos
-    if projects['without_repos']:
-        elements.append(Paragraph('Projects WITHOUT GitHub Repositories', subsection_style))
-        without_repos_data = [['Project', 'Status', 'Progress', 'Category']]
-        for p in projects['without_repos']:
-            without_repos_data.append([
-                p['name'],
-                p.get('status', ''),
-                f"{p.get('progress', 0)}%",
-                p.get('category', 'Personal')
-            ])
+        # Render each project
+        for p in projects:
+            progress = p.get('progress', 0)
+            status = p.get('status', '')
+            name = p.get('name', 'Unknown')
 
-        without_repos_table = Table(without_repos_data, colWidths=[1.8*inch, 1.5*inch, 0.8*inch, 2*inch])
-        without_repos_table.setStyle(table_header_style)
-        elements.append(without_repos_table)
+            # Format progress display
+            if progress > 0:
+                progress_str = f"{progress}%"
+            else:
+                progress_str = ''
 
-    # Footer for page 1
+            # Build header: "Project Name — 60% | Status"
+            header_parts = [name]
+            detail_parts = []
+            if progress_str:
+                detail_parts.append(progress_str)
+            if status:
+                detail_parts.append(status)
+
+            if detail_parts:
+                header_text = f"{name} — {' | '.join(detail_parts)}"
+            else:
+                header_text = name
+
+            narrative = p.get('narrative', 'No description available.')
+
+            # KeepTogether prevents orphaned headers
+            project_block = [
+                Paragraph(header_text, project_header_style),
+                Paragraph(narrative, narrative_style),
+            ]
+            elements.append(KeepTogether(project_block))
+
+    # Handle categories not in CATEGORY_ORDER
+    for cat in grouped:
+        if cat not in CATEGORY_ORDER and cat != 'Personal':
+            elements.append(Paragraph(f'{cat} Projects', category_style))
+            for p in grouped[cat]:
+                progress = p.get('progress', 0)
+                status = p.get('status', '')
+                name = p.get('name', 'Unknown')
+                detail_parts = []
+                if progress > 0:
+                    detail_parts.append(f"{progress}%")
+                if status:
+                    detail_parts.append(status)
+                if detail_parts:
+                    header_text = f"{name} — {' | '.join(detail_parts)}"
+                else:
+                    header_text = name
+                narrative = p.get('narrative', 'No description available.')
+                project_block = [
+                    Paragraph(header_text, project_header_style),
+                    Paragraph(narrative, narrative_style),
+                ]
+                elements.append(KeepTogether(project_block))
+
+    # Footer
     elements.append(Spacer(1, 0.3*inch))
-    elements.append(Paragraph('If this tool saves you time: Venmo @ctreada', footer_style))
-
-    # ==========================================================================
-    # PAGE 2+: Features Built (2-column layout)
-    # ==========================================================================
-    elements.append(PageBreak())
-
-    # Page 2 Header
-    elements.append(Paragraph('<b>Project Details: Recent Work</b>', title_style))
-    elements.append(Spacer(1, 0.15*inch))
-
-    # Styles for page 2
-    project_name_style = ParagraphStyle(
-        'ProjectName', parent=styles['Heading3'],
-        fontSize=9, textColor=colors.HexColor('#2C3E50'),
-        spaceBefore=4, spaceAfter=2
-    )
-    commit_style = ParagraphStyle(
-        'Commit', parent=styles['Normal'],
-        fontSize=6, textColor=colors.HexColor('#555555'),
-        leftIndent=5, spaceBefore=1, spaceAfter=1
-    )
-    no_data_style = ParagraphStyle(
-        'NoData', parent=styles['Normal'],
-        fontSize=6, textColor=colors.HexColor('#999999'),
-        leftIndent=5, fontName='Helvetica-Oblique'
-    )
-
-    all_projects = projects['with_repos'] + projects['without_repos']
-    all_projects.sort(key=lambda x: x['name'])
-
-    def build_project_cell(p):
-        """Build content for a single project cell."""
-        cell_content = []
-        progress = p.get('progress', 0)
-        progress_color = '#2ECC71' if progress > 75 else '#3498DB' if progress >= 50 else '#F1C40F' if progress >= 25 else '#E74C3C'
-        cell_content.append(Paragraph(
-            f"<b>{p['name']}</b> <font color='{progress_color}'>({progress}%)</font>",
-            project_name_style
-        ))
-
-        commits = p.get('recent_commits', [])
-        features = p.get('features', [])
-        if commits:
-            for commit in commits[:5]:
-                display_commit = commit[:55] + '...' if len(commit) > 55 else commit
-                cell_content.append(Paragraph(f"› {display_commit}", commit_style))
-        elif features:
-            for feat in features[:5]:
-                display_feat = feat[:55] + '...' if len(feat) > 55 else feat
-                cell_content.append(Paragraph(f"› {display_feat}", commit_style))
-        else:
-            cell_content.append(Paragraph('No recent work logged', no_data_style))
-
-        return cell_content
-
-    # Build 2-column table
-    col_width = 3.7 * inch
-    row_data = []
-
-    for i in range(0, len(all_projects), 2):
-        left_cell = build_project_cell(all_projects[i])
-        if i + 1 < len(all_projects):
-            right_cell = build_project_cell(all_projects[i + 1])
-        else:
-            right_cell = []
-
-        row_data.append([left_cell, right_cell])
-
-    # Create table with project pairs
-    for row in row_data:
-        row_table = Table([[row[0], row[1]]], colWidths=[col_width, col_width])
-        row_table.setStyle(TableStyle([
-            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-            ('LEFTPADDING', (0, 0), (-1, -1), 4),
-            ('RIGHTPADDING', (0, 0), (-1, -1), 4),
-            ('TOPPADDING', (0, 0), (-1, -1), 4),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-        ]))
-        elements.append(row_table)
-
-    # Footer for page 2
-    elements.append(Spacer(1, 0.2*inch))
     elements.append(Paragraph('If this tool saves you time: Venmo @ctreada', footer_style))
 
     doc.build(elements)
     print(f"PDF generated: {output_path}")
-    print(f"  Projects with repos: {len(projects['with_repos'])}")
-    print(f"  Projects without repos: {len(projects['without_repos'])}")
+    print(f"  {total_projects} projects across {len(grouped)} categories")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Generate PDF dashboard from PROJECT_STATUS.md files'
+        description='Generate project portfolio PDF from PROJECT_STATUS.md files'
     )
     parser.add_argument('--output', '-o', default=None,
                         help='Output path for the PDF')
@@ -691,16 +542,15 @@ def main():
 
     # Load projects dynamically
     print("Scanning for PROJECT_STATUS.md files...")
-    projects = load_projects(args.scan_paths, verbose=args.verbose)
+    all_projects = load_projects(args.scan_paths, verbose=args.verbose)
 
-    total = len(projects['with_repos']) + len(projects['without_repos'])
-    if total == 0:
+    if not all_projects:
         print("\nNo PROJECT_STATUS.md files found!")
         print("Run init_project_status.py to create status files for your projects:")
         print("  python3 init_project_status.py ~/myproject --name 'My Project' --category School")
         return
 
-    print(f"Found {total} projects")
+    print(f"Found {len(all_projects)} projects")
 
     # Generate PDF
     if args.output is None:
@@ -711,7 +561,7 @@ def main():
     else:
         output_path = os.path.expanduser(args.output)
 
-    create_pdf(output_path, projects)
+    create_pdf(output_path, all_projects)
 
 
 if __name__ == '__main__':
