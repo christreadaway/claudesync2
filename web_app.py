@@ -22,11 +22,13 @@ Usage:
 import json
 import os
 import tempfile
+import threading
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta
 
 from flask import (Flask, request, send_file, render_template_string,
-                   flash, redirect, url_for, jsonify)
+                   flash, redirect, url_for, jsonify, Response)
 
 from generate_status_pdf import load_projects, create_pdf
 
@@ -47,6 +49,82 @@ _project_cache = {
     'scan_paths': '~',
     'chat_history_path': None,
 }
+
+# Background task state — shared between threads
+_bg_task = {
+    'running': False,
+    'step': '',       # Current step name
+    'detail': '',     # Human-readable detail message
+    'error': None,
+    'result_msg': None,
+    'lock': threading.Lock(),
+}
+
+
+def _bg_progress(step, detail=''):
+    """Update the shared progress state (called from background thread)."""
+    with _bg_task['lock']:
+        _bg_task['step'] = step
+        _bg_task['detail'] = detail
+
+
+def _bg_run_load(scan_paths_str, chat_history_path, ai_analyze):
+    """Background worker: load projects, optionally enrich with AI."""
+    try:
+        with _bg_task['lock']:
+            _bg_task['running'] = True
+            _bg_task['error'] = None
+            _bg_task['result_msg'] = None
+
+        # Load projects with progress callback
+        if scan_paths_str:
+            scan_paths = [os.path.expanduser(p.strip()) for p in scan_paths_str.split()]
+        else:
+            scan_paths_str = _project_cache.get('scan_paths', '~')
+            scan_paths = [os.path.expanduser(p.strip()) for p in scan_paths_str.split()]
+
+        chp = chat_history_path or _project_cache.get('chat_history_path')
+
+        projects = load_projects(
+            scan_paths=scan_paths,
+            chat_history_path=chp,
+            verbose=False,
+            progress_callback=_bg_progress,
+        )
+
+        _project_cache['projects'] = projects
+        _project_cache['scan_paths'] = scan_paths_str
+        _project_cache['chat_history_path'] = chp
+
+        # Chat stats
+        chat_stats = getattr(load_projects, '_last_chat_stats', {})
+        total = len(projects)
+        msg = f'Loaded {total} projects'
+        if chat_stats.get('total_files'):
+            msg += f' — {chat_stats["total_files"]} chat files processed'
+            msg += f', {chat_stats["total_conversations"]} conversations matched'
+            if chat_stats.get('unmatched_files'):
+                msg += f', {chat_stats["unmatched_files"]} unmatched'
+
+        # AI enrichment
+        enriched = 0
+        if ai_analyze:
+            _bg_progress('ai_enrichment', 'Enriching projects with AI...')
+            enriched = _ai_enrich_all_projects()
+            if enriched:
+                msg += f'. AI enriched {enriched} projects.'
+
+        with _bg_task['lock']:
+            _bg_task['result_msg'] = msg
+
+    except Exception as e:
+        with _bg_task['lock']:
+            _bg_task['error'] = str(e)
+    finally:
+        with _bg_task['lock']:
+            _bg_task['running'] = False
+            _bg_task['step'] = 'done'
+            _bg_task['detail'] = ''
 
 
 # =============================================================================
@@ -501,12 +579,20 @@ DASHBOARD_HTML = """
         .modal .btn { padding: 10px 22px; font-size: 13px; }
         .btn-cancel { background: var(--stat-bg); color: var(--text-secondary); }
         .btn-cancel:hover { background: var(--progress-bg); }
-        /* Loading overlay */
-        .loading-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--modal-bg); z-index: 200; justify-content: center; align-items: center; flex-direction: column; gap: 16px; }
-        .loading-overlay.show { display: flex; }
-        .spinner { width: 36px; height: 36px; border: 3px solid var(--border); border-top-color: #3498DB; border-radius: 50%; animation: spin 0.8s linear infinite; }
+        /* Non-blocking progress banner */
+        .progress-banner { display: none; background: var(--bar-bg); border-bottom: 1px solid rgba(52,152,219,0.3); padding: 8px 24px 4px; }
+        .progress-banner.show { display: block; }
+        .progress-banner-inner { display: flex; align-items: center; gap: 10px; }
+        .progress-spinner { width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.2); border-top-color: #3498DB; border-radius: 50%; animation: spin 0.8s linear infinite; flex-shrink: 0; }
         @keyframes spin { to { transform: rotate(360deg); } }
-        .loading-text { font-size: 14px; color: var(--bar-text); font-weight: 500; }
+        .progress-step { font-size: 12px; font-weight: 600; color: #3498DB; text-transform: uppercase; letter-spacing: 0.5px; }
+        .progress-detail { font-size: 12px; color: var(--bar-text); opacity: 0.8; }
+        .progress-track { height: 2px; background: rgba(255,255,255,0.1); margin-top: 6px; border-radius: 1px; overflow: hidden; }
+        .progress-track-fill { height: 100%; background: #3498DB; border-radius: 1px; transition: width 0.3s; width: 0%; }
+        .progress-banner.done .progress-spinner { animation: none; border-color: #2ECC71; border-top-color: #2ECC71; }
+        .progress-banner.done .progress-step { color: #2ECC71; }
+        .progress-banner.error .progress-spinner { animation: none; border-color: #E74C3C; border-top-color: #E74C3C; }
+        .progress-banner.error .progress-step { color: #E74C3C; }
         .modal select { width: 100%; padding: 9px 12px; border: 1px solid var(--input-border); border-radius: 5px; font-size: 13px; background: var(--input-bg); color: var(--text); }
     </style>
     <script>
@@ -558,6 +644,12 @@ DASHBOARD_HTML = """
                 <div class="number">{{ total_blockers }}</div>
                 <div class="label">Blockers</div>
             </a>
+            {% if unmatched_count > 0 %}
+            <a href="/view/unmatched" class="stat-card" style="border-color:#e67e22;">
+                <div class="number" style="color:#e67e22;">{{ unmatched_count }}</div>
+                <div class="label">Unmatched Chats</div>
+            </a>
+            {% endif %}
         </div>
 
         <!-- Activity Chart -->
@@ -644,10 +736,14 @@ DASHBOARD_HTML = """
         </footer>
     </div>
 
-    <!-- Loading Overlay -->
-    <div class="loading-overlay" id="loadingOverlay">
-        <div class="spinner"></div>
-        <div class="loading-text" id="loadingText">Loading projects...</div>
+    <!-- Progress Bar (non-blocking, in top nav) -->
+    <div class="progress-banner" id="progressBanner">
+        <div class="progress-banner-inner">
+            <div class="progress-spinner"></div>
+            <span class="progress-step" id="progressStep"></span>
+            <span class="progress-detail" id="progressDetail"></span>
+        </div>
+        <div class="progress-track"><div class="progress-track-fill" id="progressFill"></div></div>
     </div>
 
     <!-- Upload Modal -->
@@ -825,22 +921,79 @@ DASHBOARD_HTML = """
                 .then(() => location.reload());
         }
 
-        // ---- Loading overlay ----
-        function showLoading(text) {
-            document.getElementById('loadingText').textContent = text || 'Loading...';
-            document.getElementById('loadingOverlay').classList.add('show');
+        // ---- Non-blocking progress banner ----
+        var _progressPoll = null;
+        var STEP_LABELS = {
+            'scanning': 'Scanning',
+            'parsing': 'Parsing',
+            'reading_chat': 'Reading Chat',
+            'matching_chat': 'Matching Chat',
+            'ai_enrichment': 'AI Enrichment',
+            'ai_classify': 'AI Classifying',
+            'building': 'Building',
+            'generating_pdf': 'Generating PDF',
+            'done': 'Done',
+        };
+        var STEP_PROGRESS = {
+            'scanning': 10, 'parsing': 25, 'reading_chat': 40,
+            'matching_chat': 60, 'ai_enrichment': 75, 'ai_classify': 80,
+            'building': 90, 'generating_pdf': 50, 'done': 100,
+        };
+
+        function startProgressPolling() {
+            var banner = document.getElementById('progressBanner');
+            banner.className = 'progress-banner show';
+            _progressPoll = setInterval(function() {
+                fetch('/api/progress').then(function(r) { return r.json(); }).then(function(data) {
+                    var stepEl = document.getElementById('progressStep');
+                    var detailEl = document.getElementById('progressDetail');
+                    var fillEl = document.getElementById('progressFill');
+                    stepEl.textContent = STEP_LABELS[data.step] || data.step || 'Starting...';
+                    detailEl.textContent = data.detail || '';
+                    fillEl.style.width = (STEP_PROGRESS[data.step] || 5) + '%';
+
+                    if (!data.running) {
+                        clearInterval(_progressPoll);
+                        _progressPoll = null;
+                        if (data.error) {
+                            banner.className = 'progress-banner show error';
+                            stepEl.textContent = 'Error';
+                            detailEl.textContent = data.error;
+                        } else {
+                            banner.className = 'progress-banner show done';
+                            stepEl.textContent = 'Complete';
+                            detailEl.textContent = data.result_msg || 'Done';
+                            fillEl.style.width = '100%';
+                            // Auto-reload after a brief pause so user sees the result
+                            setTimeout(function() { location.reload(); }, 1500);
+                        }
+                    }
+                });
+            }, 500);
         }
 
-        // Intercept upload form submit
+        // Intercept upload form — submit via AJAX, don't block UI
         document.querySelector('#uploadModal form').addEventListener('submit', function(e) {
-            showLoading('Loading projects... this may take a moment');
+            e.preventDefault();
+            var form = e.target;
+            var formData = new FormData(form);
             document.getElementById('uploadModal').classList.remove('show');
             document.getElementById('uploadBtn').disabled = true;
+            startProgressPolling();
+            fetch('/upload', { method: 'POST', body: formData })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                // Progress polling handles the reload
+                document.getElementById('uploadBtn').disabled = false;
+            })
+            .catch(function() {
+                document.getElementById('uploadBtn').disabled = false;
+            });
         });
 
-        // Intercept Generate PDF link
-        document.querySelector('a[href="/generate-pdf"]').addEventListener('click', function(e) {
-            showLoading('Generating PDF...');
+        // Check on page load if a background task is already running
+        fetch('/api/progress').then(function(r) { return r.json(); }).then(function(data) {
+            if (data.running) { startProgressPolling(); }
         });
 
         // ---- Drag and drop ----
@@ -1186,12 +1339,17 @@ def dashboard():
     ai_config = _load_ai_config()
     import_meta = _load_import_meta()
 
+    # Count unmatched chats
+    chat_stats = getattr(load_projects, '_last_chat_stats', {})
+    unmatched_count = len(chat_stats.get('unmatched_chats', []))
+
     return render_template_string(
         DASHBOARD_HTML,
         total_projects=len(visible),
         total_events=total_events,
         total_threads=total_threads,
         total_blockers=total_blockers,
+        unmatched_count=unmatched_count,
         chart_data=chart_data,
         project_cards=project_cards,
         ignored_names=ignored_names,
@@ -1199,6 +1357,19 @@ def dashboard():
         ai_config=ai_config,
         import_meta=import_meta,
     )
+
+
+@app.route('/api/progress')
+def api_progress():
+    """Return current background task progress."""
+    with _bg_task['lock']:
+        return jsonify({
+            'running': _bg_task['running'],
+            'step': _bg_task['step'],
+            'detail': _bg_task['detail'],
+            'error': _bg_task['error'],
+            'result_msg': _bg_task['result_msg'],
+        })
 
 
 @app.route('/api/chart-data')
@@ -1349,6 +1520,12 @@ def api_ai_config():
 
 @app.route('/upload', methods=['POST'])
 def upload():
+    """Accept upload, kick off background processing, return immediately."""
+    # Check if already running
+    with _bg_task['lock']:
+        if _bg_task['running']:
+            return jsonify({'error': 'A task is already running'}), 409
+
     chat_history_path = None
     chat_file = request.files.get('chat_history')
     if chat_file and chat_file.filename:
@@ -1357,7 +1534,6 @@ def upload():
         chat_history_path = save_path
         print(f"Chat history uploaded: {save_path}")
 
-        # Save import metadata
         meta = _load_import_meta()
         meta['last_import'] = datetime.now().strftime('%Y-%m-%d %H:%M')
         meta['last_file'] = chat_file.filename
@@ -1366,20 +1542,15 @@ def upload():
     scan_paths_str = request.form.get('scan_paths', '~').strip() or '~'
     ai_analyze = request.form.get('ai_analyze') == '1'
 
-    _load_cached_projects(scan_paths_str, chat_history_path)
+    # Launch background thread
+    t = threading.Thread(
+        target=_bg_run_load,
+        args=(scan_paths_str, chat_history_path, ai_analyze),
+        daemon=True,
+    )
+    t.start()
 
-    enriched = 0
-    if ai_analyze:
-        enriched = _ai_enrich_all_projects()
-
-    total = len(_project_cache['projects'])
-    msg = f'Loaded {total} projects.'
-    if chat_history_path:
-        msg += ' Chat history integrated.'
-    if enriched > 0:
-        msg += f' AI enriched {enriched} project descriptions.'
-    flash(msg, 'success')
-    return redirect(url_for('dashboard'))
+    return jsonify({'ok': True, 'message': 'Processing started'})
 
 
 @app.route('/generate-pdf')
@@ -2036,6 +2207,289 @@ Projects:
             continue
 
     return jsonify({'results': results})
+
+
+INITIATIVE_FILE = os.path.expanduser('~/.claudesync_initiatives.json')
+
+
+def _load_initiatives():
+    if os.path.exists(INITIATIVE_FILE):
+        try:
+            with open(INITIATIVE_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_initiatives(data):
+    with open(INITIATIVE_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
+@app.route('/api/classify-unmatched', methods=['POST'])
+def api_classify_unmatched():
+    """Use AI to classify unmatched chat conversations into initiatives."""
+    chat_stats = getattr(load_projects, '_last_chat_stats', {})
+    unmatched = chat_stats.get('unmatched_chats', [])
+
+    if not unmatched:
+        return jsonify({'error': 'No unmatched conversations found. Upload chat history first.'})
+
+    projects = _project_cache.get('projects', [])
+    project_names = [p.get('name', '') for p in projects if p.get('name')]
+
+    # Process in batches of 15 for token efficiency
+    all_results = []
+    batch_size = 15
+    for batch_start in range(0, len(unmatched), batch_size):
+        batch = unmatched[batch_start:batch_start + batch_size]
+
+        _bg_progress('ai_classify', f'Classifying batch {batch_start // batch_size + 1}...')
+
+        lines = []
+        for i, chat in enumerate(batch):
+            idx = batch_start + i
+            excerpt = chat['excerpt'][:200].replace('\n', ' ')
+            lines.append(f"[{idx}] file: {chat['filename']} | date: {chat['date']} | excerpt: {excerpt}")
+
+        chat_list = '\n'.join(lines)
+
+        prompt = f"""These chat conversations were not automatically matched to any existing project initiative.
+
+Existing initiatives: {', '.join(project_names)}
+
+For each conversation below, determine:
+1. If it clearly belongs to an existing initiative, output: [idx] MATCH initiative_name
+2. If it doesn't match any existing initiative, suggest a new initiative name: [idx] NEW suggested_initiative_name
+3. If it's too vague or is just small talk/greetings: [idx] SKIP
+
+Rules:
+- Initiative names should be descriptive (2-5 words), like "Parish Database Migration" or "School Grade Calculator"
+- Group related conversations under the same new initiative name
+- Be specific, not generic. "Code Review" is too vague. "React Dashboard Refactor" is better.
+
+Conversations:
+{chat_list}"""
+
+        result = _call_ai(prompt, max_tokens=800)
+        if not result:
+            return jsonify({'error': 'AI not configured or call failed'})
+
+        for line in result.strip().split('\n'):
+            line = line.strip()
+            if not line or not line.startswith('['):
+                continue
+            try:
+                idx_str = line[1:line.index(']')]
+                idx = int(idx_str)
+                rest = line[line.index(']') + 1:].strip()
+                if idx < 0 or idx >= len(unmatched):
+                    continue
+
+                chat_info = unmatched[idx]
+                entry = {
+                    'idx': idx,
+                    'filename': chat_info['filename'],
+                    'date': chat_info['date'],
+                    'excerpt': chat_info['excerpt'][:150],
+                }
+
+                if rest.startswith('MATCH'):
+                    initiative = rest[5:].strip()
+                    entry['action'] = 'match'
+                    entry['initiative'] = initiative
+                elif rest.startswith('NEW'):
+                    initiative = rest[3:].strip()
+                    entry['action'] = 'new'
+                    entry['initiative'] = initiative
+                elif rest.startswith('SKIP'):
+                    entry['action'] = 'skip'
+                    entry['initiative'] = ''
+                else:
+                    continue
+
+                all_results.append(entry)
+            except (ValueError, IndexError):
+                continue
+
+    # Save results for the UI
+    initiatives = _load_initiatives()
+    initiatives['last_classified'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+    initiatives['results'] = all_results
+    initiatives['total_unmatched'] = len(unmatched)
+    _save_initiatives(initiatives)
+
+    return jsonify({
+        'ok': True,
+        'total': len(unmatched),
+        'classified': len(all_results),
+        'results': all_results,
+    })
+
+
+@app.route('/view/unmatched')
+def view_unmatched():
+    """Show unmatched chat conversations and AI classification results."""
+    chat_stats = getattr(load_projects, '_last_chat_stats', {})
+    unmatched = chat_stats.get('unmatched_chats', [])
+    initiatives = _load_initiatives()
+    ai_results = initiatives.get('results', [])
+    ai_config = _load_ai_config()
+    has_ai = bool(ai_config.get('api_key'))
+
+    # Build lookup from AI results
+    classified = {}
+    for r in ai_results:
+        classified[r.get('idx', -1)] = r
+
+    # Group by suggested initiative
+    by_initiative = defaultdict(list)
+    unclassified = []
+    skipped = []
+    matched_to_existing = []
+
+    for i, chat in enumerate(unmatched):
+        c = classified.get(i)
+        if c:
+            if c['action'] == 'match':
+                matched_to_existing.append({**chat, 'initiative': c['initiative'], 'idx': i})
+            elif c['action'] == 'new':
+                by_initiative[c['initiative']].append({**chat, 'idx': i})
+            elif c['action'] == 'skip':
+                skipped.append({**chat, 'idx': i})
+        else:
+            unclassified.append({**chat, 'idx': i})
+
+    content = ''
+
+    # Stats bar
+    total = len(unmatched)
+    classified_count = len(ai_results)
+    new_initiatives = len(by_initiative)
+    content += f'''<div style="display:flex; gap:16px; margin-bottom:20px; flex-wrap:wrap;">
+        <div style="background:var(--stat-bg); padding:12px 20px; border-radius:8px; flex:1; min-width:120px; text-align:center;">
+            <div style="font-size:24px; font-weight:700; color:var(--heading);">{total}</div>
+            <div style="font-size:11px; color:var(--text-muted);">Unmatched Conversations</div>
+        </div>
+        <div style="background:var(--stat-bg); padding:12px 20px; border-radius:8px; flex:1; min-width:120px; text-align:center;">
+            <div style="font-size:24px; font-weight:700; color:var(--heading);">{new_initiatives}</div>
+            <div style="font-size:11px; color:var(--text-muted);">New Initiatives Suggested</div>
+        </div>
+        <div style="background:var(--stat-bg); padding:12px 20px; border-radius:8px; flex:1; min-width:120px; text-align:center;">
+            <div style="font-size:24px; font-weight:700; color:var(--heading);">{len(matched_to_existing)}</div>
+            <div style="font-size:11px; color:var(--text-muted);">Matched to Existing</div>
+        </div>
+        <div style="background:var(--stat-bg); padding:12px 20px; border-radius:8px; flex:1; min-width:120px; text-align:center;">
+            <div style="font-size:24px; font-weight:700; color:var(--heading);">{len(skipped)}</div>
+            <div style="font-size:11px; color:var(--text-muted);">Skipped (small talk)</div>
+        </div>
+    </div>'''
+
+    # Classify button
+    if has_ai and total > 0:
+        if classified_count == 0:
+            content += '<div style="margin-bottom:16px;"><button class="btn-sm btn-verify" onclick="classifyUnmatched(this)" style="padding:8px 18px; font-size:12px;">Classify with AI</button></div>'
+        else:
+            content += f'<div style="margin-bottom:16px; font-size:11px; color:var(--text-muted);">Last classified: {initiatives.get("last_classified", "never")} &mdash; <button class="btn-sm btn-verify" onclick="classifyUnmatched(this)" style="padding:4px 10px; font-size:10px;">Re-classify</button></div>'
+    elif total == 0:
+        content += '<div class="empty">No unmatched conversations. Upload chat history first, or all conversations were matched to projects.</div>'
+    elif not has_ai:
+        content += '<div style="margin-bottom:16px; font-size:12px; color:var(--text-muted);">Configure an API key in AI Settings to classify these conversations.</div>'
+
+    # New initiatives suggested by AI
+    if by_initiative:
+        content += f'<div class="section-header">Suggested New Initiatives <span class="badge">{new_initiatives}</span></div>'
+        for init_name, chats in sorted(by_initiative.items()):
+            content += f'''<div class="list-card" style="margin-bottom:12px;">
+                <div class="list-item" style="background:var(--stat-bg); padding:10px 18px;">
+                    <div class="main">
+                        <div class="title" style="font-size:14px; color:#e67e22;">{init_name}</div>
+                        <div class="subtitle">{len(chats)} conversation{"s" if len(chats) != 1 else ""}</div>
+                    </div>
+                </div>'''
+            for chat in chats[:10]:  # Show first 10
+                content += f'''<div class="list-item">
+                    <div class="main">
+                        <div class="title" style="font-size:12px;">{chat["filename"]}</div>
+                        <div class="subtitle">{chat["date"]}</div>
+                        <div class="detail">{chat.get("excerpt", "")[:120]}</div>
+                    </div>
+                </div>'''
+            if len(chats) > 10:
+                content += f'<div class="list-item"><div class="main"><div class="subtitle">...and {len(chats) - 10} more</div></div></div>'
+            content += '</div>'
+
+    # Matched to existing projects
+    if matched_to_existing:
+        content += f'<div class="section-header">Matched to Existing Initiatives <span class="badge">{len(matched_to_existing)}</span></div>'
+        # Group by initiative
+        by_existing = defaultdict(list)
+        for item in matched_to_existing:
+            by_existing[item['initiative']].append(item)
+        content += '<div class="list-card">'
+        for init_name, items in sorted(by_existing.items()):
+            content += f'''<div class="list-item" style="background:var(--stat-bg);">
+                <div class="main">
+                    <div class="title" style="font-size:13px;">{init_name}</div>
+                    <div class="subtitle">{len(items)} conversation{"s" if len(items) != 1 else ""}</div>
+                </div>
+            </div>'''
+        content += '</div>'
+
+    # Unclassified (not yet sent to AI)
+    if unclassified:
+        content += f'<div class="section-header">Not Yet Classified <span class="badge">{len(unclassified)}</span></div>'
+        content += '<div class="list-card">'
+        for chat in unclassified[:20]:
+            content += f'''<div class="list-item">
+                <div class="main">
+                    <div class="title" style="font-size:12px;">{chat["filename"]}</div>
+                    <div class="subtitle">{chat["date"]}</div>
+                    <div class="detail">{chat.get("excerpt", "")[:120]}</div>
+                </div>
+            </div>'''
+        if len(unclassified) > 20:
+            content += f'<div class="list-item"><div class="main"><div class="subtitle">...and {len(unclassified) - 20} more</div></div></div>'
+        content += '</div>'
+
+    # Skipped
+    if skipped:
+        content += f'<div class="section-header">Skipped (Small Talk / Greetings) <span class="badge">{len(skipped)}</span></div>'
+        content += '<div class="list-card">'
+        for chat in skipped[:10]:
+            content += f'''<div class="list-item item-ignored">
+                <div class="main">
+                    <div class="title" style="font-size:12px;">{chat["filename"]}</div>
+                    <div class="subtitle">{chat["date"]}</div>
+                </div>
+            </div>'''
+        if len(skipped) > 10:
+            content += f'<div class="list-item"><div class="main"><div class="subtitle">...and {len(skipped) - 10} more</div></div></div>'
+        content += '</div>'
+
+    # JS for classify button
+    content += '''
+    <script>
+    function classifyUnmatched(btn) {
+        btn.disabled = true;
+        btn.textContent = 'Classifying...';
+        fetch('/api/classify-unmatched', { method: 'POST' })
+        .then(r => r.json())
+        .then(function(data) {
+            if (data.error) {
+                btn.textContent = data.error;
+            } else {
+                location.reload();
+            }
+        })
+        .catch(function() { btn.textContent = 'Failed'; });
+    }
+    </script>'''
+
+    return render_template_string(LIST_VIEW_HTML,
+                                  title=f'Unmatched Conversations ({total})',
+                                  content=content)
 
 
 if __name__ == '__main__':

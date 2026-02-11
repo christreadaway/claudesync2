@@ -161,13 +161,13 @@ def _split_into_paragraphs(text):
     paragraphs = []
     for block in raw_blocks:
         block = block.strip()
-        if not block or block.startswith('```') or len(block) < 50:
+        if not block or block.startswith('```') or len(block) < 30:
             continue
 
         code_line_count = sum(1 for line in block.split('\n')
                               if line.strip().startswith(('$', '>', '#!', 'import ', 'from ', 'def ', 'class ')))
         total_lines = len(block.split('\n'))
-        if total_lines > 1 and code_line_count / total_lines > 0.5:
+        if total_lines > 1 and code_line_count / total_lines > 0.6:
             continue
 
         clean = block.replace('**', '').replace('`', '')
@@ -175,7 +175,7 @@ def _split_into_paragraphs(text):
         clean = re.sub(r'^#+\s+', '', clean, flags=re.MULTILINE)
         clean = re.sub(r'\n+', ' ', clean).strip()
 
-        if len(clean) >= 50:
+        if len(clean) >= 30:
             paragraphs.append(clean)
 
     return paragraphs
@@ -193,21 +193,40 @@ def _overlap_ratio(a, b):
 
 
 def match_chat_to_projects(chat_files, projects, verbose=False):
-    """Match chat history to projects. Returns dict of snippets and dated entries."""
+    """Match chat history to projects. Returns dict of snippets and dated entries.
+
+    Two-tier matching:
+    1) Per-conversation: if ANY paragraph in a chat file mentions a project,
+       that whole conversation counts as a chat event for that project.
+    2) Per-paragraph: best matching paragraphs become detailed timeline entries.
+    """
     project_chat_data = {}
 
+    # Pre-build search terms for each project
+    project_terms = {}
+    for project in projects:
+        name = project.get('name', '')
+        if name:
+            project_terms[name] = _build_search_terms(name)
+
+    # First pass: score every (project, chat_file) pair and collect paragraphs
+    # This lets us count conversations, not just paragraphs
     for project in projects:
         name = project.get('name', '')
         if not name:
             continue
 
-        search_terms = _build_search_terms(name)
+        search_terms = project_terms[name]
+        # Track which conversation files matched this project
+        matched_conversations = {}  # filename -> {date, best_score, paragraph_count}
         scored_paragraphs = []
 
         for chat in chat_files:
             paragraphs = _split_into_paragraphs(chat['content'])
             chat_date = chat.get('date')
             chat_filename = chat.get('filename', '')
+            file_matched = False
+            file_para_count = 0
 
             for para in paragraphs:
                 para_lower = para.lower()
@@ -225,26 +244,33 @@ def match_chat_to_projects(chat_files, projects, verbose=False):
                     desc_bonus = sum(1 for w in descriptive_words if w in para_lower)
                     total_score = score + length_bonus + desc_bonus
                     scored_paragraphs.append((total_score, para, chat_date, chat_filename))
+                    file_matched = True
+                    file_para_count += 1
+
+            # Record the conversation-level match
+            if file_matched:
+                matched_conversations[chat_filename] = {
+                    'date': chat_date,
+                    'paragraph_count': file_para_count,
+                }
 
         scored_paragraphs.sort(key=lambda x: x[0], reverse=True)
 
-        # Best snippets for narrative
+        # Best snippets for narrative (keep up to 50 for richer context)
         best_snippets = []
-        # Dated entries for timeline
-        dated_entries = []
+        # Detailed timeline entries from best-scoring paragraphs
+        detailed_entries = []
 
         for _score, para, chat_date, chat_filename in scored_paragraphs:
-            is_redundant = any(_overlap_ratio(para, existing) > 0.5 for existing in best_snippets)
+            is_redundant = any(_overlap_ratio(para, existing) > 0.65 for existing in best_snippets)
             if not is_redundant:
                 best_snippets.append(para)
 
-                # Create a dated timeline entry from chat
                 if chat_date:
                     date_str = chat_date.strftime('%Y-%m-%d')
                 else:
                     date_str = 'Unknown date'
-                # Use chat filename as source hint
-                source_hint = chat_filename.replace('.md', '').replace('.txt', '').replace('_', ' ')
+                source_hint = chat_filename.replace('.md', '').replace('.txt', '').replace('.json', '').replace('_', ' ')
                 summary_line = para[:150]
                 if len(para) > 150:
                     last_period = summary_line.rfind('.')
@@ -253,23 +279,41 @@ def match_chat_to_projects(chat_files, projects, verbose=False):
                     else:
                         summary_line = summary_line + '...'
 
-                dated_entries.append({
+                detailed_entries.append({
                     'date': date_str,
                     'source': f'Claude.ai Chat — {source_hint}',
                     'text': summary_line,
                 })
 
-                if len(best_snippets) >= 8:
+                if len(best_snippets) >= 50:
                     break
 
-        if best_snippets or dated_entries:
+        # Build per-conversation timeline entries (1 entry per conversation file)
+        conversation_entries = []
+        for fname, info in matched_conversations.items():
+            if info['date']:
+                date_str = info['date'].strftime('%Y-%m-%d')
+            else:
+                date_str = 'Unknown date'
+            source_hint = fname.replace('.md', '').replace('.txt', '').replace('.json', '').replace('_', ' ')
+            conversation_entries.append({
+                'date': date_str,
+                'source': f'Claude.ai Chat — {source_hint}',
+                'text': f'Chat conversation ({info["paragraph_count"]} relevant sections)',
+            })
+
+        if best_snippets or conversation_entries:
             project_chat_data[name] = {
                 'snippets': best_snippets,
-                'timeline_entries': dated_entries,
+                'timeline_entries': detailed_entries,
+                'conversation_entries': conversation_entries,
+                'conversation_count': len(matched_conversations),
             }
             if verbose:
-                print(f"  Chat match for '{name}': {len(scored_paragraphs)} candidates, "
-                      f"kept {len(best_snippets)} snippets, {len(dated_entries)} timeline entries")
+                print(f"  Chat match for '{name}': {len(matched_conversations)} conversations, "
+                      f"{len(scored_paragraphs)} paragraph matches, "
+                      f"kept {len(best_snippets)} snippets, {len(detailed_entries)} detailed + "
+                      f"{len(conversation_entries)} conversation entries")
 
     return project_chat_data
 
@@ -686,16 +730,26 @@ def build_project_timeline(project, chat_data=None):
     for entry in project.get('git_commits', []):
         timeline.append(entry.copy())
 
-    # Add chat-sourced entries
+    # Add chat-sourced detailed entries
     if chat_data:
         for entry in chat_data.get('timeline_entries', []):
-            # Check for redundancy against existing timeline
             is_redundant = any(
                 entry['date'] == existing['date'] and
                 _overlap_ratio(entry['text'], existing['text']) > 0.4
                 for existing in timeline
             )
             if not is_redundant:
+                timeline.append(entry.copy())
+
+        # Add conversation-level entries (1 per chat file that mentioned this project)
+        for entry in chat_data.get('conversation_entries', []):
+            # Only add if no detailed entry already covers this date+source combo
+            already_covered = any(
+                entry['date'] == existing['date'] and
+                entry['source'] == existing.get('source', '')
+                for existing in timeline
+            )
+            if not already_covered:
                 timeline.append(entry.copy())
 
     # Sort by date descending (newest first)
@@ -740,8 +794,18 @@ def build_open_threads(project):
 # LOAD AND ASSEMBLE
 # =============================================================================
 
-def load_projects(scan_paths=None, chat_history_path=None, verbose=False):
-    """Load all projects, merge with chat history, build timelines."""
+def load_projects(scan_paths=None, chat_history_path=None, verbose=False,
+                   progress_callback=None):
+    """Load all projects, merge with chat history, build timelines.
+
+    Args:
+        progress_callback: optional callable(step_name, detail) for progress reporting
+    """
+    def _progress(step, detail=''):
+        if progress_callback:
+            progress_callback(step, detail)
+
+    _progress('scanning', 'Finding PROJECT_STATUS.md files...')
     status_files = find_project_status_files(scan_paths)
 
     if verbose:
@@ -749,41 +813,106 @@ def load_projects(scan_paths=None, chat_history_path=None, verbose=False):
         for sf in status_files:
             print(f"  - {sf}")
 
+    _progress('parsing', f'Parsing {len(status_files)} project files...')
     all_projects = []
-    for sf in status_files:
+    for i, sf in enumerate(status_files):
         project = parse_project_status(sf)
         if project:
             all_projects.append(project)
+        if i % 5 == 0:
+            _progress('parsing', f'Parsed {i+1}/{len(status_files)} files...')
 
     # Load chat history
     chat_project_data = {}
+    chat_stats = {'total_files': 0, 'matched_projects': 0, 'total_conversations': 0,
+                  'unmatched_files': 0}
     if chat_history_path:
+        _progress('reading_chat', 'Extracting chat history archive...')
         print(f"Loading chat history from: {chat_history_path}")
         chat_files = load_chat_files(chat_history_path)
+        chat_stats['total_files'] = len(chat_files)
         print(f"  Loaded {len(chat_files)} chat files")
+
         if chat_files:
+            _progress('matching_chat', f'Matching {len(chat_files)} conversations to {len(all_projects)} projects...')
             chat_project_data = match_chat_to_projects(chat_files, all_projects, verbose=verbose)
-            print(f"  Matched chat context to {len(chat_project_data)} projects")
+            chat_stats['matched_projects'] = len(chat_project_data)
+            chat_stats['total_conversations'] = sum(
+                d.get('conversation_count', 0) for d in chat_project_data.values()
+            )
+            # Count unique matched files
+            matched_files = set()
+            for data in chat_project_data.values():
+                for entry in data.get('conversation_entries', []):
+                    src = entry.get('source', '')
+                    matched_files.add(src)
+            chat_stats['unmatched_files'] = len(chat_files) - len(matched_files)
+            print(f"  Matched chat context to {len(chat_project_data)} projects "
+                  f"({chat_stats['total_conversations']} conversations, "
+                  f"{chat_stats['unmatched_files']} unmatched files)")
 
     # Build narratives, timelines, and open threads
-    for project in all_projects:
+    _progress('building', 'Building timelines and threads...')
+    for i, project in enumerate(all_projects):
         name = project.get('name', '')
         chat_data = chat_project_data.get(name)
 
         project['narrative'] = build_project_narrative(project, chat_data)
         project['timeline'] = build_project_timeline(project, chat_data)
         project['open_threads'] = build_open_threads(project)
+        # Store per-project chat conversation count
+        if chat_data:
+            project['chat_conversations'] = chat_data.get('conversation_count', 0)
+        else:
+            project['chat_conversations'] = 0
 
         if verbose:
             print(f"\n{project['name']}:")
             print(f"  Category: {project['category_group']}")
             print(f"  Timeline entries: {len(project['timeline'])}")
             print(f"  Open threads: {len(project['open_threads'])}")
-            has_chat = name in chat_project_data
-            print(f"  Chat context: {'Yes' if has_chat else 'No'}")
+            print(f"  Chat conversations: {project['chat_conversations']}")
+
+        if i % 5 == 0:
+            _progress('building', f'Built {i+1}/{len(all_projects)} project timelines...')
 
     all_projects.sort(key=lambda x: x['progress'], reverse=True)
+
+    # Store stats + unmatched files for AI classification
+    # Figure out which chat files were NOT matched to any project
+    matched_filenames = set()
+    for data in chat_project_data.values():
+        for entry in data.get('conversation_entries', []):
+            # Extract filename from source string
+            src = entry.get('source', '')
+            if ' — ' in src:
+                fname_hint = src.split(' — ', 1)[1]
+                matched_filenames.add(fname_hint)
+
+    unmatched_chats = []
+    for chat in (chat_files if chat_history_path else []):
+        fname_hint = chat['filename'].replace('.md', '').replace('.txt', '').replace('.json', '').replace('_', ' ')
+        if fname_hint not in matched_filenames:
+            # Grab a short excerpt for AI classification
+            content = chat.get('content', '')
+            # Get the first ~300 chars of non-code text
+            excerpt = re.sub(r'```[\s\S]*?```', '', content)
+            excerpt = re.sub(r'^(Human|Assistant|User|Claude|System)\s*:', '', excerpt, flags=re.MULTILINE)
+            excerpt = excerpt.strip()[:300]
+            unmatched_chats.append({
+                'filename': chat['filename'],
+                'date': chat['date'].strftime('%Y-%m-%d') if chat.get('date') else 'Unknown',
+                'excerpt': excerpt,
+            })
+
+    chat_stats['unmatched_chats'] = unmatched_chats
+    load_projects._last_chat_stats = chat_stats
+
+    _progress('done', f'Loaded {len(all_projects)} projects.')
     return all_projects
+
+# Initialize the stats attribute
+load_projects._last_chat_stats = {}
 
 
 # =============================================================================

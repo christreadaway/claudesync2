@@ -9,7 +9,7 @@
 | **Project Name** | Claude Project Sync v2 |
 | **Repository** | christreadaway/claudesync2 |
 | **Category** | Infrastructure |
-| **Progress** | 60% |
+| **Progress** | 65% |
 | **Status** | Active |
 | **Last Worked** | 2026-02-11 |
 | **Has GitHub Repo** | Yes |
@@ -21,12 +21,15 @@
 
 ### What's Working
 - Web dashboard on localhost:5111 with full project portfolio view
-- Clickable stat cards drill into /view/projects, /events, /threads, /blockers
+- Clickable stat cards drill into /view/projects, /events, /threads, /blockers, /whats-next, /unmatched
 - Project detail pages with full timeline and open threads
-- Chat history upload and fuzzy matching to projects
+- Chat history upload and fuzzy matching to projects (per-conversation counting)
+- Non-blocking background processing with top-nav progress bar (step-by-step status)
 - AI enrichment via Anthropic API (Haiku/Sonnet/Opus model selector)
+- AI classification of unmatched chat conversations into initiatives (/view/unmatched)
+- AI category verification across all projects
+- What's Next cross-project triage view with Resolve/Ignore/Reassign per item
 - Bulk AI analysis checkbox on upload ("Analyze chats with AI")
-- Loading overlay prevents double-clicks during Load & Refresh / PDF gen
 - Archive/unarchive projects, ignore/restore EOL projects, resolve threads
 - Dark/light theme with persistence
 - PDF generation with category grouping, timeline, threads, cross-project summary
@@ -37,8 +40,6 @@
 
 ### What's Not Working
 - Daily PDF report automation (LaunchAgent plist created but not tested)
-- No overarching "what's next" view across all projects
-- No AI verification of project categorization
 
 ### Blockers
 - None currently
@@ -49,10 +50,16 @@
 
 ### 2026-02-11 (Claude Code — Dashboard v5 Features)
 **What was built:**
+- Non-blocking background processing: upload/load runs in a background thread, app stays usable
+- Top-nav progress bar with step-by-step status (Scanning → Parsing → Reading Chat → Matching → AI → Building → Done)
+- Chat history metrics overhaul: per-conversation counting (not just per-paragraph), raised snippet cap from 8→50, lowered paragraph minimum from 50→30 chars, relaxed overlap dedup from 0.5→0.65
+- What's Next cross-project triage (/view/whats-next): all actionable items grouped by project, with Resolve/Ignore/Reassign buttons per item
+- AI classification of unmatched chat conversations (/view/unmatched): AI suggests which initiative each conversation belongs to, or proposes new initiative names
+- AI category verification: "Verify All Categories with AI" button on What's Next page
+- Clickable stat cards linking to drill-down views + new "Unmatched Chats" stat card
 - Loading overlay with spinner for Load & Refresh and Generate PDF (prevents double-clicks)
 - AI chat analysis: bulk enrichment checkbox in upload modal, shared _call_ai() helper
 - Model dropdown (Haiku 4.5 default, Sonnet 4.5, Opus 4.6) with sensible defaults
-- Clickable stat cards linking to 4 drill-down list views
 - /view/projects with Archive/Unarchive buttons (Active + Archived sections)
 - /view/events with all timeline events, newest first, typed tags (Commit/Chat/Log)
 - /view/threads with Resolve buttons
@@ -65,11 +72,9 @@
 **What was figured out:**
 - Jinja2 auto-escapes {{ content }} by default — need |safe filter for pre-built HTML
 - Archived projects should be separate from Ignored (archive = user choice, ignore = EOL dismissal)
-
-**Next time:**
-- Overarching "what's next" view across all projects
-- AI verification of project categorization/placement
-- Reassign/ignore actions on individual items
+- Chat history was severely undercounting: 8-snippet cap + 50-char minimum + aggressive dedup meant 26MB of chat data showed almost nothing
+- "Initiatives" is a better term than "projects" for AI-classified chat groups (avoids confusion with Claude.ai chat "projects")
+- Background thread + polling is simpler and more reliable than SSE for Flask single-threaded
 
 ### 2026-02-04 (Claude.ai Chat — Sacramental Records Integration)
 **Source:** Claude.ai project chat, current session
