@@ -37,6 +37,8 @@ UPLOAD_DIR = tempfile.mkdtemp(prefix='claudesync_')
 IGNORED_FILE = os.path.expanduser('~/.claudesync_ignored.json')
 RESOLVED_FILE = os.path.expanduser('~/.claudesync_resolved.json')
 AI_CONFIG_FILE = os.path.expanduser('~/.claudesync_ai.json')
+ARCHIVED_FILE = os.path.expanduser('~/.claudesync_archived.json')
+IMPORT_META_FILE = os.path.expanduser('~/.claudesync_import_meta.json')
 
 # Cache loaded projects so dashboard + drill-down share data
 _project_cache = {
@@ -115,6 +117,44 @@ def _save_ai_config(config):
     """Save AI API configuration."""
     with open(AI_CONFIG_FILE, 'w') as f:
         json.dump(config, f, indent=2)
+
+
+# =============================================================================
+# ARCHIVED PROJECTS PERSISTENCE
+# =============================================================================
+
+def _load_archived():
+    if os.path.exists(ARCHIVED_FILE):
+        try:
+            with open(ARCHIVED_FILE, 'r') as f:
+                return set(json.load(f))
+        except Exception:
+            pass
+    return set()
+
+
+def _save_archived(names):
+    with open(ARCHIVED_FILE, 'w') as f:
+        json.dump(sorted(names), f, indent=2)
+
+
+# =============================================================================
+# IMPORT METADATA
+# =============================================================================
+
+def _load_import_meta():
+    if os.path.exists(IMPORT_META_FILE):
+        try:
+            with open(IMPORT_META_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_import_meta(meta):
+    with open(IMPORT_META_FILE, 'w') as f:
+        json.dump(meta, f, indent=2)
 
 
 # =============================================================================
@@ -367,7 +407,8 @@ DASHBOARD_HTML = """
         .filter-toggle.active { background: var(--heading); color: white; border-color: var(--heading); }
 
         .stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 24px; }
-        .stat-card { background: var(--bg-card); border-radius: 8px; padding: 18px; box-shadow: 0 1px 3px var(--shadow); }
+        .stat-card { background: var(--bg-card); border-radius: 8px; padding: 18px; box-shadow: 0 1px 3px var(--shadow); cursor: pointer; transition: box-shadow 0.2s; text-decoration: none; display: block; color: inherit; }
+        .stat-card:hover { box-shadow: 0 4px 12px var(--shadow-hover); }
         .stat-card .number { font-size: 28px; font-weight: 700; color: var(--heading); }
         .stat-card .label { font-size: 11px; color: var(--text-secondary); margin-top: 2px; text-transform: uppercase; letter-spacing: 0.5px; }
         .chart-card { background: var(--bg-card); border-radius: 8px; padding: 20px; margin-bottom: 24px; box-shadow: 0 1px 3px var(--shadow); }
@@ -474,22 +515,22 @@ DASHBOARD_HTML = """
 
         <!-- Stats Row -->
         <div class="stats-row">
-            <div class="stat-card">
-                <div class="number" id="statProjects">{{ total_projects }}</div>
+            <a href="/view/projects" class="stat-card">
+                <div class="number">{{ total_projects }}</div>
                 <div class="label">Projects</div>
-            </div>
-            <div class="stat-card">
-                <div class="number" id="statEvents">{{ total_events }}</div>
+            </a>
+            <a href="/view/events" class="stat-card">
+                <div class="number">{{ total_events }}</div>
                 <div class="label">Total Events</div>
-            </div>
-            <div class="stat-card">
-                <div class="number" id="statThreads">{{ total_threads }}</div>
+            </a>
+            <a href="/view/threads" class="stat-card">
+                <div class="number">{{ total_threads }}</div>
                 <div class="label">Open Threads</div>
-            </div>
-            <div class="stat-card">
-                <div class="number" id="statBlockers">{{ total_blockers }}</div>
+            </a>
+            <a href="/view/blockers" class="stat-card">
+                <div class="number">{{ total_blockers }}</div>
                 <div class="label">Blockers</div>
-            </div>
+            </a>
         </div>
 
         <!-- Activity Chart -->
@@ -586,6 +627,12 @@ DASHBOARD_HTML = """
     <div class="modal-overlay" id="uploadModal">
         <div class="modal">
             <h2>Upload Chat History & Configure</h2>
+            {% if import_meta.last_import %}
+            <p style="font-size:11px; color:var(--text-secondary); margin-bottom:12px; padding:8px; background:var(--stat-bg); border-radius:4px;">
+                Last import: <strong>{{ import_meta.last_import }}</strong> ({{ import_meta.last_file }})<br>
+                <span style="color:var(--text-muted);">You can upload just your recent chats to append new data.</span>
+            </p>
+            {% endif %}
             <form method="POST" action="/upload" enctype="multipart/form-data">
                 <div class="drop-zone" id="dropZone">
                     <p>Drag & drop a chat export zip, or click to browse</p>
@@ -1095,9 +1142,12 @@ def dashboard():
         projects = _load_cached_projects()
 
     ignored_names = _load_ignored()
+    archived_names = _load_archived()
 
-    # Only count non-ignored projects in stats
-    visible = [p for p in projects if p.get('name', '') not in ignored_names]
+    # Only count non-ignored, non-archived projects in stats
+    visible = [p for p in projects
+                if p.get('name', '') not in ignored_names
+                and p.get('name', '') not in archived_names]
 
     chart_data = _aggregate_activity(visible, mode='day')
     project_cards = _project_activity_breakdown(projects)  # all projects, for filtering
@@ -1107,6 +1157,7 @@ def dashboard():
     total_blockers = sum(c['blockers'] for c in project_cards if c['name'] not in ignored_names)
 
     ai_config = _load_ai_config()
+    import_meta = _load_import_meta()
 
     return render_template_string(
         DASHBOARD_HTML,
@@ -1119,6 +1170,7 @@ def dashboard():
         ignored_names=ignored_names,
         scan_paths=_project_cache.get('scan_paths', '~'),
         ai_config=ai_config,
+        import_meta=import_meta,
     )
 
 
@@ -1278,6 +1330,12 @@ def upload():
         chat_history_path = save_path
         print(f"Chat history uploaded: {save_path}")
 
+        # Save import metadata
+        meta = _load_import_meta()
+        meta['last_import'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+        meta['last_file'] = chat_file.filename
+        _save_import_meta(meta)
+
     scan_paths_str = request.form.get('scan_paths', '~').strip() or '~'
     ai_analyze = request.form.get('ai_analyze') == '1'
 
@@ -1322,6 +1380,275 @@ def generate_pdf():
         as_attachment=True,
         download_name=f'Project_Portfolio_Status_{today}.pdf'
     )
+
+
+# =============================================================================
+# LIST VIEW TEMPLATE (shared by /view/projects, /events, /threads, /blockers)
+# =============================================================================
+
+LIST_VIEW_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }} -- Dashboard</title>
+    <style>
+        """ + THEME_CSS + """
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); }
+        .top-bar { background: var(--bar-bg); color: var(--bar-text); padding: 16px 24px; display: flex; align-items: center; gap: 16px; }
+        .top-bar a { color: #8cc4e8; text-decoration: none; font-size: 13px; }
+        .top-bar a:hover { color: white; }
+        .top-bar h1 { font-size: 18px; font-weight: 600; flex: 1; }
+        .btn-theme { background: transparent; border: 1px solid rgba(255,255,255,0.3); color: var(--bar-text); font-size: 12px; padding: 5px 10px; border-radius: 4px; cursor: pointer; }
+        .container { max-width: 900px; margin: 0 auto; padding: 24px 20px; }
+        .list-card { background: var(--bg-card); border-radius: 8px; margin-bottom: 10px; box-shadow: 0 1px 3px var(--shadow); overflow: hidden; }
+        .list-item { padding: 14px 18px; display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--border-light); }
+        .list-item:last-child { border-bottom: none; }
+        .list-item .main { flex: 1; }
+        .list-item .title { font-size: 13px; font-weight: 600; color: var(--heading); }
+        .list-item .subtitle { font-size: 11px; color: var(--text-secondary); margin-top: 2px; }
+        .list-item .detail { font-size: 12px; color: var(--text); margin-top: 4px; line-height: 1.5; }
+        .list-item .actions { display: flex; gap: 6px; align-items: center; flex-shrink: 0; }
+        .btn-sm { padding: 4px 12px; border: 1px solid var(--border); border-radius: 4px; font-size: 10px; font-weight: 600; cursor: pointer; background: var(--bg); color: var(--text-secondary); }
+        .btn-sm:hover { background: var(--stat-bg); }
+        .btn-sm.btn-archive { border-color: #e67e22; color: #e67e22; }
+        .btn-sm.btn-archive:hover { background: #e67e22; color: white; }
+        .btn-sm.btn-unarchive { border-color: #2ECC71; color: #2ECC71; }
+        .btn-sm.btn-unarchive:hover { background: #2ECC71; color: white; }
+        .btn-sm.btn-resolve { border-color: #2ECC71; color: #2ECC71; }
+        .btn-sm.btn-resolve:hover { background: #d4edda; color: #155724; }
+        .tag { display: inline-block; padding: 1px 7px; border-radius: 3px; font-size: 10px; font-weight: 600; margin-right: 4px; }
+        .tag-blocker { background: #fce4ec; color: #c62828; }
+        .tag-question { background: #fff3e0; color: #e65100; }
+        .tag-next { background: #e3f2fd; color: #1565c0; }
+        .tag-notbuilt { background: var(--stat-bg); color: var(--text-secondary); }
+        .tag-archived { background: #fff3e0; color: #e67e22; }
+        .tag-commit { background: #e3f2fd; color: #1565c0; }
+        .tag-chat { background: #f3e5f5; color: #7b1fa2; }
+        .tag-log { background: #e8f5e9; color: #2e7d32; }
+        .section-header { font-size: 12px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; padding: 20px 0 8px; }
+        .empty { font-size: 13px; color: var(--text-muted); padding: 20px; text-align: center; }
+        .progress-bar { height: 5px; background: var(--progress-bg); border-radius: 3px; overflow: hidden; width: 80px; display: inline-block; vertical-align: middle; margin-left: 8px; }
+        .progress-fill { height: 100%; border-radius: 3px; }
+        footer { text-align: center; font-size: 11px; color: var(--text-muted); margin-top: 30px; }
+        footer a { color: var(--text-muted); text-decoration: none; }
+    </style>
+    <script>
+        (function() {
+            var t = localStorage.getItem('theme') || 'light';
+            document.documentElement.setAttribute('data-theme', t);
+        })();
+    </script>
+</head>
+<body>
+    <div class="top-bar">
+        <a href="/">&larr; Dashboard</a>
+        <h1>{{ title }}</h1>
+        <button class="btn-theme" onclick="toggleTheme()"><span id="themeIcon"></span></button>
+    </div>
+    <div class="container">
+        {{ content }}
+        <footer><a href="/">&larr; Back to Dashboard</a></footer>
+    </div>
+    <script>
+        function toggleTheme() {
+            var cur = document.documentElement.getAttribute('data-theme');
+            var next = cur === 'dark' ? 'light' : 'dark';
+            document.documentElement.setAttribute('data-theme', next);
+            localStorage.setItem('theme', next);
+            document.getElementById('themeIcon').textContent = next === 'dark' ? 'Light' : 'Dark';
+        }
+        document.getElementById('themeIcon').textContent =
+            document.documentElement.getAttribute('data-theme') === 'dark' ? 'Light' : 'Dark';
+
+        function apiAction(url, body, el) {
+            el.disabled = true;
+            el.textContent = '...';
+            fetch(url, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) })
+            .then(r => r.json())
+            .then(function() { location.reload(); });
+        }
+    </script>
+</body>
+</html>
+"""
+
+
+@app.route('/view/projects')
+def view_projects():
+    projects = _project_cache.get('projects', [])
+    archived = _load_archived()
+    ignored = _load_ignored()
+
+    active_html = ''
+    archived_html = ''
+
+    for i, p in enumerate(projects):
+        name = p.get('name', 'Unknown')
+        progress = p.get('progress', 0)
+        color = '#2ECC71' if progress > 75 else '#3498DB' if progress >= 50 else '#F1C40F' if progress >= 25 else '#E74C3C'
+        is_archived = name in archived
+
+        item = f'''<div class="list-item">
+            <div class="main">
+                <div class="title"><a href="/project/{i}" style="color:inherit; text-decoration:none;">{name}</a>
+                    <div class="progress-bar"><div class="progress-fill" style="width:{progress}%; background:{color};"></div></div>
+                    {' <span class="tag tag-archived">Archived</span>' if is_archived else ''}
+                </div>
+                <div class="subtitle">{p.get("category_group", "")} &middot; {p.get("status", "")} &middot; {p.get("last_worked", "")}</div>
+            </div>
+            <div class="actions">'''
+
+        if is_archived:
+            item += f'<button class="btn-sm btn-unarchive" onclick="apiAction(\'/api/unarchive\', {{name:\'{name}\'}}, this)">Unarchive</button>'
+        else:
+            item += f'<button class="btn-sm btn-archive" onclick="apiAction(\'/api/archive\', {{name:\'{name}\'}}, this)">Archive</button>'
+
+        item += '</div></div>'
+
+        if is_archived:
+            archived_html += item
+        else:
+            active_html += item
+
+    content = '<div class="section-header">Active Projects</div>'
+    content += f'<div class="list-card">{active_html}</div>' if active_html else '<div class="empty">No active projects</div>'
+    if archived_html:
+        content += '<div class="section-header">Archived</div>'
+        content += f'<div class="list-card">{archived_html}</div>'
+
+    return render_template_string(LIST_VIEW_HTML, title=f'All Projects ({len(projects)})', content=content)
+
+
+@app.route('/view/events')
+def view_events():
+    projects = _project_cache.get('projects', [])
+    ignored = _load_ignored()
+
+    all_events = []
+    for i, p in enumerate(projects):
+        if p.get('name', '') in ignored:
+            continue
+        for e in p.get('timeline', []):
+            src = e.get('source', '').lower()
+            if 'commit' in src:
+                tag = '<span class="tag tag-commit">Commit</span>'
+            elif 'chat' in src:
+                tag = '<span class="tag tag-chat">Chat</span>'
+            else:
+                tag = '<span class="tag tag-log">Log</span>'
+            all_events.append({
+                'date': e.get('date', ''),
+                'text': e.get('text', ''),
+                'source': e.get('source', ''),
+                'project': p.get('name', ''),
+                'project_idx': i,
+                'tag': tag,
+            })
+
+    all_events.sort(key=lambda x: x['date'], reverse=True)
+
+    items = ''
+    for ev in all_events:
+        items += f'''<div class="list-item">
+            <div class="main">
+                <div class="title">{ev['tag']} {ev['text'][:120]}</div>
+                <div class="subtitle">{ev['date']} &middot; <a href="/project/{ev['project_idx']}" style="color:inherit;">{ev['project']}</a> &middot; {ev['source']}</div>
+            </div>
+        </div>'''
+
+    content = f'<div class="list-card">{items}</div>' if items else '<div class="empty">No events</div>'
+    return render_template_string(LIST_VIEW_HTML, title=f'All Events ({len(all_events)})', content=content)
+
+
+@app.route('/view/threads')
+def view_threads():
+    projects = _project_cache.get('projects', [])
+    resolved = _load_resolved()
+    ignored = _load_ignored()
+
+    items = ''
+    count = 0
+    for i, p in enumerate(projects):
+        name = p.get('name', '')
+        if name in ignored:
+            continue
+        for t_type, t_text in p.get('open_threads', []):
+            key = _thread_key(name, t_text)
+            if key in resolved:
+                continue
+            count += 1
+            tag_class = {'Blocker': 'tag-blocker', 'Open Question': 'tag-question',
+                         'Next Step': 'tag-next'}.get(t_type, 'tag-notbuilt')
+            items += f'''<div class="list-item">
+                <div class="main">
+                    <div class="title"><span class="tag {tag_class}">{t_type}</span> {t_text}</div>
+                    <div class="subtitle"><a href="/project/{i}" style="color:inherit;">{name}</a></div>
+                </div>
+                <div class="actions">
+                    <button class="btn-sm btn-resolve" onclick="apiAction('/api/resolve-thread', {{project:'{name}', text:'{t_text[:100].replace(chr(39), "&#39;")}'}}, this)">Resolve</button>
+                </div>
+            </div>'''
+
+    content = f'<div class="list-card">{items}</div>' if items else '<div class="empty">No open threads</div>'
+    return render_template_string(LIST_VIEW_HTML, title=f'Open Threads ({count})', content=content)
+
+
+@app.route('/view/blockers')
+def view_blockers():
+    projects = _project_cache.get('projects', [])
+    resolved = _load_resolved()
+    ignored = _load_ignored()
+
+    items = ''
+    count = 0
+    for i, p in enumerate(projects):
+        name = p.get('name', '')
+        if name in ignored:
+            continue
+        for t_type, t_text in p.get('open_threads', []):
+            if t_type != 'Blocker':
+                continue
+            key = _thread_key(name, t_text)
+            if key in resolved:
+                continue
+            count += 1
+            items += f'''<div class="list-item">
+                <div class="main">
+                    <div class="title"><span class="tag tag-blocker">Blocker</span> {t_text}</div>
+                    <div class="subtitle"><a href="/project/{i}" style="color:inherit;">{name}</a></div>
+                </div>
+                <div class="actions">
+                    <button class="btn-sm btn-resolve" onclick="apiAction('/api/resolve-thread', {{project:'{name}', text:'{t_text[:100].replace(chr(39), "&#39;")}'}}, this)">Resolve</button>
+                </div>
+            </div>'''
+
+    content = f'<div class="list-card">{items}</div>' if items else '<div class="empty">No blockers</div>'
+    return render_template_string(LIST_VIEW_HTML, title=f'Blockers ({count})', content=content)
+
+
+@app.route('/api/archive', methods=['POST'])
+def api_archive():
+    data = request.get_json(force=True)
+    name = data.get('name', '')
+    if name:
+        archived = _load_archived()
+        archived.add(name)
+        _save_archived(archived)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/unarchive', methods=['POST'])
+def api_unarchive():
+    data = request.get_json(force=True)
+    name = data.get('name', '')
+    if name:
+        archived = _load_archived()
+        archived.discard(name)
+        _save_archived(archived)
+    return jsonify({'ok': True})
 
 
 if __name__ == '__main__':
