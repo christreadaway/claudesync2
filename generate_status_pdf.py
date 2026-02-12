@@ -15,6 +15,7 @@ import json
 import os
 import re
 import sys
+import zipfile
 from datetime import datetime
 from io import BytesIO
 
@@ -183,6 +184,443 @@ SKIP_DIRS = {
     'Applications', 'Pictures', 'Music', 'Movies', 'Documents'
 }
 
+
+# =============================================================================
+# CHAT HISTORY PROCESSING - Claude.ai export (conversations.json in ZIP/DMS)
+# =============================================================================
+
+def load_chat_files(chat_path):
+    """Load conversations from a Claude.ai export (ZIP/DMS with conversations.json)
+    or a directory/file of text-based chat exports.
+
+    Claude.ai exports are .dms files (renamed ZIPs) containing conversations.json:
+    a JSON array of conversation objects with uuid, name, created_at, updated_at,
+    and chat_messages[].
+
+    Returns list of dicts: [{'filename': str, 'content': str, 'date': datetime|None}, ...]
+    """
+    chat_files = []
+    if chat_path is None:
+        return chat_files
+
+    chat_path = os.path.expanduser(chat_path)
+
+    if not os.path.exists(chat_path):
+        return chat_files
+
+    # Try as ZIP/DMS archive first
+    if zipfile.is_zipfile(chat_path):
+        chat_files = _load_from_zip(chat_path)
+    elif os.path.isdir(chat_path):
+        # Walk directory for text files
+        for root, _dirs, files in os.walk(chat_path):
+            for fname in files:
+                if fname.endswith(('.md', '.txt', '.json')):
+                    fpath = os.path.join(root, fname)
+                    try:
+                        with open(fpath, 'r', errors='replace') as f:
+                            text = f.read()
+                        if fname == 'conversations.json':
+                            chat_files.extend(_parse_conversations_json(text))
+                        else:
+                            mod_time = datetime.fromtimestamp(os.path.getmtime(fpath))
+                            chat_files.append({
+                                'filename': fname,
+                                'content': text,
+                                'date': mod_time,
+                            })
+                    except Exception:
+                        continue
+    elif os.path.isfile(chat_path):
+        try:
+            with open(chat_path, 'r', errors='replace') as f:
+                text = f.read()
+            if chat_path.endswith('.json'):
+                chat_files.extend(_parse_conversations_json(text))
+            else:
+                mod_time = datetime.fromtimestamp(os.path.getmtime(chat_path))
+                chat_files.append({
+                    'filename': os.path.basename(chat_path),
+                    'content': text,
+                    'date': mod_time,
+                })
+        except Exception:
+            pass
+
+    return chat_files
+
+
+def _load_from_zip(zip_path):
+    """Extract conversations from a ZIP/DMS archive."""
+    chat_files = []
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            # Check for conversations.json (Claude.ai native export)
+            names = zf.namelist()
+            conversations_files = [n for n in names
+                                   if os.path.basename(n) == 'conversations.json']
+            if conversations_files:
+                for cf in conversations_files:
+                    try:
+                        raw = zf.read(cf).decode('utf-8', errors='replace')
+                        chat_files.extend(_parse_conversations_json(raw))
+                    except Exception:
+                        continue
+            else:
+                # Fallback: treat individual files as chat exports
+                for name in names:
+                    if name.endswith(('.md', '.txt', '.json')):
+                        try:
+                            raw = zf.read(name).decode('utf-8', errors='replace')
+                            info = zf.getinfo(name)
+                            mod_time = datetime(*info.date_time) if info.date_time else None
+                            chat_files.append({
+                                'filename': os.path.basename(name),
+                                'content': raw,
+                                'date': mod_time,
+                            })
+                        except Exception:
+                            continue
+    except Exception:
+        pass
+    return chat_files
+
+
+def _parse_conversations_json(json_text):
+    """Parse a Claude.ai conversations.json export.
+
+    Format: JSON array of conversation objects with:
+      - uuid, name, created_at, updated_at
+      - chat_messages[]: each with text, sender, created_at, content[]
+
+    Returns list of chat_file dicts compatible with our pipeline.
+    """
+    chat_files = []
+    try:
+        data = json.loads(json_text)
+    except (json.JSONDecodeError, TypeError):
+        return chat_files
+
+    if not isinstance(data, list):
+        return chat_files
+
+    for conv in data:
+        if not isinstance(conv, dict):
+            continue
+
+        # Extract conversation metadata
+        conv_name = conv.get('name', '') or ''
+        conv_uuid = conv.get('uuid', '')
+        created_at = conv.get('created_at', '')
+        updated_at = conv.get('updated_at', '')
+
+        # Parse date - prefer updated_at for "when was this worked on"
+        conv_date = None
+        for date_str in [updated_at, created_at]:
+            if date_str:
+                try:
+                    conv_date = datetime.fromisoformat(
+                        date_str.replace('Z', '+00:00')
+                    )
+                    break
+                except (ValueError, TypeError):
+                    continue
+
+        # Build combined text content from all messages
+        messages = conv.get('chat_messages', [])
+        if not messages:
+            continue
+
+        text_parts = []
+        # Add conversation title
+        if conv_name:
+            text_parts.append(f"# {conv_name}\n")
+
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            sender = msg.get('sender', '')
+            # Get text from top-level text field
+            msg_text = msg.get('text', '')
+            # Also try content blocks
+            if not msg_text:
+                content_blocks = msg.get('content', [])
+                if isinstance(content_blocks, list):
+                    for block in content_blocks:
+                        if isinstance(block, dict) and block.get('type') == 'text':
+                            msg_text = block.get('text', '')
+                            break
+
+            if msg_text:
+                label = 'Human' if sender == 'human' else 'Assistant'
+                text_parts.append(f"{label}: {msg_text}")
+
+        if not text_parts:
+            continue
+
+        combined_text = '\n\n'.join(text_parts)
+
+        # Build filename from title or UUID
+        if conv_name:
+            safe_name = re.sub(r'[^\w\s-]', '', conv_name)[:60].strip()
+            filename = safe_name or conv_uuid[:12]
+        else:
+            filename = conv_uuid[:12] if conv_uuid else 'untitled'
+
+        chat_files.append({
+            'filename': filename,
+            'content': combined_text,
+            'date': conv_date,
+            'conversation_name': conv_name,
+            'uuid': conv_uuid,
+        })
+
+    return chat_files
+
+
+def _build_search_terms(project_name):
+    """Build fuzzy search patterns from a project name."""
+    name_lower = project_name.lower().strip()
+    terms = set()
+    terms.add(name_lower)
+
+    # Without version suffix
+    no_version = re.sub(r'\s*v\d+(\.\d+)*\s*$', '', name_lower).strip()
+    if no_version and len(no_version) > 3:
+        terms.add(no_version)
+
+    # No spaces
+    squashed = name_lower.replace(' ', '')
+    if len(squashed) > 5:
+        terms.add(squashed)
+
+    # First two significant words
+    words = [w for w in name_lower.split()
+             if len(w) > 2 and w not in ('the', 'and', 'for', 'app', 'project')]
+    if len(words) >= 2:
+        terms.add(words[0] + ' ' + words[1])
+
+    # Longest significant word (if long enough)
+    if words:
+        longest = max(words, key=len)
+        if len(longest) >= 8:
+            terms.add(longest)
+
+    return list(terms)
+
+
+def _split_into_paragraphs(text):
+    """Split chat text into meaningful paragraphs, filtering out code blocks."""
+    # Remove speaker labels
+    cleaned = re.sub(r'^(Human|Assistant|User|Claude|System)\s*:', '', text, flags=re.MULTILINE)
+    # Split on double newlines or horizontal rules
+    raw_blocks = re.split(r'\n\s*\n|\n---+\n', cleaned)
+
+    paragraphs = []
+    for block in raw_blocks:
+        block = block.strip()
+        if not block or block.startswith('```') or len(block) < 30:
+            continue
+
+        # Skip code-heavy blocks
+        code_indicators = ('$', '>', '#!', 'import ', 'from ', 'def ', 'class ',
+                           'function ', 'const ', 'let ', 'var ', 'return ', '{', '}')
+        code_line_count = sum(1 for line in block.split('\n')
+                              if line.strip().startswith(code_indicators))
+        total_lines = len(block.split('\n'))
+        if total_lines > 1 and code_line_count / total_lines > 0.6:
+            continue
+
+        # Clean formatting
+        clean = block.replace('**', '').replace('`', '')
+        clean = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', clean)  # [text](url) -> text
+        clean = re.sub(r'^#+\s+', '', clean, flags=re.MULTILINE)  # Remove headers
+        clean = re.sub(r'\n+', ' ', clean).strip()
+
+        if len(clean) >= 30:
+            paragraphs.append(clean)
+
+    return paragraphs
+
+
+def _overlap_ratio(a, b):
+    """Quick overlap check between two strings using word sets."""
+    words_a = set(a.lower().split())
+    words_b = set(b.lower().split())
+    if not words_a or not words_b:
+        return 0.0
+    intersection = words_a & words_b
+    smaller = min(len(words_a), len(words_b))
+    return len(intersection) / smaller if smaller > 0 else 0.0
+
+
+def match_chat_to_projects(chat_files, projects, verbose=False, progress_callback=None):
+    """Match chat history to projects using fuzzy name matching.
+
+    Returns:
+        tuple: (project_chat_data, chat_stats)
+            project_chat_data: {project_name: {snippets: [...], timeline_entries: [...],
+                                                conversation_entries: [...]}}
+            chat_stats: {total_files, total_conversations, matched_projects,
+                         unmatched_files, unmatched_chats: [...]}
+    """
+    def _progress(detail=''):
+        if progress_callback:
+            progress_callback('matching', detail)
+
+    project_chat_data = {}
+    matched_filenames = set()  # Track which chat files matched any project
+    total_conversations_matched = 0
+
+    for pi, project in enumerate(projects):
+        name = project.get('name', '')
+        if not name:
+            continue
+
+        _progress(f'Matching chats to {name} ({pi + 1}/{len(projects)})...')
+        search_terms = _build_search_terms(name)
+        scored_paragraphs = []  # (score, text, date, filename)
+        matched_conversations = {}  # filename -> {date, paragraph_count}
+
+        for chat in chat_files:
+            paragraphs = _split_into_paragraphs(chat['content'])
+            chat_date = chat.get('date')
+            chat_filename = chat.get('filename', '')
+            conv_name = chat.get('conversation_name', '')
+
+            # Also check if the conversation title itself mentions the project
+            title_bonus = 0
+            if conv_name:
+                title_lower = conv_name.lower()
+                for term in search_terms:
+                    if term in title_lower:
+                        title_bonus = 50  # Strong signal from title match
+                        break
+
+            for para in paragraphs:
+                para_lower = para.lower()
+                score = title_bonus  # Start with title bonus if any
+
+                for term in search_terms:
+                    count = para_lower.count(term)
+                    if count > 0:
+                        score += count * len(term)
+
+                if score > 0:
+                    # Bonuses for quality
+                    length_bonus = min(len(para), 500) / 100
+                    descriptive_words = ['project', 'build', 'feature', 'implement',
+                                         'design', 'status', 'progress', 'complete',
+                                         'working', 'develop', 'launch', 'deploy']
+                    desc_bonus = sum(1 for w in descriptive_words if w in para_lower)
+                    total_score = score + length_bonus + desc_bonus
+                    scored_paragraphs.append((total_score, para, chat_date, chat_filename))
+
+                    # Track per-conversation matching
+                    if chat_filename not in matched_conversations:
+                        matched_conversations[chat_filename] = {
+                            'date': chat_date,
+                            'paragraph_count': 0,
+                        }
+                    matched_conversations[chat_filename]['paragraph_count'] += 1
+
+        scored_paragraphs.sort(key=lambda x: x[0], reverse=True)
+
+        # Best snippets (deduped)
+        best_snippets = []
+        timeline_entries = []
+
+        for _score, para, chat_date, chat_filename in scored_paragraphs:
+            is_redundant = any(_overlap_ratio(para, existing) > 0.65
+                               for existing in best_snippets)
+            if not is_redundant:
+                best_snippets.append(para)
+
+                # Create dated timeline entry
+                if chat_date:
+                    date_str = chat_date.strftime('%Y-%m-%d')
+                else:
+                    date_str = ''
+
+                summary_line = para[:150]
+                if len(para) > 150:
+                    last_period = summary_line.rfind('.')
+                    if last_period > 80:
+                        summary_line = summary_line[:last_period + 1]
+                    else:
+                        summary_line = summary_line + '...'
+
+                timeline_entries.append({
+                    'date': date_str,
+                    'source': 'Claude.ai Chat',
+                    'text': summary_line,
+                })
+
+                if len(best_snippets) >= 50:
+                    break
+
+        # Build per-conversation entries (one per matched conversation)
+        conversation_entries = []
+        for fname, info in matched_conversations.items():
+            matched_filenames.add(fname)
+            if info.get('date'):
+                date_str = info['date'].strftime('%Y-%m-%d')
+            else:
+                date_str = ''
+            conversation_entries.append({
+                'date': date_str,
+                'source': 'Claude.ai Chat',
+                'text': f"Chat conversation ({info['paragraph_count']} relevant sections)",
+            })
+
+        if best_snippets or conversation_entries:
+            project_chat_data[name] = {
+                'snippets': best_snippets,
+                'timeline_entries': timeline_entries,
+                'conversation_entries': conversation_entries,
+            }
+            total_conversations_matched += len(matched_conversations)
+
+            if verbose:
+                print(f"  Chat match for '{name}': {len(scored_paragraphs)} candidates, "
+                      f"kept {len(best_snippets)} snippets, "
+                      f"{len(matched_conversations)} conversations")
+
+    # Build unmatched list
+    unmatched_chats = []
+    for chat in chat_files:
+        fname = chat.get('filename', '')
+        if fname not in matched_filenames:
+            # Build excerpt: strip code blocks, remove labels, take first 300 chars
+            raw = chat.get('content', '')
+            excerpt = re.sub(r'```[\s\S]*?```', '', raw)
+            excerpt = re.sub(r'^(Human|Assistant|User|Claude|System)\s*:',
+                             '', excerpt, flags=re.MULTILINE)
+            excerpt = excerpt.strip()[:300]
+
+            chat_date = chat.get('date')
+            date_str = chat_date.strftime('%Y-%m-%d') if chat_date else ''
+
+            unmatched_chats.append({
+                'filename': fname,
+                'date': date_str,
+                'excerpt': excerpt,
+            })
+
+    chat_stats = {
+        'total_files': len(chat_files),
+        'total_conversations': total_conversations_matched,
+        'matched_projects': len(project_chat_data),
+        'unmatched_files': len(unmatched_chats),
+        'unmatched_chats': unmatched_chats,
+    }
+
+    return project_chat_data, chat_stats
+
+
+# =============================================================================
+# PROJECT STATUS FILE SCANNING
+# =============================================================================
 
 def find_project_status_files(scan_paths=None, max_depth=2):
     """Find all PROJECT_STATUS.md files in scan paths."""
@@ -596,6 +1034,76 @@ def load_projects(scan_paths=None, verbose=False, chat_history_path=None,
                 without_repos.append(project)
 
     status.done()
+
+    # ---- Chat history integration ----
+    chat_stats = {}
+    if chat_history_path:
+        _progress('reading_chat', 'Loading chat history...')
+        status.update('Loading chat history...')
+        chat_files = load_chat_files(chat_history_path)
+        status.done()
+
+        if chat_files:
+            _progress('matching', f'Matching {len(chat_files)} conversations to projects...')
+            status.update(f'Matching {len(chat_files)} conversations to projects...')
+            chat_project_data, chat_stats = match_chat_to_projects(
+                chat_files, all_projects, verbose=verbose,
+                progress_callback=progress_callback,
+            )
+            status.done()
+
+            if verbose:
+                print(f"\n  Loaded {len(chat_files)} conversations")
+                print(f"  Matched to {chat_stats['matched_projects']} projects")
+                print(f"  {chat_stats['unmatched_files']} unmatched")
+
+            # Merge chat data into project timelines
+            for project in all_projects:
+                name = project.get('name', '')
+                chat_data = chat_project_data.get(name)
+                if chat_data:
+                    existing_timeline = project.get('timeline', [])
+
+                    # Add chat timeline entries (deduped against existing)
+                    for entry in chat_data.get('timeline_entries', []):
+                        is_redundant = any(
+                            entry['date'] == e['date'] and
+                            _overlap_ratio(entry['text'], e['text']) > 0.4
+                            for e in existing_timeline
+                        )
+                        if not is_redundant:
+                            existing_timeline.append(entry)
+
+                    # Add per-conversation entries
+                    for entry in chat_data.get('conversation_entries', []):
+                        existing_timeline.append(entry)
+
+                    # Re-sort timeline
+                    existing_timeline.sort(
+                        key=lambda e: e.get('date', ''), reverse=True
+                    )
+                    project['timeline'] = existing_timeline
+
+                    # Update last_worked if chat has newer dates
+                    chat_dates = [e['date'] for e in existing_timeline
+                                  if e.get('date') and 'Chat' in e.get('source', '')]
+                    if chat_dates:
+                        newest_chat = max(chat_dates)
+                        if newest_chat > project.get('last_worked', ''):
+                            project['last_worked'] = newest_chat
+
+                    # Store snippets for narrative building
+                    project['_chat_snippets'] = chat_data.get('snippets', [])
+        else:
+            chat_stats = {
+                'total_files': 0, 'total_conversations': 0,
+                'matched_projects': 0, 'unmatched_files': 0,
+                'unmatched_chats': [],
+            }
+
+    # Store chat_stats as function attribute so web_app can access it
+    load_projects._last_chat_stats = chat_stats
+
     _progress('done', f'Loaded {len(all_projects)} projects')
 
     if flat:

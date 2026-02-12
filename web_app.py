@@ -167,7 +167,7 @@ Conversations:
     # Save results
     if all_results:
         initiatives = _load_initiatives()
-        initiatives['last_classified'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+        initiatives['last_classified'] = datetime.now(CENTRAL_TZ).strftime('%Y-%m-%d %H:%M')
         initiatives['results'] = all_results
         initiatives['total_unmatched'] = len(unmatched_chats)
         _save_initiatives(initiatives)
@@ -911,9 +911,9 @@ DASHBOARD_HTML = """
             {% endif %}
             <form method="POST" action="/upload" enctype="multipart/form-data">
                 <div class="drop-zone" id="dropZone">
-                    <p>Drag & drop a chat export zip, or click to browse</p>
+                    <p>Drag & drop a Claude.ai export (.dms or .zip), or click to browse</p>
                     <p class="filename" id="fileName"></p>
-                    <input type="file" name="chat_history" id="fileInput" accept=".zip,.md,.txt">
+                    <input type="file" name="chat_history" id="fileInput" accept=".zip,.dms,.md,.txt,.json">
                 </div>
                 <label for="scan_paths">Scan Paths</label>
                 <input type="text" name="scan_paths" id="scanPaths" value="{{ scan_paths }}" placeholder="~ ~/projects">
@@ -1830,7 +1830,7 @@ def upload():
         print(f"Chat history uploaded: {save_path}")
 
         meta = _load_import_meta()
-        meta['last_import'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+        meta['last_import'] = datetime.now(CENTRAL_TZ).strftime('%Y-%m-%d %H:%M')
         meta['last_file'] = chat_file.filename
         _save_import_meta(meta)
 
@@ -2717,7 +2717,7 @@ Conversations:
 
     # Save results for the UI
     initiatives = _load_initiatives()
-    initiatives['last_classified'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+    initiatives['last_classified'] = datetime.now(CENTRAL_TZ).strftime('%Y-%m-%d %H:%M')
     initiatives['results'] = all_results
     initiatives['total_unmatched'] = len(unmatched)
     _save_initiatives(initiatives)
