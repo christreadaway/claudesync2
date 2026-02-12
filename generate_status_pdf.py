@@ -18,6 +18,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -70,60 +71,238 @@ CATEGORY_MAP = {
 # CHAT HISTORY INTEGRATION
 # =============================================================================
 
+def _extract_conversations_from_json(text, filename, fallback_date=None):
+    """Parse a JSON file that may contain multiple conversations.
+
+    Handles Claude.ai export format (array of conversation objects)
+    as well as single conversation objects.  Returns a list of
+    {filename, content, date} dicts — one per conversation.
+    """
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        # Not valid JSON — treat as plain text
+        return [{'filename': filename, 'content': text, 'date': fallback_date}]
+
+    conversations = []
+
+    # Claude.ai export: top-level list of conversation objects
+    if isinstance(data, list):
+        for i, item in enumerate(data):
+            if isinstance(item, dict):
+                conv = _parse_single_conversation(item, i, filename, fallback_date)
+                if conv:
+                    conversations.append(conv)
+    elif isinstance(data, dict):
+        # Single conversation object, or wrapper with a list inside
+        for key in ('conversations', 'chat_messages', 'data', 'items', 'results'):
+            if key in data and isinstance(data[key], list):
+                for i, item in enumerate(data[key]):
+                    if isinstance(item, dict):
+                        conv = _parse_single_conversation(item, i, filename, fallback_date)
+                        if conv:
+                            conversations.append(conv)
+                break
+        else:
+            # It's a single conversation dict
+            conv = _parse_single_conversation(data, 0, filename, fallback_date)
+            if conv:
+                conversations.append(conv)
+
+    if not conversations:
+        # Fallback: treat the raw text as one conversation
+        conversations.append({'filename': filename, 'content': text, 'date': fallback_date})
+
+    return conversations
+
+
+def _parse_single_conversation(obj, index, parent_filename, fallback_date):
+    """Extract a single conversation from a JSON object.
+
+    Handles multiple Claude.ai export variants and generic chat formats.
+    """
+    # Build a readable name
+    name = (obj.get('name') or obj.get('title') or
+            obj.get('conversation_name') or obj.get('subject') or '')
+    if not name:
+        name = f'{os.path.splitext(parent_filename)[0]}_{index + 1}'
+    # Sanitize for use as a filename-like key
+    safe_name = re.sub(r'[^\w\s-]', '', name).strip()[:80] or f'conversation_{index + 1}'
+
+    # Extract date
+    conv_date = fallback_date
+    for date_key in ('created_at', 'updated_at', 'date', 'timestamp', 'created', 'create_time'):
+        raw = obj.get(date_key)
+        if raw:
+            try:
+                if isinstance(raw, (int, float)):
+                    conv_date = datetime.fromtimestamp(raw)
+                else:
+                    # Try ISO 8601 first, then common formats
+                    for fmt in ('%Y-%m-%dT%H:%M:%S.%fZ', '%Y-%m-%dT%H:%M:%SZ',
+                                '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+                        try:
+                            conv_date = datetime.strptime(str(raw)[:26], fmt)
+                            break
+                        except ValueError:
+                            continue
+            except Exception:
+                pass
+            if conv_date != fallback_date:
+                break
+
+    # Extract message text — handles several common structures
+    text_parts = []
+
+    # Claude.ai format: chat_messages list with sender + text
+    messages = (obj.get('chat_messages') or obj.get('messages') or
+                obj.get('mapping') or obj.get('content') or [])
+
+    if isinstance(messages, list):
+        for msg in messages:
+            if isinstance(msg, dict):
+                role = (msg.get('sender') or msg.get('role') or
+                        msg.get('author', {}).get('role', '') if isinstance(msg.get('author'), dict) else
+                        msg.get('author', ''))
+                # Get text content
+                body = msg.get('text', '')
+                if not body:
+                    # OpenAI/generic format: content can be string or list
+                    body = msg.get('content', '')
+                    if isinstance(body, list):
+                        body = ' '.join(
+                            part.get('text', '') if isinstance(part, dict) else str(part)
+                            for part in body
+                        )
+                if body and isinstance(body, str):
+                    prefix = 'Human' if role in ('human', 'user') else 'Assistant' if role in ('assistant', 'bot', 'claude') else ''
+                    if prefix:
+                        text_parts.append(f'{prefix}: {body}')
+                    else:
+                        text_parts.append(body)
+            elif isinstance(msg, str):
+                text_parts.append(msg)
+    elif isinstance(messages, dict):
+        # OpenAI mapping format (dict of node IDs)
+        for node in messages.values():
+            if isinstance(node, dict) and 'message' in node:
+                m = node['message']
+                if isinstance(m, dict):
+                    role = m.get('author', {}).get('role', '') if isinstance(m.get('author'), dict) else ''
+                    content = m.get('content', {})
+                    if isinstance(content, dict):
+                        parts = content.get('parts', [])
+                        body = ' '.join(str(p) for p in parts if isinstance(p, str))
+                    elif isinstance(content, str):
+                        body = content
+                    else:
+                        body = ''
+                    if body:
+                        prefix = 'Human' if role == 'user' else 'Assistant' if role == 'assistant' else ''
+                        text_parts.append(f'{prefix}: {body}' if prefix else body)
+
+    full_text = '\n\n'.join(text_parts)
+
+    # If no messages extracted, try to use the whole object as text
+    if not full_text.strip():
+        # Maybe the conversation text is in a top-level field
+        for text_key in ('text', 'body', 'transcript', 'content'):
+            val = obj.get(text_key)
+            if isinstance(val, str) and len(val) > 20:
+                full_text = val
+                break
+
+    if not full_text.strip():
+        return None
+
+    return {
+        'filename': f'{safe_name}.json',
+        'content': full_text,
+        'date': conv_date,
+    }
+
+
 def load_chat_files(chat_path):
-    """Load text content from a zip file, directory, or single file."""
+    """Load text content from a zip file, directory, or single file.
+
+    Handles Claude.ai JSON exports (with multiple conversations in one file),
+    as well as plain .md/.txt files with one conversation each.
+    """
     chat_files = []
     if chat_path is None:
         return chat_files
 
     chat_path = os.path.expanduser(chat_path)
 
+    raw_files = []  # List of (filename, text, date) tuples
+
     if zipfile.is_zipfile(chat_path):
         with zipfile.ZipFile(chat_path, 'r') as zf:
             for name in zf.namelist():
-                if name.endswith(('.md', '.txt', '.json')):
-                    try:
-                        raw = zf.read(name)
-                        text = raw.decode('utf-8', errors='replace')
-                        # Try to get file modification time from zip
-                        info = zf.getinfo(name)
-                        mod_time = datetime(*info.date_time) if info.date_time else None
-                        chat_files.append({
-                            'filename': os.path.basename(name),
-                            'content': text,
-                            'date': mod_time,
-                        })
-                    except Exception:
-                        continue
+                # Skip directories and hidden files
+                basename = os.path.basename(name)
+                if not basename or basename.startswith('.'):
+                    continue
+                # Accept common text/data formats
+                lower = basename.lower()
+                if not lower.endswith(('.md', '.txt', '.json', '.jsonl', '.csv', '.yaml', '.yml')):
+                    continue
+                try:
+                    raw = zf.read(name)
+                    text = raw.decode('utf-8', errors='replace')
+                    info = zf.getinfo(name)
+                    mod_time = datetime(*info.date_time) if info.date_time else None
+                    raw_files.append((basename, text, mod_time))
+                except Exception:
+                    continue
     elif os.path.isdir(chat_path):
         for root, _dirs, files in os.walk(chat_path):
             for fname in files:
-                if fname.endswith(('.md', '.txt', '.json')):
-                    fpath = os.path.join(root, fname)
-                    try:
-                        with open(fpath, 'r', errors='replace') as f:
-                            text = f.read()
-                        mod_time = datetime.fromtimestamp(os.path.getmtime(fpath))
-                        chat_files.append({
-                            'filename': fname,
-                            'content': text,
-                            'date': mod_time,
-                        })
-                    except Exception:
-                        continue
+                if fname.startswith('.'):
+                    continue
+                lower = fname.lower()
+                if not lower.endswith(('.md', '.txt', '.json', '.jsonl', '.csv', '.yaml', '.yml')):
+                    continue
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, 'r', errors='replace') as f:
+                        text = f.read()
+                    mod_time = datetime.fromtimestamp(os.path.getmtime(fpath))
+                    raw_files.append((fname, text, mod_time))
+                except Exception:
+                    continue
     else:
         try:
             with open(chat_path, 'r', errors='replace') as f:
                 text = f.read()
             mod_time = datetime.fromtimestamp(os.path.getmtime(chat_path))
-            chat_files.append({
-                'filename': os.path.basename(chat_path),
-                'content': text,
-                'date': mod_time,
-            })
+            raw_files.append((os.path.basename(chat_path), text, mod_time))
         except Exception:
             pass
 
+    # Now split JSON files that contain multiple conversations
+    for filename, text, mod_time in raw_files:
+        if filename.lower().endswith(('.json', '.jsonl')):
+            if filename.lower().endswith('.jsonl'):
+                # JSONL: one JSON object per line
+                for line_num, line in enumerate(text.splitlines()):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    convs = _extract_conversations_from_json(line, f'{filename}_L{line_num + 1}', mod_time)
+                    chat_files.extend(convs)
+            else:
+                convs = _extract_conversations_from_json(text, filename, mod_time)
+                chat_files.extend(convs)
+        else:
+            # Plain text file — one conversation per file
+            chat_files.append({
+                'filename': filename,
+                'content': text,
+                'date': mod_time,
+            })
+
+    print(f"  Extracted {len(chat_files)} conversations from {len(raw_files)} files")
     return chat_files
 
 

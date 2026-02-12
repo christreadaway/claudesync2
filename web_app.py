@@ -2864,6 +2864,7 @@ Projects:
 
 
 INITIATIVE_FILE = os.path.expanduser('~/.claudesync_initiatives.json')
+DISMISSED_CHATS_FILE = os.path.expanduser('~/.claudesync_dismissed_chats.json')
 
 
 def _load_initiatives():
@@ -2879,6 +2880,24 @@ def _load_initiatives():
 def _save_initiatives(data):
     with open(INITIATIVE_FILE, 'w') as f:
         json.dump(data, f, indent=2)
+
+
+def _load_dismissed_chats():
+    """Load set of dismissed (ignored) chat filenames."""
+    if os.path.exists(DISMISSED_CHATS_FILE):
+        try:
+            with open(DISMISSED_CHATS_FILE, 'r') as f:
+                data = json.load(f)
+                return set(data.get('dismissed', []))
+        except Exception:
+            pass
+    return set()
+
+
+def _save_dismissed_chats(dismissed):
+    """Save dismissed chat filenames to disk."""
+    with open(DISMISSED_CHATS_FILE, 'w') as f:
+        json.dump({'dismissed': sorted(dismissed)}, f, indent=2)
 
 
 @app.route('/api/classify-unmatched', methods=['POST'])
@@ -2982,28 +3001,109 @@ Conversations:
     })
 
 
+@app.route('/api/dismiss-chat', methods=['POST'])
+def api_dismiss_chat():
+    """Dismiss (ignore) an unmatched chat so it no longer shows up."""
+    data = request.get_json(force=True)
+    filename = data.get('filename', '')
+    if not filename:
+        return jsonify({'error': 'filename required'}), 400
+
+    dismissed = _load_dismissed_chats()
+    dismissed.add(filename)
+    _save_dismissed_chats(dismissed)
+    return jsonify({'ok': True, 'dismissed_count': len(dismissed)})
+
+
+@app.route('/api/restore-chat', methods=['POST'])
+def api_restore_chat():
+    """Restore a previously dismissed chat."""
+    data = request.get_json(force=True)
+    filename = data.get('filename', '')
+    if not filename:
+        return jsonify({'error': 'filename required'}), 400
+
+    dismissed = _load_dismissed_chats()
+    dismissed.discard(filename)
+    _save_dismissed_chats(dismissed)
+    return jsonify({'ok': True, 'dismissed_count': len(dismissed)})
+
+
+@app.route('/api/assign-chat', methods=['POST'])
+def api_assign_chat():
+    """Assign an unmatched chat to an existing project."""
+    data = request.get_json(force=True)
+    filename = data.get('filename', '')
+    project_name = data.get('project', '')
+    if not filename or not project_name:
+        return jsonify({'error': 'filename and project required'}), 400
+
+    # Update the initiatives file to record the assignment
+    initiatives = _load_initiatives()
+    if 'assigned' not in initiatives:
+        initiatives['assigned'] = {}
+    initiatives['assigned'][filename] = {
+        'project': project_name,
+        'assigned_at': _format_timestamp(),
+    }
+    _save_initiatives(initiatives)
+
+    # Also dismiss it from the unmatched view
+    dismissed = _load_dismissed_chats()
+    dismissed.add(filename)
+    _save_dismissed_chats(dismissed)
+
+    return jsonify({'ok': True, 'assigned_to': project_name})
+
+
+@app.route('/api/dismiss-chat/bulk', methods=['POST'])
+def api_dismiss_chat_bulk():
+    """Dismiss multiple chats at once (e.g., all skipped chats)."""
+    data = request.get_json(force=True)
+    filenames = data.get('filenames', [])
+    if not filenames:
+        return jsonify({'error': 'filenames list required'}), 400
+
+    dismissed = _load_dismissed_chats()
+    for fn in filenames:
+        dismissed.add(fn)
+    _save_dismissed_chats(dismissed)
+    return jsonify({'ok': True, 'dismissed_count': len(dismissed)})
+
+
 @app.route('/view/unmatched')
 def view_unmatched():
-    """Show unmatched chat conversations and AI classification results."""
+    """Show unmatched chat conversations with assign/dismiss actions."""
     chat_stats = getattr(load_projects, '_last_chat_stats', {})
     unmatched = chat_stats.get('unmatched_chats', [])
     initiatives = _load_initiatives()
     ai_results = initiatives.get('results', [])
+    assigned = initiatives.get('assigned', {})
     ai_config = _load_ai_config()
     has_ai = bool(ai_config.get('api_key'))
+    dismissed = _load_dismissed_chats()
+
+    # Build project list for the assign dropdown
+    projects = _get_projects()
+    project_names = sorted(set(p.get('name', '') for p in projects if p.get('name')))
 
     # Build lookup from AI results
     classified = {}
     for r in ai_results:
         classified[r.get('idx', -1)] = r
 
-    # Group by suggested initiative
+    # Filter out dismissed chats and group the rest
     by_initiative = defaultdict(list)
     unclassified = []
     skipped = []
     matched_to_existing = []
+    dismissed_list = []
 
     for i, chat in enumerate(unmatched):
+        fn = chat.get('filename', '')
+        if fn in dismissed:
+            dismissed_list.append({**chat, 'idx': i, 'assigned_to': assigned.get(fn, {}).get('project', '')})
+            continue
         c = classified.get(i)
         if c:
             if c['action'] == 'match':
@@ -3018,13 +3118,14 @@ def view_unmatched():
     content = ''
 
     # Stats bar
+    visible_total = len(unmatched) - len(dismissed_list)
     total = len(unmatched)
     classified_count = len(ai_results)
     new_initiatives = len(by_initiative)
     content += f'''<div style="display:flex; gap:16px; margin-bottom:20px; flex-wrap:wrap;">
         <div style="background:var(--stat-bg); padding:12px 20px; border-radius:8px; flex:1; min-width:120px; text-align:center;">
-            <div style="font-size:24px; font-weight:700; color:var(--heading);">{total}</div>
-            <div style="font-size:11px; color:var(--text-muted);">Unmatched Conversations</div>
+            <div style="font-size:24px; font-weight:700; color:var(--heading);">{visible_total}</div>
+            <div style="font-size:11px; color:var(--text-muted);">Active Unmatched</div>
         </div>
         <div style="background:var(--stat-bg); padding:12px 20px; border-radius:8px; flex:1; min-width:120px; text-align:center;">
             <div style="font-size:24px; font-weight:700; color:var(--heading);">{new_initiatives}</div>
@@ -3035,21 +3136,53 @@ def view_unmatched():
             <div style="font-size:11px; color:var(--text-muted);">Matched to Existing</div>
         </div>
         <div style="background:var(--stat-bg); padding:12px 20px; border-radius:8px; flex:1; min-width:120px; text-align:center;">
-            <div style="font-size:24px; font-weight:700; color:var(--heading);">{len(skipped)}</div>
-            <div style="font-size:11px; color:var(--text-muted);">Skipped (small talk)</div>
+            <div style="font-size:24px; font-weight:700; color:#2ECC71;">{len(dismissed_list)}</div>
+            <div style="font-size:11px; color:var(--text-muted);">Dismissed / Assigned</div>
         </div>
     </div>'''
 
+    # Build project options for assign dropdown
+    project_options = ''.join(f'<option value="{name}">{name}</option>' for name in project_names)
+
+    def _chat_item_html(chat, show_actions=True, extra_class='', extra_info=''):
+        """Render a single chat item row with action buttons."""
+        fn = chat['filename'].replace("'", "\\'").replace('"', '&quot;')
+        fn_display = chat['filename']
+        excerpt = (chat.get('excerpt', '') or '')[:150]
+        date = chat.get('date', 'Unknown')
+        row_id = f'chat-row-{chat.get("idx", 0)}'
+
+        actions = ''
+        if show_actions:
+            actions = f'''<div class="actions" style="flex-shrink:0; display:flex; gap:4px; align-items:center; flex-wrap:wrap;">
+                <select class="assign-select" data-filename="{fn}" onchange="assignChat(this)"
+                    style="font-size:10px; padding:3px 6px; border:1px solid var(--border); border-radius:4px; background:var(--input-bg); color:var(--text); max-width:140px;">
+                    <option value="">Assign to...</option>
+                    {project_options}
+                </select>
+                <button class="btn-sm" style="border-color:#e67e22; color:#e67e22; font-size:10px;"
+                    onclick="dismissChat('{fn}', this)">Dismiss</button>
+            </div>'''
+
+        return f'''<div class="list-item" id="{row_id}" style="{extra_class}">
+            <div class="main">
+                <div class="title" style="font-size:12px;">{fn_display}</div>
+                <div class="subtitle">{date}{extra_info}</div>
+                <div class="detail">{excerpt}</div>
+            </div>
+            {actions}
+        </div>'''
+
     # Classify button
-    if has_ai and total > 0:
+    if has_ai and visible_total > 0:
         if classified_count == 0:
             content += '<div style="margin-bottom:16px;"><button class="btn-sm btn-verify" onclick="classifyUnmatched(this)" style="padding:8px 18px; font-size:12px;">Classify with AI</button></div>'
         else:
             content += f'<div style="margin-bottom:16px; font-size:11px; color:var(--text-muted);">Last classified: {initiatives.get("last_classified", "never")} &mdash; <button class="btn-sm btn-verify" onclick="classifyUnmatched(this)" style="padding:4px 10px; font-size:10px;">Re-classify</button></div>'
-    elif total == 0:
+    elif visible_total == 0 and len(dismissed_list) == 0:
         content += '<div class="empty">No unmatched conversations. Upload chat history first, or all conversations were matched to projects.</div>'
-    elif not has_ai:
-        content += '<div style="margin-bottom:16px; font-size:12px; color:var(--text-muted);">Configure an API key in AI Settings to classify these conversations.</div>'
+    elif not has_ai and visible_total > 0:
+        content += '<div style="margin-bottom:16px; font-size:12px; color:var(--text-muted);">Configure an API key in <a href="/settings">Settings</a> to auto-classify these conversations.</div>'
 
     # New initiatives suggested by AI
     if by_initiative:
@@ -3062,87 +3195,190 @@ def view_unmatched():
                         <div class="subtitle">{len(chats)} conversation{"s" if len(chats) != 1 else ""}</div>
                     </div>
                 </div>'''
-            for chat in chats[:10]:  # Show first 10
-                content += f'''<div class="list-item">
-                    <div class="main">
-                        <div class="title" style="font-size:12px;">{chat["filename"]}</div>
-                        <div class="subtitle">{chat["date"]}</div>
-                        <div class="detail">{chat.get("excerpt", "")[:120]}</div>
-                    </div>
-                </div>'''
-            if len(chats) > 10:
-                content += f'<div class="list-item"><div class="main"><div class="subtitle">...and {len(chats) - 10} more</div></div></div>'
+            for chat in chats[:15]:
+                content += _chat_item_html(chat)
+            if len(chats) > 15:
+                content += f'<div class="list-item"><div class="main"><div class="subtitle">...and {len(chats) - 15} more</div></div></div>'
             content += '</div>'
 
     # Matched to existing projects
     if matched_to_existing:
-        content += f'<div class="section-header">Matched to Existing Initiatives <span class="badge">{len(matched_to_existing)}</span></div>'
-        # Group by initiative
+        content += f'<div class="section-header">Matched to Existing Projects <span class="badge">{len(matched_to_existing)}</span></div>'
         by_existing = defaultdict(list)
         for item in matched_to_existing:
             by_existing[item['initiative']].append(item)
-        content += '<div class="list-card">'
         for init_name, items in sorted(by_existing.items()):
-            content += f'''<div class="list-item" style="background:var(--stat-bg);">
-                <div class="main">
-                    <div class="title" style="font-size:13px;">{init_name}</div>
-                    <div class="subtitle">{len(items)} conversation{"s" if len(items) != 1 else ""}</div>
-                </div>
-            </div>'''
-        content += '</div>'
+            content += f'''<div class="list-card" style="margin-bottom:12px;">
+                <div class="list-item" style="background:var(--stat-bg); padding:10px 18px;">
+                    <div class="main">
+                        <div class="title" style="font-size:13px;">{init_name}</div>
+                        <div class="subtitle">{len(items)} conversation{"s" if len(items) != 1 else ""}</div>
+                    </div>
+                </div>'''
+            for chat in items[:10]:
+                content += _chat_item_html(chat)
+            if len(items) > 10:
+                content += f'<div class="list-item"><div class="main"><div class="subtitle">...and {len(items) - 10} more</div></div></div>'
+            content += '</div>'
 
     # Unclassified (not yet sent to AI)
     if unclassified:
         content += f'<div class="section-header">Not Yet Classified <span class="badge">{len(unclassified)}</span></div>'
         content += '<div class="list-card">'
-        for chat in unclassified[:20]:
-            content += f'''<div class="list-item">
-                <div class="main">
-                    <div class="title" style="font-size:12px;">{chat["filename"]}</div>
-                    <div class="subtitle">{chat["date"]}</div>
-                    <div class="detail">{chat.get("excerpt", "")[:120]}</div>
-                </div>
-            </div>'''
-        if len(unclassified) > 20:
-            content += f'<div class="list-item"><div class="main"><div class="subtitle">...and {len(unclassified) - 20} more</div></div></div>'
+        for chat in unclassified[:30]:
+            content += _chat_item_html(chat)
+        if len(unclassified) > 30:
+            content += f'<div class="list-item"><div class="main"><div class="subtitle">...and {len(unclassified) - 30} more</div></div></div>'
         content += '</div>'
 
-    # Skipped
+    # Skipped by AI
     if skipped:
-        content += f'<div class="section-header">Skipped (Small Talk / Greetings) <span class="badge">{len(skipped)}</span></div>'
-        content += '<div class="list-card">'
-        for chat in skipped[:10]:
-            content += f'''<div class="list-item item-ignored">
-                <div class="main">
-                    <div class="title" style="font-size:12px;">{chat["filename"]}</div>
-                    <div class="subtitle">{chat["date"]}</div>
-                </div>
-            </div>'''
-        if len(skipped) > 10:
-            content += f'<div class="list-item"><div class="main"><div class="subtitle">...and {len(skipped) - 10} more</div></div></div>'
+        content += f'''<div class="section-header">Skipped (Small Talk / Greetings) <span class="badge">{len(skipped)}</span>
+            <button class="btn-sm" style="margin-left:12px; border-color:#e67e22; color:#e67e22; font-size:10px;"
+                onclick="dismissAllSkipped()">Dismiss All Skipped</button>
+        </div>'''
+        content += '<div class="list-card" id="skippedCard">'
+        for chat in skipped[:15]:
+            content += _chat_item_html(chat, extra_class='opacity:0.7;')
+        if len(skipped) > 15:
+            content += f'<div class="list-item"><div class="main"><div class="subtitle">...and {len(skipped) - 15} more</div></div></div>'
         content += '</div>'
 
-    # JS for classify button
-    content += '''
+    # Dismissed / Assigned section (collapsed by default)
+    if dismissed_list:
+        content += f'''<div class="section-header" style="cursor:pointer;" onclick="toggleDismissed()">
+            Dismissed / Assigned <span class="badge">{len(dismissed_list)}</span>
+            <span id="dismissedToggle" style="font-size:10px; margin-left:8px; color:var(--text-muted);">Show</span>
+        </div>'''
+        content += '<div class="list-card" id="dismissedCard" style="display:none;">'
+        for chat in dismissed_list[:30]:
+            assigned_info = f' &mdash; Assigned to: <strong>{chat["assigned_to"]}</strong>' if chat.get('assigned_to') else ''
+            content += f'''<div class="list-item" style="opacity:0.5;">
+                <div class="main">
+                    <div class="title" style="font-size:12px;">{chat["filename"]}</div>
+                    <div class="subtitle">{chat.get("date", "Unknown")}{assigned_info}</div>
+                </div>
+                <div class="actions">
+                    <button class="btn-sm" style="border-color:#2ECC71; color:#2ECC71; font-size:10px;"
+                        onclick="restoreChat('{chat['filename'].replace(chr(39), chr(92)+chr(39))}', this)">Restore</button>
+                </div>
+            </div>'''
+        if len(dismissed_list) > 30:
+            content += f'<div class="list-item"><div class="main"><div class="subtitle">...and {len(dismissed_list) - 30} more</div></div></div>'
+        content += '</div>'
+
+    # Build JS for skipped filenames (for bulk dismiss)
+    skipped_fns_json = json.dumps([c['filename'] for c in skipped])
+
+    # JS for all actions
+    content += f'''
     <script>
-    function classifyUnmatched(btn) {
+    function classifyUnmatched(btn) {{
         btn.disabled = true;
         btn.textContent = 'Classifying...';
-        fetch('/api/classify-unmatched', { method: 'POST' })
+        fetch('/api/classify-unmatched', {{ method: 'POST' }})
         .then(r => r.json())
-        .then(function(data) {
-            if (data.error) {
-                btn.textContent = data.error;
-            } else {
-                location.reload();
-            }
-        })
-        .catch(function() { btn.textContent = 'Failed'; });
-    }
+        .then(function(data) {{
+            if (data.error) {{ btn.textContent = data.error; }}
+            else {{ location.reload(); }}
+        }})
+        .catch(function() {{ btn.textContent = 'Failed'; }});
+    }}
+
+    function dismissChat(filename, btn) {{
+        btn.disabled = true;
+        btn.textContent = 'Dismissing...';
+        fetch('/api/dismiss-chat', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{ filename: filename }})
+        }})
+        .then(r => r.json())
+        .then(function(data) {{
+            if (data.ok) {{
+                var row = btn.closest('.list-item');
+                row.style.opacity = '0.3';
+                row.style.transition = 'opacity 0.3s';
+                setTimeout(function() {{ row.remove(); }}, 400);
+            }} else {{
+                btn.textContent = 'Error';
+                btn.disabled = false;
+            }}
+        }});
+    }}
+
+    function restoreChat(filename, btn) {{
+        btn.disabled = true;
+        btn.textContent = 'Restoring...';
+        fetch('/api/restore-chat', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{ filename: filename }})
+        }})
+        .then(r => r.json())
+        .then(function(data) {{
+            if (data.ok) {{ location.reload(); }}
+            else {{ btn.textContent = 'Error'; btn.disabled = false; }}
+        }});
+    }}
+
+    function assignChat(select) {{
+        var project = select.value;
+        var filename = select.dataset.filename;
+        if (!project) return;
+        select.disabled = true;
+        fetch('/api/assign-chat', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{ filename: filename, project: project }})
+        }})
+        .then(r => r.json())
+        .then(function(data) {{
+            if (data.ok) {{
+                var row = select.closest('.list-item');
+                row.style.background = 'rgba(46,204,113,0.1)';
+                var main = row.querySelector('.main');
+                main.innerHTML += '<div style="font-size:11px; color:#2ECC71; font-weight:600; margin-top:4px;">Assigned to ' + project + '</div>';
+                var actions = row.querySelector('.actions');
+                if (actions) actions.remove();
+                setTimeout(function() {{ row.style.opacity = '0.3'; }}, 1500);
+            }} else {{
+                select.disabled = false;
+                alert(data.error || 'Failed to assign');
+            }}
+        }});
+    }}
+
+    function dismissAllSkipped() {{
+        var filenames = {skipped_fns_json};
+        if (!filenames.length) return;
+        if (!confirm('Dismiss all ' + filenames.length + ' skipped conversations?')) return;
+        fetch('/api/dismiss-chat/bulk', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{ filenames: filenames }})
+        }})
+        .then(r => r.json())
+        .then(function(data) {{
+            if (data.ok) {{ location.reload(); }}
+        }});
+    }}
+
+    function toggleDismissed() {{
+        var card = document.getElementById('dismissedCard');
+        var toggle = document.getElementById('dismissedToggle');
+        if (card.style.display === 'none') {{
+            card.style.display = '';
+            toggle.textContent = 'Hide';
+        }} else {{
+            card.style.display = 'none';
+            toggle.textContent = 'Show';
+        }}
+    }}
     </script>'''
 
     return render_template_string(LIST_VIEW_HTML,
-                                  title=f'Unmatched Conversations ({total})',
+                                  title=f'Unmatched Conversations ({visible_total})',
                                   content=content)
 
 
