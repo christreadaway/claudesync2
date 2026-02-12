@@ -704,7 +704,7 @@ DASHBOARD_HTML = """
         .btn-cancel { background: var(--stat-bg); color: var(--text-secondary); }
         .btn-cancel:hover { background: var(--progress-bg); }
         /* Non-blocking progress banner */
-        .progress-banner { display: none; background: var(--bar-bg); border-bottom: 1px solid rgba(52,152,219,0.3); padding: 8px 24px 4px; }
+        .progress-banner { display: none; background: var(--bar-bg); border-bottom: 1px solid rgba(52,152,219,0.3); padding: 8px 24px 4px; position: sticky; top: 0; z-index: 90; }
         .progress-banner.show { display: block; }
         .progress-banner-inner { display: flex; align-items: center; gap: 10px; }
         .progress-spinner { width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.2); border-top-color: #3498DB; border-radius: 50%; animation: spin 0.8s linear infinite; flex-shrink: 0; }
@@ -739,6 +739,16 @@ DASHBOARD_HTML = """
             <button class="btn" style="background:#8e44ad;" onclick="document.getElementById('aiModal').classList.add('show')">AI Settings</button>
             <a href="/generate-pdf" class="btn btn-pdf">Generate PDF</a>
         </div>
+    </div>
+
+    <!-- Progress Banner (sticky, right below top bar) -->
+    <div class="progress-banner" id="progressBanner">
+        <div class="progress-banner-inner">
+            <div class="progress-spinner"></div>
+            <span class="progress-step" id="progressStep"></span>
+            <span class="progress-detail" id="progressDetail"></span>
+        </div>
+        <div class="progress-track"><div class="progress-track-fill" id="progressFill"></div></div>
     </div>
 
     <div class="container">
@@ -861,16 +871,6 @@ DASHBOARD_HTML = """
         </footer>
     </div>
 
-    <!-- Progress Bar (non-blocking, in top nav) -->
-    <div class="progress-banner" id="progressBanner">
-        <div class="progress-banner-inner">
-            <div class="progress-spinner"></div>
-            <span class="progress-step" id="progressStep"></span>
-            <span class="progress-detail" id="progressDetail"></span>
-        </div>
-        <div class="progress-track"><div class="progress-track-fill" id="progressFill"></div></div>
-    </div>
-
     <!-- Upload Modal -->
     <div class="modal-overlay" id="uploadModal">
         <div class="modal">
@@ -953,6 +953,9 @@ DASHBOARD_HTML = """
         function aiPromptAccept() {
             var key = document.getElementById('ai_prompt_key').value.trim();
             if (!key) { document.getElementById('ai_prompt_key').style.borderColor = '#E74C3C'; return; }
+            var okBtn = document.getElementById('aiPromptOk');
+            okBtn.textContent = 'Saving key...';
+            okBtn.disabled = true;
             // Save the key
             fetch('/api/ai-config', {
                 method: 'POST',
@@ -961,12 +964,21 @@ DASHBOARD_HTML = """
             })
             .then(function(r) { return r.json(); })
             .then(function() {
-                document.getElementById('aiPromptModal').classList.remove('show');
-                if (_pendingFormData) {
-                    _pendingFormData.set('ai_analyze', '1');
-                    submitUpload(_pendingFormData);
-                    _pendingFormData = null;
-                }
+                okBtn.textContent = 'Key saved!';
+                okBtn.style.background = '#2ECC71';
+                setTimeout(function() {
+                    document.getElementById('aiPromptModal').classList.remove('show');
+                    if (_pendingFormData) {
+                        _pendingFormData.set('ai_analyze', '1');
+                        submitUpload(_pendingFormData);
+                        _pendingFormData = null;
+                    }
+                }, 800);
+            })
+            .catch(function() {
+                okBtn.textContent = 'Failed — try again';
+                okBtn.style.background = '#E74C3C';
+                okBtn.disabled = false;
             });
         }
 
@@ -994,11 +1006,25 @@ DASHBOARD_HTML = """
             };
             var key = document.getElementById('ai_key').value;
             if (key) body.api_key = key;
+            var saveBtn = document.querySelector('#aiModal .btn[style*="8e44ad"]');
+            saveBtn.textContent = 'Saving...';
+            saveBtn.disabled = true;
             fetch('/api/ai-config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) })
             .then(r => r.json())
             .then(function() {
-                document.getElementById('aiModal').classList.remove('show');
-                location.reload();
+                saveBtn.textContent = 'Saved!';
+                saveBtn.style.background = '#2ECC71';
+                saveBtn.style.borderColor = '#2ECC71';
+                saveBtn.style.color = 'white';
+                setTimeout(function() {
+                    document.getElementById('aiModal').classList.remove('show');
+                    location.reload();
+                }, 1200);
+            })
+            .catch(function() {
+                saveBtn.textContent = 'Failed — try again';
+                saveBtn.style.background = '#E74C3C';
+                saveBtn.disabled = false;
             });
         }
 
@@ -1557,7 +1583,16 @@ Be specific and factual. No filler language."""
 def dashboard():
     projects = _get_projects()
     if not projects:
-        projects = _load_cached_projects()
+        # If no background task running, kick one off (non-blocking)
+        with _bg_task['lock']:
+            already_running = _bg_task['running']
+        if not already_running:
+            t = threading.Thread(
+                target=_bg_run_load,
+                args=(_project_cache.get('scan_paths', '~'), None, False),
+                daemon=True,
+            )
+            t.start()
 
     ignored_names = _load_ignored()
     archived_names = _load_archived()
@@ -1891,8 +1926,6 @@ def upload():
 @app.route('/generate-pdf')
 def generate_pdf():
     projects = _get_projects()
-    if not projects:
-        projects = _load_cached_projects()
 
     if not projects:
         flash('No projects found. Upload data first.', 'error')
@@ -2231,7 +2264,15 @@ def view_whats_next():
     """Cross-project view: what needs to happen next for every project."""
     projects = _get_projects()
     if not projects:
-        projects = _load_cached_projects()
+        with _bg_task['lock']:
+            already_running = _bg_task['running']
+        if not already_running:
+            t = threading.Thread(
+                target=_bg_run_load,
+                args=(_project_cache.get('scan_paths', '~'), None, False),
+                daemon=True,
+            )
+            t.start()
 
     ignored = _load_ignored()
     archived = _load_archived()
@@ -2828,15 +2869,19 @@ def view_unmatched():
 
 
 if __name__ == '__main__':
-    print("Pre-loading projects...")
-    _load_cached_projects()
-    total = len(_project_cache['projects'])
-    print(f"Loaded {total} projects")
-
     print("\n" + "="*60)
     print("  Project Portfolio Dashboard")
     print("  Open http://localhost:5111 in your browser")
     print("  Press Ctrl+C to stop")
     print("="*60 + "\n")
+
+    # Kick off initial project load in background so server starts immediately
+    print("Loading projects in background...")
+    t = threading.Thread(
+        target=_bg_run_load,
+        args=('~', None, False),
+        daemon=True,
+    )
+    t.start()
 
     app.run(host='127.0.0.1', port=5111, debug=False)
