@@ -1,4 +1,4 @@
-# Product Spec: Claude Project Sync v7
+# Product Spec: Claude Project Sync v7.1
 
 ## Product Overview
 
@@ -14,6 +14,9 @@
 5. Generates a downloadable PDF report for sharing with Claude.ai
 6. Tracks open threads, blockers, and decisions across all projects
 7. Uses AI to classify unmatched conversations into new or existing initiatives
+8. Lets users manually assign, dismiss, or restore unmatched conversations
+9. Color-codes projects by category for instant visual identification
+10. Displays all timestamps in a configurable timezone (default: Central US)
 
 ---
 
@@ -28,13 +31,13 @@ generate_status_pdf.py — scanner, parser, chat matcher, PDF renderer
         v
 web_app.py — Flask dashboard (localhost:5111)
         |
-        ├── Dashboard (stats, chart, project cards, filters)
+        ├── Dashboard (stats, chart, category-colored project cards, filters)
         ├── Drill-down views (/view/projects, /events, /threads, /blockers)
         ├── What's Next triage (/view/whats-next)
-        ├── Unmatched conversations (/view/unmatched)
+        ├── Unmatched conversations (/view/unmatched) with assign/dismiss
         ├── Project detail pages (/project/<idx>)
-        ├── Upload modal (chat history zip + scan paths)
-        ├── Background processing (threading + progress polling)
+        ├── Settings page (/settings) — timezone, AI config, scan paths
+        ├── Non-blocking background processing (threading + progress polling)
         ├── AI integration (auto when key present, prompt when not)
         └── PDF generation (/generate-pdf)
 ```
@@ -46,7 +49,9 @@ web_app.py — Flask dashboard (localhost:5111)
 - `_ai.json` — API config (url, key, model)
 - `_import_meta.json` — last chat import timestamp + filename
 - `_item_actions.json` — item ignore/reassign decisions (What's Next)
-- `_initiatives.json` — AI classification results for unmatched chats
+- `_initiatives.json` — AI classification results + manual assignments for unmatched chats
+- `_dismissed_chats.json` — user-dismissed/assigned conversation filenames
+- `_settings.json` — dashboard settings (timezone, etc.)
 
 ---
 
@@ -57,15 +62,18 @@ web_app.py — Flask dashboard (localhost:5111)
 **Workflow:**
 1. Developer works in Claude Code — commits happen on `claude/*` branches, `PROJECT_STATUS.md` files get updated
 2. Developer opens `http://localhost:5111` in their browser
-3. Clicks "Upload Chat History" — drops in a Claude.ai export zip + scan paths
-4. **If API key exists:** AI enrichment + initiative classification runs automatically in the background
-5. **If no API key:** A prompt appears asking "Enable AI-Enhanced Results?" with an API key field — OK to save and enable, Skip to proceed without
-6. App stays fully usable during processing — top-nav progress bar shows step-by-step status
-7. Dashboard populates with all projects, activity charts, thread counts, blockers
-8. Clicks into any project for full timeline and open threads
-9. Checks "What's Next" for cross-project triage of all action items
-10. Checks "Unmatched Conversations" to see chat that couldn't be auto-matched + AI suggestions
-11. Clicks "Generate PDF" for a downloadable report to share with Claude.ai
+3. **Server starts instantly** — projects load in background with visible progress banner
+4. Dashboard is browsable immediately — no blocking wait for data
+5. Clicks "Upload Chat History" — drops in a Claude.ai export zip + scan paths
+6. **If API key exists:** AI enrichment + initiative classification runs automatically in the background
+7. **If no API key:** A prompt appears asking "Enable AI-Enhanced Results?" with API key field
+8. **Visible confirmation:** "Key saved!" with green flash when API key is saved
+9. App stays fully usable during processing — sticky progress bar shows step-by-step status
+10. Dashboard populates with category-colored project cards, activity charts, thread counts, blockers
+11. Clicks into any project for full timeline and open threads
+12. Checks "What's Next" for cross-project triage of all action items
+13. Checks "Unmatched Conversations" — assigns chats to projects, dismisses irrelevant ones
+14. Clicks "Generate PDF" for a downloadable report to share with Claude.ai
 
 ---
 
@@ -89,28 +97,44 @@ Each project directory contains a `PROJECT_STATUS.md` with:
 
 Flask app running on `localhost:5111`. Fully local — nothing leaves the machine.
 
+**Startup behavior:**
+- Server starts immediately — no blocking preload
+- Initial project scan runs in background thread
+- Progress banner auto-shows if background task is running on page load
+
 **Dashboard page (`/`):**
+- Sticky progress banner (right below top bar) — visible during all background processing
 - 5 clickable stat cards: Projects, Events, Threads, Blockers, Unmatched Chats — each links to a drill-down view
 - Stacked bar chart (Chart.js) showing activity across all projects, toggleable by Day/Week/Month
 - Filter bar: Active, Possibly EOL, Ignored
 - Project card grid (responsive, 320px min) with:
+  - **Category color-coding** — colored left border + category badge per card
   - Progress bar (color-coded by %)
   - Activity counts (commits, chats, logs)
   - Last 3 decisions
   - First 3 open threads with color-coded tags
   - EOL detection with Ignore button
 - Dark/light theme toggle (persisted in localStorage)
-- Top-bar buttons: What's Next, Upload Chat History, AI Settings, Generate PDF
-- Upload Chat History modal
-- AI Settings modal (manual override for url/key/model)
+- Top-bar buttons: What's Next, Upload Chat History, Settings, Generate PDF
+
+**Category colors (light + dark mode variants):**
+
+| Category | Border Color | Badge Color |
+|----------|-------------|-------------|
+| Church | Purple (#7E57C2) | Purple bg/text |
+| School | Blue (#1E88E5) | Blue bg/text |
+| Product | Green (#43A047) | Green bg/text |
+| Infrastructure | Orange (#EF6C00) | Orange bg/text |
+| Personal | Pink (#C2185B) | Pink bg/text |
+| Research | Teal (#00897B) | Teal bg/text |
 
 **Drill-down list views:**
 - `/view/projects` — all projects, split into Active and Archived sections, with Archive/Unarchive buttons
 - `/view/events` — all timeline events across all projects, newest first, tagged by type (Commit/Chat/Log)
 - `/view/threads` — all open threads with Resolve buttons, grouped by project
 - `/view/blockers` — filtered to blocker-type threads only, with Resolve buttons
-- `/view/whats-next` — cross-project triage (see Section 9)
-- `/view/unmatched` — unmatched chat conversations + AI classification (see Section 11)
+- `/view/whats-next` — cross-project triage (see Section 11)
+- `/view/unmatched` — unmatched chat conversations with assign/dismiss/restore (see Section 12)
 
 **Project detail page (`/project/<idx>`):**
 - Header card with metadata, progress bar, narrative description
@@ -120,32 +144,56 @@ Flask app running on `localhost:5111`. Fully local — nothing leaves the machin
 - Open threads card with Resolve buttons
 - "Enrich with AI" button (when API key configured)
 
+**Settings page (`/settings`):**
+- Timezone selector (default: Central US / America/Chicago, auto-adjusts for DST)
+- AI configuration: API URL, API key (with save confirmation), model selector
+- Scan paths configuration
+- "Save All Settings" button with visible success/error feedback
+
 ### 3. Non-Blocking Background Processing
 
 All heavy work (scanning, parsing, chat matching, AI enrichment, AI classification) runs in a **background thread**. The app stays fully usable during processing.
 
-**Top-nav progress bar:**
-- Slim bar below the top bar, visible only during processing
+**Sticky progress banner (right below top bar):**
+- Visible on every page load if background task is running
 - Shows spinner + step name + detail message
 - Steps: Scanning → Parsing → Reading Chat → Matching Chat → AI Enrichment → AI Classifying → Building → Done
 - Progress track fills based on current step
 - Auto-reloads the page 1.5s after completion
 - Error state shown in red if something fails
+- `position: sticky; top: 0; z-index: 90` — stays visible while scrolling
 
 **Implementation:** Background thread + `/api/progress` polling every 500ms. No SSE or WebSockets needed.
+
+**Startup:** `__main__` block kicks off `_bg_run_load` in a daemon thread, server starts immediately.
 
 ### 4. Chat History Integration
 
 **Upload flow:**
 - User exports chat history from Claude.ai (zip file)
 - Uploads via drag-and-drop or file picker in the Upload modal
-- System extracts .md/.txt/.json files from the zip
-- Two-tier matching:
-  1. **Per-conversation:** If ANY paragraph in a chat file mentions a project, that whole file counts as a conversation event for that project
-  2. **Per-paragraph:** Best-scoring paragraphs become detailed timeline entries with excerpts
+- System extracts conversations from the zip (see JSON parsing below)
+- Two-tier matching runs against all projects
 - Import timestamp and filename saved for reference
 
-**Matching algorithm:**
+**JSON conversation parsing (new):**
+- Handles Claude.ai export format: single `conversations.json` containing array of conversation objects
+- Extracts individual conversations from JSON arrays
+- Handles wrapper dicts with keys like `conversations`, `chat_messages`, `data`, `items`
+- Parses message text from multiple formats:
+  - Claude.ai: `{sender: "human", text: "..."}` in `chat_messages` list
+  - OpenAI-style: `{role: "user", content: "..."}` in `messages` list
+  - Mapping format: `{node_id: {message: {author: {role: "..."}, content: {parts: [...]}}}}}`
+- Extracts dates from: `created_at`, `updated_at`, `date`, `timestamp` (ISO 8601 + Unix timestamps)
+- Accepts file types: `.md`, `.txt`, `.json`, `.jsonl`, `.csv`, `.yaml`, `.yml`
+- JSONL support: one JSON object per line
+- Prints extraction stats: "Extracted X conversations from Y files"
+
+**Matching algorithm (two-tier):**
+1. **Per-conversation:** If ANY paragraph in a chat file mentions a project, that whole file counts as a conversation event for that project
+2. **Per-paragraph:** Best-scoring paragraphs become detailed timeline entries with excerpts
+
+**Scoring:**
 - Builds search terms per project: name variants, without version, squashed, first words, longest word
 - Scores paragraphs by: term frequency * term length, length bonus, descriptive word bonus
 - Deduplicates by word overlap ratio (>0.65 = skip)
@@ -167,13 +215,15 @@ All heavy work (scanning, parsing, chat matching, AI enrichment, AI classificati
 - **When no API key exists:** A prompt modal appears on Load asking "Enable AI-Enhanced Results?"
   - Shows what AI does (enrichment, classification, verification)
   - API key input field
-  - **OK:** saves the key to `~/.claudesync_ai.json`, proceeds with AI enabled
+  - **OK:** saves the key with visible "Key saved!" confirmation (green flash, 800ms delay), then proceeds with AI enabled
   - **Skip:** proceeds without AI
+  - **Error handling:** "Failed — try again" on save error
 
-**AI Settings modal** (manual override):
+**AI Settings (now in Settings page `/settings`):**
 - API URL (default: `https://api.anthropic.com/v1/messages`)
-- API Key (stored locally, masked in UI)
+- API Key (stored locally, masked display showing first 8 chars)
 - Model dropdown: Haiku 4.5 (default, cheapest), Sonnet 4.5 (balanced), Opus 4.6 (most capable)
+- Save button with "Saved!" / green confirmation, auto-reset after 2.5s
 
 **Enrichment modes:**
 - **Bulk enrichment** — during Load & Refresh background task
@@ -248,10 +298,6 @@ Each project can be assigned a development state reflecting its current work sta
 - AI responds with state classification + reasoning
 - Auto-selects the suggested state in the dropdown
 
-**API endpoints:**
-- `POST /api/dev-state/<idx>` — set dev state `{dev_state: "test|refine|continue|"}`
-- `POST /api/ai-assess-state/<idx>` — AI classifies dev state, returns `{dev_state, reason}`
-
 ### 10. Thread Resolution
 
 - Resolve button on threads in detail pages and list views
@@ -286,11 +332,11 @@ Cross-project triage view showing every actionable item across all projects.
 
 **Persistence:** `~/.claudesync_item_actions.json`
 
-### 12. Unmatched Conversations & Initiative Classification (`/view/unmatched`)
+### 12. Unmatched Conversations & Management (`/view/unmatched`)
 
-Shows chat conversations that weren't automatically matched to any project by fuzzy name matching.
+Shows chat conversations not automatically matched to any project by fuzzy name matching.
 
-**Stats bar:** Unmatched Conversations, New Initiatives Suggested, Matched to Existing, Skipped (small talk)
+**Stats bar:** Active Unmatched, New Initiatives Suggested, Matched to Existing, Dismissed/Assigned
 
 **AI classification** (runs automatically during Load & Refresh when key is present):
 - Sends unmatched conversations to AI in batches of 15
@@ -301,7 +347,38 @@ Shows chat conversations that weren't automatically matched to any project by fu
 - Results grouped by suggested initiative with conversation excerpts
 - Can also be triggered manually via "Classify with AI" button
 
-**Persistence:** `~/.claudesync_initiatives.json`
+**Per-conversation actions:**
+- **Assign to project** — dropdown of all existing projects; assigns and auto-dismisses the chat
+  - Green flash confirmation: "Assigned to [Project Name]"
+  - Smooth fade-out animation
+- **Dismiss** — removes from active view, moves to Dismissed section
+  - Fade-out animation on dismiss
+- **Restore** — brings back a dismissed/assigned chat to active view
+
+**Bulk actions:**
+- **Dismiss All Skipped** — one-click dismissal of all AI-skipped chats (with confirmation dialog)
+
+**Sections (top to bottom):**
+1. Suggested New Initiatives (from AI, with assign/dismiss per conversation)
+2. Matched to Existing Projects (from AI, with assign/dismiss per conversation)
+3. Not Yet Classified (awaiting AI, with assign/dismiss per conversation)
+4. Skipped / Small Talk (from AI, with "Dismiss All Skipped" bulk action)
+5. Dismissed / Assigned (collapsed by default, click to show/hide, with Restore buttons)
+
+**Persistence:**
+- `~/.claudesync_initiatives.json` — AI classification results + manual assignment records
+- `~/.claudesync_dismissed_chats.json` — set of dismissed/assigned filenames
+
+### 13. Timezone-Aware Timestamps
+
+All dashboard-generated timestamps use the configured timezone:
+- Default: `America/Chicago` (Central US)
+- Automatically adjusts for daylight savings (CST ↔ CDT)
+- Format: `YYYY-MM-DD HH:MM AM/PM TZ` (e.g., `2026-02-11 06:09 PM CST`)
+- Applied to: last import time, last classified time, assignment timestamps
+- Configurable via Settings page (`/settings`)
+- Uses Python `zoneinfo.ZoneInfo` for IANA timezone database
+- Available zones: Central, Eastern, Mountain, Pacific, UTC, London
 
 ---
 
@@ -334,32 +411,87 @@ python3 generate_status_pdf.py --scan-paths "~ ~/projects" --chat-history ~/expo
 
 ## API Endpoints
 
+### Pages (HTML responses)
+
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/` | Dashboard |
-| GET | `/project/<idx>` | Project detail |
-| GET | `/view/projects` | All projects list |
-| GET | `/view/events` | All events list |
-| GET | `/view/threads` | Open threads list |
-| GET | `/view/blockers` | Blockers list |
-| GET | `/view/whats-next` | Cross-project triage view |
-| GET | `/view/unmatched` | Unmatched conversations + AI classification |
-| GET | `/api/progress` | Background task status (running, step, detail) |
-| GET | `/api/chart-data?mode=day\|week\|month` | Activity chart data |
-| POST | `/api/ignore` | Hide project `{name}` |
-| POST | `/api/restore` | Unhide project `{name}` |
-| POST | `/api/archive` | Archive project `{name}` |
-| POST | `/api/unarchive` | Unarchive project `{name}` |
-| POST | `/api/resolve-thread` | Resolve thread `{project, text}` |
-| POST | `/api/item-action` | Ignore/reassign/undo item `{key, action, target_project?}` |
-| POST | `/api/verify-categories` | AI-verify all project categories |
-| POST | `/api/classify-unmatched` | AI-classify unmatched chat conversations |
-| POST | `/api/enrich/<idx>` | AI-enrich single project |
-| POST | `/api/dev-state/<idx>` | Set project dev state (test/refine/continue) |
-| POST | `/api/ai-assess-state/<idx>` | AI-classify project dev state |
-| GET/POST | `/api/ai-config` | Get/save AI configuration |
-| POST | `/upload` | Upload chat zip, start background processing (returns JSON) |
-| GET | `/generate-pdf` | Download PDF report |
+| GET | `/` | Dashboard with category-colored project cards |
+| GET | `/project/<idx>` | Project detail with timeline + threads |
+| GET | `/settings` | Settings page (timezone, AI config, scan paths) |
+| GET | `/view/projects` | All projects list with Archive/Unarchive |
+| GET | `/view/events` | All events list with type badges |
+| GET | `/view/threads` | Open threads list with Resolve buttons |
+| GET | `/view/blockers` | Blockers list with Resolve buttons |
+| GET | `/view/whats-next` | Cross-project triage with assign/dismiss |
+| GET | `/view/unmatched` | Unmatched conversations with assign/dismiss/restore |
+
+### JSON API Endpoints
+
+**Progress & Data:**
+
+| Method | Path | Request | Response |
+|--------|------|---------|----------|
+| GET | `/api/progress` | — | `{running, step, detail, error, result_msg}` |
+| GET | `/api/chart-data?mode=` | — | `[{date, projects: [...]}]` |
+
+**Project Management:**
+
+| Method | Path | Request | Response |
+|--------|------|---------|----------|
+| POST | `/api/ignore` | `{name}` | `{ok, ignored: [names]}` |
+| POST | `/api/restore` | `{name}` | `{ok, ignored: [names]}` |
+| POST | `/api/archive` | `{name}` | `{ok, archived: [names]}` |
+| POST | `/api/unarchive` | `{name}` | `{ok, archived: [names]}` |
+
+**Thread Management:**
+
+| Method | Path | Request | Response |
+|--------|------|---------|----------|
+| POST | `/api/resolve-thread` | `{project, text}` | `{ok}` |
+
+**What's Next Item Management:**
+
+| Method | Path | Request | Response |
+|--------|------|---------|----------|
+| POST | `/api/item-action` | `{key, action, target_project?}` | `{ok}` |
+
+**Dev State:**
+
+| Method | Path | Request | Response |
+|--------|------|---------|----------|
+| POST | `/api/dev-state/<idx>` | `{dev_state}` | `{ok, dev_state}` |
+| POST | `/api/ai-assess-state/<idx>` | — | `{dev_state, reason}` |
+
+**AI Integration:**
+
+| Method | Path | Request | Response |
+|--------|------|---------|----------|
+| GET/POST | `/api/ai-config` | `{api_url?, api_key?, model?}` | `{ok, ...config}` |
+| POST | `/api/enrich/<idx>` | — | `{ok, narrative}` |
+| POST | `/api/verify-categories` | — | `{ok}` |
+| POST | `/api/classify-unmatched` | — | `{ok, total, classified, results}` |
+
+**Chat Management:**
+
+| Method | Path | Request | Response |
+|--------|------|---------|----------|
+| POST | `/api/dismiss-chat` | `{filename}` | `{ok, dismissed_count}` |
+| POST | `/api/restore-chat` | `{filename}` | `{ok, dismissed_count}` |
+| POST | `/api/assign-chat` | `{filename, project}` | `{ok, assigned_to}` |
+| POST | `/api/dismiss-chat/bulk` | `{filenames: [...]}` | `{ok, dismissed_count}` |
+
+**Settings:**
+
+| Method | Path | Request | Response |
+|--------|------|---------|----------|
+| GET/POST | `/api/settings` | `{timezone?, api_key?, api_url?, model?}` | `{ok, ...}` or `{error}` |
+
+**Upload & Export:**
+
+| Method | Path | Request | Response |
+|--------|------|---------|----------|
+| POST | `/upload` | multipart/form-data | `{ok, message}` |
+| GET | `/generate-pdf` | — | PDF file download |
 
 ---
 
@@ -418,6 +550,53 @@ python3 generate_status_pdf.py --scan-paths "~ ~/projects" --chat-history ~/expo
 }
 ```
 
+### Chat Conversation (extracted from JSON)
+```python
+{
+    'filename': str,   # Conversation name (sanitized) + .json extension
+    'content': str,    # Full text of all messages (Human: ... \n\n Assistant: ...)
+    'date': datetime,  # Extracted from created_at/updated_at/date/timestamp fields
+}
+```
+
+### Initiative Classification Result
+```python
+{
+    'idx': int,             # Index in unmatched_chats list
+    'filename': str,        # Chat filename
+    'date': str,            # YYYY-MM-DD
+    'excerpt': str,         # First 150 chars
+    'action': str,          # 'match', 'new', 'skip'
+    'initiative': str,      # Project/initiative name
+}
+```
+
+### Dismissed Chats File
+```python
+{
+    'dismissed': ['filename1.json', 'filename2.json', ...]  # Set of dismissed filenames
+}
+```
+
+### Initiative Assignments (in initiatives.json)
+```python
+{
+    'assigned': {
+        'filename.json': {
+            'project': 'Project Name',
+            'assigned_at': '2026-02-12 06:09 PM CST'
+        }
+    }
+}
+```
+
+### Settings File
+```python
+{
+    'timezone': 'America/Chicago'  # IANA timezone identifier
+}
+```
+
 ---
 
 ## PROJECT_STATUS.md Schema
@@ -457,8 +636,9 @@ python3 generate_status_pdf.py --scan-paths "~ ~/projects" --chat-history ~/expo
 
 ---
 
-## Progress Color Coding
+## Color Coding Reference
 
+### Progress Colors
 | Progress | Color |
 |----------|-------|
 | > 75% | Green (#2ECC71) |
@@ -466,19 +646,28 @@ python3 generate_status_pdf.py --scan-paths "~ ~/projects" --chat-history ~/expo
 | 25-49% | Yellow (#F1C40F) |
 | < 25% | Red (#E74C3C) |
 
-## Dev State Color Coding
-
+### Dev State Colors
 | State | Color | Badge | Card Border |
 |-------|-------|-------|-------------|
 | test | Orange (#E67E22) | Orange bg/text | Left orange border |
 | refine | Blue (#3498DB) | Blue bg/text | Left blue border |
 | continue | Red (#E74C3C) | Red bg/text | Left red border |
 
+### Category Colors
+| Category | Border | Badge (Light) | Badge (Dark) |
+|----------|--------|---------------|--------------|
+| Church | Purple (#7E57C2) | Purple on lavender | Purple on deep purple |
+| School | Blue (#1E88E5) | Blue on light blue | Light blue on navy |
+| Product | Green (#43A047) | Green on light green | Light green on dark green |
+| Infrastructure | Orange (#EF6C00) | Dark orange on peach | Orange on dark brown |
+| Personal | Pink (#C2185B) | Pink on light pink | Pink on dark red |
+| Research | Teal (#00897B) | Teal on light cyan | Teal on dark cyan |
+
 ---
 
 ## Theming
 
-Light and dark themes via CSS custom properties on `[data-theme]`. Persisted in localStorage, applied before paint to prevent flash. Toggle button in top bar on every page.
+Light and dark themes via CSS custom properties on `[data-theme]`. Persisted in localStorage, applied before paint to prevent flash. Toggle button in top bar on every page. All category colors, dev state badges, and thread type tags have dark mode variants.
 
 ---
 
@@ -492,8 +681,12 @@ matplotlib>=3.7.0
 numpy>=1.24.0
 ```
 
+### Standard Library (no install needed)
+- `zoneinfo` (Python 3.9+) — timezone support
+- `json`, `threading`, `urllib`, `tempfile`, `zipfile`
+
 ### System
-- Python 3.8+
+- Python 3.9+ (for `zoneinfo`)
 - Git (commit history + remote detection)
 - macOS or Linux
 
@@ -506,8 +699,8 @@ numpy>=1.24.0
 
 ```
 ~/claudesync2/
-├── web_app.py                  # Flask dashboard (2652 lines)
-├── generate_status_pdf.py      # Scanner, parser, chat matcher, PDF renderer (1238 lines)
+├── web_app.py                  # Flask dashboard (~3400 lines)
+├── generate_status_pdf.py      # Scanner, parser, chat matcher, PDF renderer (~1400 lines)
 ├── init_project_status.py      # Project initializer CLI
 ├── update_repos.py             # Batch repo updater CLI
 ├── sync_history.py             # Asset registry builder
@@ -526,13 +719,15 @@ numpy>=1.24.0
 
 ### Persistence Files (in `~/`)
 ```
-~/.claudesync_ignored.json      # Hidden project names
-~/.claudesync_resolved.json     # Resolved thread keys
-~/.claudesync_archived.json     # Archived project names
-~/.claudesync_ai.json           # AI API config (url, key, model)
-~/.claudesync_import_meta.json  # Last chat import metadata
-~/.claudesync_item_actions.json # Item ignore/reassign decisions
-~/.claudesync_initiatives.json  # AI classification of unmatched chats
+~/.claudesync_ignored.json          # Hidden project names (set)
+~/.claudesync_resolved.json         # Resolved thread keys (set)
+~/.claudesync_archived.json         # Archived project names (set)
+~/.claudesync_ai.json               # {api_url, api_key, model}
+~/.claudesync_import_meta.json      # {last_import, last_file}
+~/.claudesync_item_actions.json     # {item_key: {action, target_project?}}
+~/.claudesync_initiatives.json      # {last_classified, results: [...], assigned: {...}}
+~/.claudesync_dismissed_chats.json  # {dismissed: [filenames]}
+~/.claudesync_settings.json         # {timezone}
 ```
 
 ---
@@ -554,6 +749,46 @@ python3 generate_status_pdf.py --scan-paths ~ --chat-history ~/export.zip
 
 ---
 
+## Recent Changes (v7.0 → v7.1)
+
+### This Session (2026-02-12)
+
+1. **Non-blocking startup** — Server starts instantly, projects load in background. No more waiting before the browser opens.
+
+2. **Sticky progress banner** — Moved to right below top bar, `position: sticky`, visible while scrolling. Auto-shows on page load if background task is running.
+
+3. **API key save confirmation** — "Saved!" green flash with 800ms delay in both the AI prompt modal and Settings page. Error state: "Failed — try again".
+
+4. **Settings page (`/settings`)** — Replaced the AI Settings modal with a full settings page combining:
+   - Timezone configuration (Central US default, DST-aware)
+   - AI API key, URL, and model
+   - Scan paths
+   - Single "Save All Settings" button with visible feedback
+
+5. **Category color-coding** — Every project card now has:
+   - Colored left border by category (6 colors)
+   - Category badge next to project name (uppercase, small)
+   - Full dark mode support for all category colors
+
+6. **Timezone-aware timestamps** — All dashboard-generated timestamps (last import, last classified, assignment times) use the configured timezone with format `YYYY-MM-DD HH:MM AM/PM TZ`.
+
+7. **Chat import overhaul** — Complete rewrite of `load_chat_files()`:
+   - Parses Claude.ai JSON exports with multiple conversations in a single file
+   - Handles wrapper objects, JSONL, multiple date formats
+   - Extracts messages from Claude.ai `sender/text` and OpenAI `role/content` formats
+   - Accepts `.jsonl`, `.csv`, `.yaml` files from zip archives
+   - Extraction stats printed to console
+
+8. **Unmatched chat management** — Full CRUD on the Unmatched Conversations page:
+   - Assign dropdown (assigns to project, auto-dismisses)
+   - Dismiss button (per-conversation, with fade animation)
+   - Restore button (for dismissed/assigned chats)
+   - "Dismiss All Skipped" bulk action with confirmation
+   - Dismissed/Assigned section (collapsed by default)
+   - Green flash confirmation on assignment
+
+---
+
 ## Out of Scope (For Now)
 
 1. **Automatic Claude.ai upload** — user must manually upload PDF
@@ -562,8 +797,9 @@ python3 generate_status_pdf.py --scan-paths ~ --chat-history ~/export.zip
 4. **Multi-user support** — single developer only
 5. **Cloud storage** — all data is local, nothing leaves the machine
 6. **Windows support** — untested
+7. **Mobile-optimized layout** — responsive but not mobile-first
 
 ---
 
-*Last updated: 2026-02-11*
-*Version: 7.0*
+*Last updated: 2026-02-12*
+*Version: 7.1*
