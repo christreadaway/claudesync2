@@ -25,7 +25,17 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+# Central Time: UTC-6 (CST) / UTC-5 (CDT)
+# Use a fixed offset for Central Standard Time; for daylight saving,
+# we'd need pytz/zoneinfo, but a simple approach: try zoneinfo first.
+try:
+    from zoneinfo import ZoneInfo
+    CENTRAL_TZ = ZoneInfo('America/Chicago')
+except ImportError:
+    # Fallback: CST is UTC-6
+    CENTRAL_TZ = timezone(timedelta(hours=-6))
 
 from flask import (Flask, request, send_file, render_template_string,
                    flash, redirect, url_for, jsonify, Response)
@@ -42,6 +52,7 @@ AI_CONFIG_FILE = os.path.expanduser('~/.claudesync_ai.json')
 ARCHIVED_FILE = os.path.expanduser('~/.claudesync_archived.json')
 IMPORT_META_FILE = os.path.expanduser('~/.claudesync_import_meta.json')
 ITEM_ACTIONS_FILE = os.path.expanduser('~/.claudesync_item_actions.json')
+PRIORITIZED_FILE = os.path.expanduser('~/.claudesync_prioritized.json')
 
 # Cache loaded projects so dashboard + drill-down share data
 _project_cache = {
@@ -59,6 +70,25 @@ _bg_task = {
     'result_msg': None,
     'lock': threading.Lock(),
 }
+
+
+def _today_central():
+    """Return today's date string (YYYY-MM-DD) in Central Time."""
+    return datetime.now(CENTRAL_TZ).strftime('%Y-%m-%d')
+
+
+def _filter_future_dates(projects):
+    """Remove timeline entries with dates beyond today in Central Time.
+
+    Also updates last_worked to not exceed today.
+    """
+    today = _today_central()
+    for p in projects:
+        timeline = p.get('timeline', [])
+        if timeline:
+            p['timeline'] = [e for e in timeline if e.get('date', '') <= today]
+        if p.get('last_worked', '') > today:
+            p['last_worked'] = today
 
 
 def _bg_progress(step, detail=''):
@@ -167,7 +197,11 @@ def _bg_run_load(scan_paths_str, chat_history_path, ai_analyze):
             chat_history_path=chp,
             verbose=False,
             progress_callback=_bg_progress,
+            flat=True,
         )
+
+        # Filter out future dates (based on Central Time)
+        _filter_future_dates(projects)
 
         _project_cache['projects'] = projects
         _project_cache['scan_paths'] = scan_paths_str
@@ -354,6 +388,30 @@ def _item_key(project_name, item_type, item_text):
 
 
 # =============================================================================
+# PRIORITIZED THREADS PERSISTENCE
+# =============================================================================
+
+def _load_prioritized():
+    """Load prioritized thread keys from disk.
+
+    Keys are 'project_name::thread_text' (same format as resolved keys).
+    """
+    if os.path.exists(PRIORITIZED_FILE):
+        try:
+            with open(PRIORITIZED_FILE, 'r') as f:
+                return set(json.load(f))
+        except Exception:
+            pass
+    return set()
+
+
+def _save_prioritized(keys):
+    """Save prioritized thread keys to disk."""
+    with open(PRIORITIZED_FILE, 'w') as f:
+        json.dump(sorted(keys), f, indent=2)
+
+
+# =============================================================================
 # DATA LOADING + EOL DETECTION
 # =============================================================================
 
@@ -367,7 +425,10 @@ def _load_cached_projects(scan_paths_str=None, chat_history_path=None):
 
     chp = chat_history_path or _project_cache.get('chat_history_path')
 
-    projects = load_projects(scan_paths=scan_paths, chat_history_path=chp, verbose=False)
+    projects = load_projects(scan_paths=scan_paths, chat_history_path=chp, verbose=False, flat=True)
+
+    # Filter out future dates (based on Central Time)
+    _filter_future_dates(projects)
 
     _project_cache['projects'] = projects
     _project_cache['scan_paths'] = scan_paths_str
@@ -402,7 +463,7 @@ def _detect_eol(project):
                 continue
         if dates:
             latest = max(dates)
-            days_ago = (datetime.now() - latest).days
+            days_ago = (datetime.now(CENTRAL_TZ).replace(tzinfo=None) - latest).days
             if days_ago > 90:
                 return f'No activity in {days_ago} days'
 
@@ -1290,7 +1351,11 @@ PROJECT_DETAIL_HTML = """
                         {{ thread_text }}
                         <div class="thread-meta">{{ project.name }}</div>
                     </div>
-                    <button class="btn-resolve" onclick="resolveThread('{{ project.name }}', '{{ thread_text[:100]|e }}', this)">Resolve</button>
+                    <div style="display:flex; gap:4px; flex-shrink:0;">
+                        <button class="btn-resolve" onclick="resolveThread('{{ project.name }}', '{{ thread_text[:100]|e }}', this)">Resolve</button>
+                        <button class="btn-resolve" style="color:#95a5a6; border-color:#95a5a6;" onclick="ignoreThread('{{ project.name }}', '{{ thread_text[:100]|e }}', this)">Ignore</button>
+                        <button class="btn-resolve" style="color:#e67e22; border-color:#e67e22;" onclick="prioritizeThread('{{ project.name }}', '{{ thread_text[:100]|e }}', this)">Prioritize</button>
+                    </div>
                 </li>
                 {% endfor %}
             </ul>
@@ -1329,6 +1394,38 @@ PROJECT_DETAIL_HTML = """
                 li.style.opacity = '0.3';
                 li.style.textDecoration = 'line-through';
                 btn.textContent = 'Resolved';
+            });
+        }
+
+        function ignoreThread(projectName, threadText, btn) {
+            btn.textContent = '...';
+            btn.disabled = true;
+            fetch('/api/ignore-thread', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({project: projectName, text: threadText})
+            })
+            .then(r => r.json())
+            .then(function() {
+                var li = btn.closest('li');
+                li.style.opacity = '0.3';
+                btn.textContent = 'Ignored';
+            });
+        }
+
+        function prioritizeThread(projectName, threadText, btn) {
+            btn.textContent = '...';
+            btn.disabled = true;
+            fetch('/api/prioritize-thread', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({project: projectName, text: threadText})
+            })
+            .then(r => r.json())
+            .then(function() {
+                btn.textContent = 'Prioritized';
+                btn.style.background = '#e67e22';
+                btn.style.color = 'white';
             });
         }
 
@@ -1582,14 +1679,67 @@ def project_detail(idx):
 
 @app.route('/api/resolve-thread', methods=['POST'])
 def api_resolve_thread():
-    """Mark a thread as resolved."""
+    """Mark a thread as resolved (done)."""
     data = request.get_json(force=True)
     project_name = data.get('project', '')
     thread_text = data.get('text', '')
     if project_name and thread_text:
+        key = _thread_key(project_name, thread_text)
         resolved = _load_resolved()
-        resolved.add(_thread_key(project_name, thread_text))
+        resolved.add(key)
         _save_resolved(resolved)
+        # Also remove from prioritized if it was there
+        prioritized = _load_prioritized()
+        prioritized.discard(key)
+        _save_prioritized(prioritized)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/ignore-thread', methods=['POST'])
+def api_ignore_thread():
+    """Mark a thread as ignored (doesn't matter). Persists like resolved."""
+    data = request.get_json(force=True)
+    project_name = data.get('project', '')
+    thread_text = data.get('text', '')
+    if project_name and thread_text:
+        key = _thread_key(project_name, thread_text)
+        # Store in resolved set (ignored items are effectively removed from view)
+        # But track separately so we can distinguish ignored vs resolved
+        resolved = _load_resolved()
+        resolved.add(key)
+        _save_resolved(resolved)
+        # Also remove from prioritized if it was there
+        prioritized = _load_prioritized()
+        prioritized.discard(key)
+        _save_prioritized(prioritized)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/prioritize-thread', methods=['POST'])
+def api_prioritize_thread():
+    """Mark a thread as prioritized. Surfaces it high in What's Next."""
+    data = request.get_json(force=True)
+    project_name = data.get('project', '')
+    thread_text = data.get('text', '')
+    if project_name and thread_text:
+        key = _thread_key(project_name, thread_text)
+        prioritized = _load_prioritized()
+        prioritized.add(key)
+        _save_prioritized(prioritized)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/unprioritize-thread', methods=['POST'])
+def api_unprioritize_thread():
+    """Remove priority from a thread."""
+    data = request.get_json(force=True)
+    project_name = data.get('project', '')
+    thread_text = data.get('text', '')
+    if project_name and thread_text:
+        key = _thread_key(project_name, thread_text)
+        prioritized = _load_prioritized()
+        prioritized.discard(key)
+        _save_prioritized(prioritized)
     return jsonify({'ok': True})
 
 
@@ -1708,11 +1858,16 @@ def generate_pdf():
         flash('No projects found. Upload data first.', 'error')
         return redirect(url_for('dashboard'))
 
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = _today_central()
     output_path = os.path.join(UPLOAD_DIR, f'Project_Portfolio_Status_{today}.pdf')
 
     try:
-        create_pdf(output_path, projects)
+        # create_pdf expects {'with_repos': [...], 'without_repos': [...]}
+        pdf_projects = {
+            'with_repos': [p for p in projects if p.get('has_github_repo')],
+            'without_repos': [p for p in projects if not p.get('has_github_repo')],
+        }
+        create_pdf(output_path, pdf_projects)
     except Exception as e:
         flash(f'Error generating PDF: {e}', 'error')
         return redirect(url_for('dashboard'))
@@ -1778,6 +1933,12 @@ LIST_VIEW_HTML = """
         .progress-fill { height: 100%; border-radius: 3px; }
         .btn-sm.btn-ignore { border-color: #95a5a6; color: #95a5a6; }
         .btn-sm.btn-ignore:hover { background: #95a5a6; color: white; }
+        .btn-sm.btn-prioritize { border-color: #e67e22; color: #e67e22; }
+        .btn-sm.btn-prioritize:hover { background: #e67e22; color: white; }
+        .btn-sm.btn-unprioritize { border-color: #95a5a6; color: #95a5a6; }
+        .btn-sm.btn-unprioritize:hover { background: #95a5a6; color: white; }
+        .tag-priority { background: #e67e22; color: white; }
+        .item-prioritized { border-left: 3px solid #e67e22; }
         .btn-sm.btn-reassign { border-color: #8e44ad; color: #8e44ad; }
         .btn-sm.btn-reassign:hover { background: #8e44ad; color: white; }
         .btn-sm.btn-undo { border-color: #3498db; color: #3498db; }
@@ -1953,8 +2114,10 @@ def view_threads():
     projects = _project_cache.get('projects', [])
     resolved = _load_resolved()
     ignored = _load_ignored()
+    prioritized = _load_prioritized()
 
-    items = ''
+    priority_items = []
+    normal_items = []
     count = 0
     for i, p in enumerate(projects):
         name = p.get('name', '')
@@ -1967,17 +2130,43 @@ def view_threads():
             count += 1
             tag_class = {'Blocker': 'tag-blocker', 'Open Question': 'tag-question',
                          'Next Step': 'tag-next'}.get(t_type, 'tag-notbuilt')
-            items += f'''<div class="list-item">
+            safe_text = t_text[:100].replace(chr(39), "&#39;")
+            safe_name = name.replace(chr(39), "&#39;")
+            is_prioritized = key in prioritized
+
+            if is_prioritized:
+                prio_btn = f'''<button class="btn-sm btn-unprioritize" onclick="apiAction('/api/unprioritize-thread', {{project:'{safe_name}', text:'{safe_text}'}}, this)">Deprioritize</button>'''
+            else:
+                prio_btn = f'''<button class="btn-sm btn-prioritize" onclick="apiAction('/api/prioritize-thread', {{project:'{safe_name}', text:'{safe_text}'}}, this)">Prioritize</button>'''
+
+            html = f'''<div class="list-item{'  item-prioritized' if is_prioritized else ''}">
                 <div class="main">
-                    <div class="title"><span class="tag {tag_class}">{t_type}</span> {t_text}</div>
+                    <div class="title">{'<span class="tag tag-priority">PRIORITY</span> ' if is_prioritized else ''}<span class="tag {tag_class}">{t_type}</span> {t_text}</div>
                     <div class="subtitle"><a href="/project/{i}" style="color:inherit;">{name}</a></div>
                 </div>
                 <div class="actions">
-                    <button class="btn-sm btn-resolve" onclick="apiAction('/api/resolve-thread', {{project:'{name}', text:'{t_text[:100].replace(chr(39), "&#39;")}'}}, this)">Resolve</button>
+                    <button class="btn-sm btn-resolve" onclick="apiAction('/api/resolve-thread', {{project:'{safe_name}', text:'{safe_text}'}}, this)">Resolve</button>
+                    <button class="btn-sm btn-ignore" onclick="apiAction('/api/ignore-thread', {{project:'{safe_name}', text:'{safe_text}'}}, this)">Ignore</button>
+                    {prio_btn}
                 </div>
             </div>'''
 
-    content = f'<div class="list-card">{items}</div>' if items else '<div class="empty">No open threads</div>'
+            if is_prioritized:
+                priority_items.append(html)
+            else:
+                normal_items.append(html)
+
+    content = ''
+    if priority_items:
+        content += '<div class="section-header">Prioritized</div>'
+        content += f'<div class="list-card">{"".join(priority_items)}</div>'
+    if normal_items:
+        if priority_items:
+            content += '<div class="section-header">Other Threads</div>'
+        content += f'<div class="list-card">{"".join(normal_items)}</div>'
+    if not priority_items and not normal_items:
+        content = '<div class="empty">No open threads</div>'
+
     return render_template_string(LIST_VIEW_HTML, title=f'Open Threads ({count})', content=content)
 
 
@@ -1986,8 +2175,10 @@ def view_blockers():
     projects = _project_cache.get('projects', [])
     resolved = _load_resolved()
     ignored = _load_ignored()
+    prioritized = _load_prioritized()
 
-    items = ''
+    priority_items = []
+    normal_items = []
     count = 0
     for i, p in enumerate(projects):
         name = p.get('name', '')
@@ -2000,17 +2191,43 @@ def view_blockers():
             if key in resolved:
                 continue
             count += 1
-            items += f'''<div class="list-item">
+            safe_text = t_text[:100].replace(chr(39), "&#39;")
+            safe_name = name.replace(chr(39), "&#39;")
+            is_prioritized = key in prioritized
+
+            if is_prioritized:
+                prio_btn = f'''<button class="btn-sm btn-unprioritize" onclick="apiAction('/api/unprioritize-thread', {{project:'{safe_name}', text:'{safe_text}'}}, this)">Deprioritize</button>'''
+            else:
+                prio_btn = f'''<button class="btn-sm btn-prioritize" onclick="apiAction('/api/prioritize-thread', {{project:'{safe_name}', text:'{safe_text}'}}, this)">Prioritize</button>'''
+
+            html = f'''<div class="list-item{'  item-prioritized' if is_prioritized else ''}">
                 <div class="main">
-                    <div class="title"><span class="tag tag-blocker">Blocker</span> {t_text}</div>
+                    <div class="title">{'<span class="tag tag-priority">PRIORITY</span> ' if is_prioritized else ''}<span class="tag tag-blocker">Blocker</span> {t_text}</div>
                     <div class="subtitle"><a href="/project/{i}" style="color:inherit;">{name}</a></div>
                 </div>
                 <div class="actions">
-                    <button class="btn-sm btn-resolve" onclick="apiAction('/api/resolve-thread', {{project:'{name}', text:'{t_text[:100].replace(chr(39), "&#39;")}'}}, this)">Resolve</button>
+                    <button class="btn-sm btn-resolve" onclick="apiAction('/api/resolve-thread', {{project:'{safe_name}', text:'{safe_text}'}}, this)">Resolve</button>
+                    <button class="btn-sm btn-ignore" onclick="apiAction('/api/ignore-thread', {{project:'{safe_name}', text:'{safe_text}'}}, this)">Ignore</button>
+                    {prio_btn}
                 </div>
             </div>'''
 
-    content = f'<div class="list-card">{items}</div>' if items else '<div class="empty">No blockers</div>'
+            if is_prioritized:
+                priority_items.append(html)
+            else:
+                normal_items.append(html)
+
+    content = ''
+    if priority_items:
+        content += '<div class="section-header">Prioritized</div>'
+        content += f'<div class="list-card">{"".join(priority_items)}</div>'
+    if normal_items:
+        if priority_items:
+            content += '<div class="section-header">Other Blockers</div>'
+        content += f'<div class="list-card">{"".join(normal_items)}</div>'
+    if not priority_items and not normal_items:
+        content = '<div class="empty">No blockers</div>'
+
     return render_template_string(LIST_VIEW_HTML, title=f'Blockers ({count})', content=content)
 
 
@@ -2047,6 +2264,7 @@ def view_whats_next():
     archived = _load_archived()
     resolved = _load_resolved()
     item_actions = _load_item_actions()
+    prioritized = _load_prioritized()
     ai_config = _load_ai_config()
     has_ai = bool(ai_config.get('api_key'))
 
@@ -2056,6 +2274,7 @@ def view_whats_next():
 
     # Build sections
     next_items = []      # Active items per project
+    priority_items = []  # Prioritized items (shown at top)
     flagged_items = []   # Items that have been reassigned (show in target project)
     ignored_items = []   # Dismissed items
 
@@ -2076,10 +2295,13 @@ def view_whats_next():
         # Next Steps (highest priority)
         for step in p.get('next_steps', []):
             key = _item_key(name, 'Next Step', step)
+            tkey = _thread_key(name, step)
             project_items.append({
                 'key': key, 'type': 'Next Step', 'text': step,
                 'project': name, 'project_idx': i,
                 'tag_class': 'tag-next', 'priority': 1,
+                'is_prioritized': tkey in prioritized,
+                'tkey': tkey,
             })
 
         # Blockers
@@ -2092,6 +2314,8 @@ def view_whats_next():
                 'key': key, 'type': 'Blocker', 'text': b,
                 'project': name, 'project_idx': i,
                 'tag_class': 'tag-blocker', 'priority': 0,
+                'is_prioritized': tkey in prioritized,
+                'tkey': tkey,
             })
 
         # Open Questions
@@ -2104,15 +2328,20 @@ def view_whats_next():
                 'key': key, 'type': 'Open Question', 'text': q,
                 'project': name, 'project_idx': i,
                 'tag_class': 'tag-question', 'priority': 2,
+                'is_prioritized': tkey in prioritized,
+                'tkey': tkey,
             })
 
         # Not Yet Built
         for nw in p.get('not_working', []):
             key = _item_key(name, 'Not Yet Built', nw)
+            tkey = _thread_key(name, nw)
             project_items.append({
                 'key': key, 'type': 'Not Yet Built', 'text': nw,
                 'project': name, 'project_idx': i,
                 'tag_class': 'tag-notbuilt', 'priority': 3,
+                'is_prioritized': tkey in prioritized,
+                'tkey': tkey,
             })
 
         # Sort by priority (blockers first, then next steps, questions, not built)
@@ -2125,6 +2354,8 @@ def view_whats_next():
             elif action and action.get('action') == 'reassigned':
                 item['reassigned_to'] = action.get('target_project', '')
                 flagged_items.append(item)
+            elif item.get('is_prioritized'):
+                priority_items.append(item)
             else:
                 next_items.append(item)
 
@@ -2152,6 +2383,30 @@ def view_whats_next():
     # Verify all categories button
     if has_ai:
         content += '<div style="margin-bottom:16px; text-align:right;"><button class="btn-sm btn-verify" onclick="verifyAllCategories(this)" style="padding:6px 14px; font-size:11px;">Verify All Categories with AI</button></div>'
+
+    # Prioritized items (shown first, flat list)
+    if priority_items:
+        content += f'<div class="section-header">Prioritized <span class="badge">{len(priority_items)}</span></div>'
+        content += '<div class="list-card">'
+        for item in priority_items:
+            dropdown_counter += 1
+            dd_id = f'dd-{dropdown_counter}'
+            safe_key = item['key'].replace("'", "&#39;").replace('"', '&quot;')
+            safe_text = item['text'].replace("'", "&#39;").replace('"', '&quot;')
+            safe_name = item['project'].replace(chr(39), "&#39;")
+
+            content += f'''<div class="list-item item-prioritized">
+                <div class="main">
+                    <div class="title"><span class="tag tag-priority">PRIORITY</span> <span class="tag {item['tag_class']}">{item['type']}</span> {item['text']}</div>
+                    <div class="subtitle"><a href="/project/{item['project_idx']}" style="color:inherit;">{item['project']}</a></div>
+                </div>
+                <div class="actions">
+                    <button class="btn-sm btn-resolve" onclick="apiAction('/api/resolve-thread', {{project:'{safe_name}', text:'{safe_text[:100]}'}}, this)">Resolve</button>
+                    <button class="btn-sm btn-ignore" onclick="apiAction('/api/item-action', {{key:'{safe_key}', action:'ignored'}}, this)">Ignore</button>
+                    <button class="btn-sm btn-unprioritize" onclick="apiAction('/api/unprioritize-thread', {{project:'{safe_name}', text:'{safe_text[:100]}'}}, this)">Deprioritize</button>
+                </div>
+            </div>'''
+        content += '</div>'
 
     # Active items grouped by project
     active_count = len(next_items)
@@ -2181,13 +2436,15 @@ def view_whats_next():
                 safe_key = item['key'].replace("'", "&#39;").replace('"', '&quot;')
                 safe_text = item['text'].replace("'", "&#39;").replace('"', '&quot;')
 
+                safe_name = item['project'].replace(chr(39), "&#39;")
                 content += f'''<div class="list-item">
                     <div class="main">
                         <div class="title"><span class="tag {item['tag_class']}">{item['type']}</span> {item['text']}</div>
                     </div>
                     <div class="actions">
-                        <button class="btn-sm btn-resolve" onclick="apiAction('/api/resolve-thread', {{project:'{item['project'].replace(chr(39), "&#39;")}', text:'{safe_text[:100]}'}}, this)">Resolve</button>
+                        <button class="btn-sm btn-resolve" onclick="apiAction('/api/resolve-thread', {{project:'{safe_name}', text:'{safe_text[:100]}'}}, this)">Resolve</button>
                         <button class="btn-sm btn-ignore" onclick="apiAction('/api/item-action', {{key:'{safe_key}', action:'ignored'}}, this)">Ignore</button>
+                        <button class="btn-sm btn-prioritize" onclick="apiAction('/api/prioritize-thread', {{project:'{safe_name}', text:'{safe_text[:100]}'}}, this)">Prioritize</button>
                         <button class="btn-sm btn-reassign" onclick="toggleDropdown('{dd_id}')">Reassign</button>
                         <div class="reassign-dropdown" id="{dd_id}">'''
 

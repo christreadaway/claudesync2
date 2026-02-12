@@ -229,11 +229,14 @@ def extract_list_items(content, header_pattern, max_items=3):
             if line.startswith('-') or line.startswith('*'):
                 item = line.lstrip('-* ').strip()
                 # Skip placeholder items
-                placeholder_words = ['describe', 'nothing yet', 'none yet', 'tbd', 'todo',
-                                     'list ', 'add ', 'initial project', 'project structure']
+                placeholder_starts = ['describe', 'list ', 'add ', 'none']
+                placeholder_contains = ['nothing yet', 'none yet', 'tbd', 'todo',
+                                        'initial project', 'project structure']
+                item_lower = item.lower()
                 is_placeholder = (
                     item.startswith('(') or
-                    any(pw in item.lower() for pw in placeholder_words) or
+                    any(item_lower.startswith(pw) for pw in placeholder_starts) or
+                    any(pw in item_lower for pw in placeholder_contains) or
                     len(item) < 10
                 )
                 if item and not is_placeholder:
@@ -243,35 +246,35 @@ def extract_list_items(content, header_pattern, max_items=3):
     return items
 
 
+COMMIT_SKIP_PATTERNS = [
+    'add files via upload',
+    'initial commit',
+    'first commit',
+    'init commit',
+    'create readme',
+    'update readme',
+    'delete ',
+    'remove ',
+    'merge branch',
+    'merge pull request',
+    'wip',
+    'fix typo',
+    'minor fix',
+    'small fix',
+    'quick fix',
+    'bump version',
+    'update dependencies',
+    'update package',
+    'lint fix',
+    'format code',
+    'cleanup',
+    'refactor',
+]
+
+
 def get_recent_commits(project_dir, max_commits=5):
     """Get recent meaningful commit messages from git log."""
     import subprocess
-
-    # Garbage commit patterns to skip
-    skip_patterns = [
-        'add files via upload',
-        'initial commit',
-        'first commit',
-        'init commit',
-        'create readme',
-        'update readme',
-        'delete ',
-        'remove ',
-        'merge branch',
-        'merge pull request',
-        'wip',
-        'fix typo',
-        'minor fix',
-        'small fix',
-        'quick fix',
-        'bump version',
-        'update dependencies',
-        'update package',
-        'lint fix',
-        'format code',
-        'cleanup',
-        'refactor',
-    ]
 
     try:
         # Scan ALL commits across ALL branches to find meaningful ones
@@ -291,12 +294,60 @@ def get_recent_commits(project_dir, max_commits=5):
 
                 # Check against skip patterns
                 line_lower = line.lower()
-                is_garbage = any(pattern in line_lower for pattern in skip_patterns)
+                is_garbage = any(pattern in line_lower for pattern in COMMIT_SKIP_PATTERNS)
 
                 if not is_garbage:
                     commits.append(line)
                     if len(commits) >= max_commits:
                         break
+            return commits
+    except Exception:
+        pass
+    return []
+
+
+def get_recent_commits_with_dates(project_dir, max_commits=20):
+    """Get recent meaningful commits with dates from git log.
+
+    Returns list of (date_str, message) tuples where date_str is YYYY-MM-DD.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ['git', 'log', '--all', '--pretty=format:%aI%n%s'],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode == 0:
+            lines = result.stdout.strip().split('\n')
+            commits = []
+            i = 0
+            while i < len(lines) - 1:
+                date_line = lines[i].strip()
+                msg_line = lines[i + 1].strip() if i + 1 < len(lines) else ''
+                i += 2
+
+                if not msg_line or len(msg_line) < 15:
+                    continue
+
+                msg_lower = msg_line.lower()
+                is_garbage = any(p in msg_lower for p in COMMIT_SKIP_PATTERNS)
+                if is_garbage:
+                    continue
+
+                # Parse ISO date to YYYY-MM-DD
+                try:
+                    dt = datetime.fromisoformat(date_line)
+                    date_str = dt.strftime('%Y-%m-%d')
+                except (ValueError, TypeError):
+                    date_str = ''
+
+                commits.append((date_str, msg_line))
+                if len(commits) >= max_commits:
+                    break
             return commits
     except Exception:
         pass
@@ -331,12 +382,13 @@ def parse_project_status(file_path):
             'status': r'\*\*Status\*\*\s*\|\s*(.+)',
             'has_repo': r'\*\*Has GitHub Repo\*\*\s*\|\s*(.+)',
             'dev_state': r'\*\*Dev State\*\*\s*\|\s*(.+)',
+            'last_worked': r'\*\*Last Worked\*\*\s*\|\s*(.+)',
         }
 
         for key, pattern in patterns.items():
             match = re.search(pattern, content)
             if match:
-                value = match.group(1).strip()
+                value = match.group(1).strip().rstrip('|').strip()
                 if key == 'progress':
                     project[key] = int(value)
                 else:
@@ -376,6 +428,107 @@ def parse_project_status(file_path):
         status.update(f"Reading commits: {project['name']}")
         project['recent_commits'] = get_recent_commits(project['project_path'], 5)
 
+        # Set category_group (alias used by web dashboard)
+        project['category_group'] = project.get('category', 'Personal')
+
+        # Set last_worked default
+        project.setdefault('last_worked', '')
+
+        # ---- Extract structured sections for web dashboard ----
+
+        # What's Not Working
+        project['not_working'] = extract_list_items(content, r"### What's Not Working", 20)
+
+        # Blockers
+        project['blockers'] = extract_list_items(content, r"### Blockers", 20)
+
+        # Open Questions (from "Still stuck on:" entries across all log dates)
+        open_questions = []
+        for match in re.finditer(r'\*\*Still stuck on:\*\*\s*\n((?:[-*]\s+.+\n?)+)', content):
+            for line in match.group(1).split('\n'):
+                line = line.strip().lstrip('-* ').strip()
+                if line and len(line) >= 10:
+                    open_questions.append(line)
+        project['open_questions'] = open_questions
+
+        # Next Steps (from "Next time:" entries across all log dates)
+        next_steps = []
+        for match in re.finditer(r'\*\*Next time:\*\*\s*\n((?:[-*]\s+.+\n?)+)', content):
+            for line in match.group(1).split('\n'):
+                line = line.strip().lstrip('-* ').strip()
+                if line and len(line) >= 10:
+                    next_steps.append(line)
+        project['next_steps'] = next_steps
+
+        # Open threads: combined list of (type, text) tuples
+        open_threads = []
+        for b in project['blockers']:
+            open_threads.append(('Blocker', b))
+        for q in open_questions:
+            open_threads.append(('Open Question', q))
+        for ns in next_steps:
+            open_threads.append(('Next Step', ns))
+        for nw in project['not_working']:
+            open_threads.append(('Not Yet Built', nw))
+        project['open_threads'] = open_threads
+
+        # ---- Build timeline from progress log dates ----
+        timeline = []
+        # Find all ### YYYY-MM-DD headings and their content
+        log_section = re.search(r'## Progress Log\s*\n(.*)', content, re.DOTALL)
+        if log_section:
+            log_text = log_section.group(1)
+            # Match each dated entry
+            date_entries = re.finditer(
+                r'### (\d{4}-\d{2}-\d{2})\s*\n(.*?)(?=### \d{4}-\d{2}-\d{2}|\Z)',
+                log_text, re.DOTALL
+            )
+            for entry in date_entries:
+                log_date = entry.group(1)
+                log_body = entry.group(2).strip()
+                # Extract "What was built" as summary
+                built_match = re.search(r'\*\*What was built:\*\*\s*\n((?:[-*]\s+.+\n?)+)', log_body)
+                if built_match:
+                    for line in built_match.group(1).split('\n'):
+                        line = line.strip().lstrip('-* ').strip()
+                        if line and len(line) >= 10:
+                            timeline.append({
+                                'date': log_date,
+                                'source': 'Progress Log',
+                                'text': line,
+                            })
+                # Also extract "What was figured out" entries
+                figured_match = re.search(r'\*\*What was figured out:\*\*\s*\n((?:[-*]\s+.+\n?)+)', log_body)
+                if figured_match:
+                    for line in figured_match.group(1).split('\n'):
+                        line = line.strip().lstrip('-* ').strip()
+                        if line and len(line) >= 10:
+                            timeline.append({
+                                'date': log_date,
+                                'source': 'Progress Log',
+                                'text': line,
+                            })
+
+        # Add git commits with dates to timeline
+        commits_with_dates = get_recent_commits_with_dates(project['project_path'], 20)
+        for cdate, cmsg in commits_with_dates:
+            if cdate:
+                timeline.append({
+                    'date': cdate,
+                    'source': 'Git Commit',
+                    'text': cmsg,
+                })
+
+        # Sort timeline by date descending (newest first)
+        timeline.sort(key=lambda e: e.get('date', ''), reverse=True)
+        project['timeline'] = timeline
+
+        # Update last_worked from actual activity if not set in metadata
+        if not project['last_worked'] and timeline:
+            dates = [e['date'] for e in timeline if e.get('date')]
+            if dates:
+                project['last_worked'] = max(dates)
+
         # Store raw content for AI assessment
         project['_raw_content'] = content
 
@@ -386,8 +539,26 @@ def parse_project_status(file_path):
         return None
 
 
-def load_projects(scan_paths=None, verbose=False):
-    """Load all projects from PROJECT_STATUS.md files."""
+def load_projects(scan_paths=None, verbose=False, chat_history_path=None,
+                   progress_callback=None, flat=False):
+    """Load all projects from PROJECT_STATUS.md files.
+
+    Args:
+        scan_paths: List of paths to scan for PROJECT_STATUS.md files.
+        verbose: Print verbose output.
+        chat_history_path: Path to chat history ZIP (for web dashboard).
+        progress_callback: Callable(step, detail) for progress updates.
+        flat: If True, return a flat list of projects (for web dashboard).
+              If False, return {'with_repos': [...], 'without_repos': [...]}.
+
+    Returns:
+        Flat list of project dicts if flat=True, else dict with with_repos/without_repos.
+    """
+    def _progress(step, detail=''):
+        if progress_callback:
+            progress_callback(step, detail)
+
+    _progress('scanning', 'Scanning for projects...')
     status_files = find_project_status_files(scan_paths)
 
     status.done()
@@ -396,11 +567,13 @@ def load_projects(scan_paths=None, verbose=False):
         for sf in status_files:
             print(f"  - {sf}")
 
+    all_projects = []
     with_repos = []
     without_repos = []
 
     total = len(status_files)
     for i, sf in enumerate(status_files, 1):
+        _progress('parsing', f'Parsing project {i}/{total}...')
         status.update(f"Loading project {i}/{total}: {os.path.basename(os.path.dirname(sf))}")
         project = parse_project_status(sf)
         if project:
@@ -416,12 +589,19 @@ def load_projects(scan_paths=None, verbose=False):
                 for c in commits[:2]:
                     print(f"    - {c[:50]}...")
 
+            all_projects.append(project)
             if project['has_github_repo']:
                 with_repos.append(project)
             else:
                 without_repos.append(project)
 
     status.done()
+    _progress('done', f'Loaded {len(all_projects)} projects')
+
+    if flat:
+        # Sort by progress descending for web dashboard
+        all_projects.sort(key=lambda x: x['progress'], reverse=True)
+        return all_projects
 
     # Sort by progress descending
     with_repos.sort(key=lambda x: x['progress'], reverse=True)
