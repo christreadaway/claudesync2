@@ -26,7 +26,8 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from flask import (Flask, request, send_file, render_template_string,
                    flash, redirect, url_for, jsonify, Response)
@@ -43,6 +44,53 @@ AI_CONFIG_FILE = os.path.expanduser('~/.claudesync_ai.json')
 ARCHIVED_FILE = os.path.expanduser('~/.claudesync_archived.json')
 IMPORT_META_FILE = os.path.expanduser('~/.claudesync_import_meta.json')
 ITEM_ACTIONS_FILE = os.path.expanduser('~/.claudesync_item_actions.json')
+SETTINGS_FILE = os.path.expanduser('~/.claudesync_settings.json')
+
+DEFAULT_TIMEZONE = 'America/Chicago'  # Central US (auto-adjusts for daylight savings)
+
+
+def _load_settings():
+    """Load dashboard settings from disk."""
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {'timezone': DEFAULT_TIMEZONE}
+
+
+def _save_settings(settings):
+    """Save dashboard settings to disk."""
+    with open(SETTINGS_FILE, 'w') as f:
+        json.dump(settings, f, indent=2)
+
+
+def _now_local():
+    """Get current datetime in the configured timezone."""
+    settings = _load_settings()
+    tz_name = settings.get('timezone', DEFAULT_TIMEZONE)
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo(DEFAULT_TIMEZONE)
+    return datetime.now(tz)
+
+
+def _format_timestamp(dt=None):
+    """Format a datetime as a readable timestamp in the configured timezone."""
+    if dt is None:
+        dt = _now_local()
+    elif dt.tzinfo is None:
+        # Naive datetime — assume UTC and convert
+        settings = _load_settings()
+        tz_name = settings.get('timezone', DEFAULT_TIMEZONE)
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = ZoneInfo(DEFAULT_TIMEZONE)
+        dt = dt.replace(tzinfo=timezone.utc).astimezone(tz)
+    return dt.strftime('%Y-%m-%d %I:%M %p %Z')
 
 # Cache loaded projects so dashboard + drill-down share data
 _project_cache = {
@@ -146,7 +194,7 @@ Conversations:
     # Save results
     if all_results:
         initiatives = _load_initiatives()
-        initiatives['last_classified'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+        initiatives['last_classified'] = _format_timestamp()
         initiatives['results'] = all_results
         initiatives['total_unmatched'] = len(unmatched_chats)
         _save_initiatives(initiatives)
@@ -653,6 +701,25 @@ DASHBOARD_HTML = """
         .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: 600; }
         .badge-blocker { background: #fce4ec; color: #c62828; }
         .badge-eol { background: var(--eol-bg); color: var(--eol-text); border: 1px solid var(--eol-border); }
+        .badge-cat { font-size: 9px; font-weight: 700; padding: 2px 8px; border-radius: 10px; margin-left: 6px; letter-spacing: 0.3px; text-transform: uppercase; }
+        .badge-cat-church { background: #EDE7F6; color: #5E35B1; border: 1px solid #B39DDB; }
+        .badge-cat-school { background: #E3F2FD; color: #1565C0; border: 1px solid #90CAF9; }
+        .badge-cat-product { background: #E8F5E9; color: #2E7D32; border: 1px solid #A5D6A7; }
+        .badge-cat-infrastructure { background: #FFF3E0; color: #E65100; border: 1px solid #FFCC80; }
+        .badge-cat-personal { background: #FCE4EC; color: #AD1457; border: 1px solid #F48FB1; }
+        .badge-cat-research { background: #E0F7FA; color: #00695C; border: 1px solid #80CBC4; }
+        [data-theme="dark"] .badge-cat-church { background: #1A0A3E; color: #B39DDB; }
+        [data-theme="dark"] .badge-cat-school { background: #0A1A3E; color: #64B5F6; }
+        [data-theme="dark"] .badge-cat-product { background: #0A2E0A; color: #81C784; }
+        [data-theme="dark"] .badge-cat-infrastructure { background: #2E1500; color: #FFB74D; }
+        [data-theme="dark"] .badge-cat-personal { background: #2E0A1A; color: #F48FB1; }
+        [data-theme="dark"] .badge-cat-research { background: #002E2A; color: #80CBC4; }
+        .project-card.cat-church { border-left: 3px solid #7E57C2; }
+        .project-card.cat-school { border-left: 3px solid #1E88E5; }
+        .project-card.cat-product { border-left: 3px solid #43A047; }
+        .project-card.cat-infrastructure { border-left: 3px solid #EF6C00; }
+        .project-card.cat-personal { border-left: 3px solid #C2185B; }
+        .project-card.cat-research { border-left: 3px solid #00897B; }
         .badge-dev-state { font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 10px; margin-left: 6px; }
         .badge-dev-test { background: #FDF2E9; color: #E67E22; border: 1px solid #E67E22; }
         .badge-dev-refine { background: #EBF5FB; color: #3498DB; border: 1px solid #3498DB; }
@@ -736,7 +803,7 @@ DASHBOARD_HTML = """
             </button>
             <a href="/view/whats-next" class="btn" style="background:#e67e22;">What's Next</a>
             <button class="btn btn-upload" onclick="document.getElementById('uploadModal').classList.add('show')">Upload Chat History</button>
-            <button class="btn" style="background:#8e44ad;" onclick="document.getElementById('aiModal').classList.add('show')">AI Settings</button>
+            <a href="/settings" class="btn" style="background:#8e44ad;">Settings</a>
             <a href="/generate-pdf" class="btn btn-pdf">Generate PDF</a>
         </div>
     </div>
@@ -810,15 +877,16 @@ DASHBOARD_HTML = """
         <!-- Project Cards -->
         <div class="projects-grid" id="projectsGrid">
             {% for p in project_cards %}
-            <div class="project-card {% if p.eol_reason %}eol{% endif %} {% if p.name in ignored_names %}hidden{% endif %} {% if p.dev_state %}dev-{{ p.dev_state|lower }}{% endif %}"
+            <div class="project-card cat-{{ p.category|lower|replace(' ', '') }} {% if p.eol_reason %}eol{% endif %} {% if p.name in ignored_names %}hidden{% endif %} {% if p.dev_state %}dev-{{ p.dev_state|lower }}{% endif %}"
                  data-name="{{ p.name }}" data-eol="{{ 'yes' if p.eol_reason else 'no' }}" data-ignored="{{ 'yes' if p.name in ignored_names else 'no' }}" data-devstate="{{ p.dev_state|lower }}"
                  onclick="if (!event.target.closest('.btn-ignore, .btn-restore')) window.location='/project/{{ loop.index0 }}'">
                 <div class="name">
                     {{ p.name }}
+                    <span class="badge badge-cat badge-cat-{{ p.category|lower|replace(' ', '') }}">{{ p.category }}</span>
                     {% if p.dev_state %}<span class="badge badge-dev-state badge-dev-{{ p.dev_state|lower }}">{{ p.dev_state }}</span>{% endif %}
                     {% if p.eol_reason %}<span class="badge badge-eol">Possibly EOL</span>{% endif %}
                 </div>
-                <div class="meta">{{ p.category }} &middot; {{ p.status }}{% if p.last_worked %} &middot; Last: {{ p.last_worked }}{% endif %}</div>
+                <div class="meta">{{ p.status }}{% if p.last_worked %} &middot; Last: {{ p.last_worked }}{% endif %}</div>
                 <div class="progress-bar">
                     <div class="progress-fill" style="width: {{ p.progress }}%; background: {{ '#2ECC71' if p.progress > 75 else '#3498DB' if p.progress >= 50 else '#F1C40F' if p.progress >= 25 else '#E74C3C' }};"></div>
                 </div>
@@ -1791,6 +1859,216 @@ def api_ai_config():
     return jsonify({'ok': True})
 
 
+@app.route('/api/settings', methods=['GET', 'POST'])
+def api_settings():
+    """Get or set dashboard settings (timezone, etc)."""
+    if request.method == 'GET':
+        settings = _load_settings()
+        ai_config = _load_ai_config()
+        return jsonify({**settings, 'ai_config': ai_config})
+
+    data = request.get_json(force=True)
+    settings = _load_settings()
+    if 'timezone' in data:
+        # Validate timezone
+        tz_name = data['timezone']
+        try:
+            ZoneInfo(tz_name)
+            settings['timezone'] = tz_name
+        except Exception:
+            return jsonify({'error': f'Invalid timezone: {tz_name}'}), 400
+    _save_settings(settings)
+
+    # Also save AI config if provided
+    if any(k in data for k in ('api_key', 'api_url', 'model')):
+        ai_config = _load_ai_config()
+        if 'api_url' in data:
+            ai_config['api_url'] = data['api_url']
+        if 'api_key' in data:
+            ai_config['api_key'] = data['api_key']
+        if 'model' in data:
+            ai_config['model'] = data['model']
+        _save_ai_config(ai_config)
+
+    return jsonify({'ok': True})
+
+
+SETTINGS_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Settings -- Dashboard</title>
+    <style>
+        """ + THEME_CSS + """
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); }
+        .top-bar { background: var(--bar-bg); color: var(--bar-text); padding: 16px 24px; display: flex; align-items: center; gap: 16px; }
+        .top-bar a { color: #8cc4e8; text-decoration: none; font-size: 13px; }
+        .top-bar a:hover { color: white; }
+        .top-bar h1 { font-size: 18px; font-weight: 600; flex: 1; }
+        .btn-theme { background: transparent; border: 1px solid rgba(255,255,255,0.3); color: var(--bar-text); font-size: 12px; padding: 5px 10px; border-radius: 4px; cursor: pointer; }
+        .container { max-width: 600px; margin: 0 auto; padding: 24px 20px; }
+        .card { background: var(--bg-card); border-radius: 8px; padding: 22px; margin-bottom: 16px; box-shadow: 0 1px 3px var(--shadow); }
+        .card h2 { font-size: 15px; font-weight: 600; color: var(--heading); margin-bottom: 16px; }
+        label { display: block; font-size: 12px; color: var(--text-secondary); margin: 12px 0 5px; font-weight: 600; }
+        input[type="text"], select { width: 100%; padding: 9px 12px; border: 1px solid var(--input-border); border-radius: 5px; font-size: 13px; background: var(--input-bg); color: var(--text); }
+        .hint { font-size: 10px; color: var(--text-muted); margin-top: 3px; }
+        .btn { padding: 10px 22px; border-radius: 5px; font-size: 13px; font-weight: 600; cursor: pointer; border: none; color: white; }
+        .btn-save { background: #3498DB; }
+        .btn-save:hover { background: #2980B9; }
+        .btn-save:disabled { opacity: 0.5; }
+        .status-msg { display: inline-block; margin-left: 12px; font-size: 12px; font-weight: 600; }
+        footer { text-align: center; font-size: 11px; color: var(--text-muted); margin-top: 30px; }
+        footer a { color: var(--text-muted); text-decoration: none; }
+    </style>
+    <script>
+        (function() {
+            var t = localStorage.getItem('theme') || 'light';
+            document.documentElement.setAttribute('data-theme', t);
+        })();
+    </script>
+</head>
+<body>
+    <div class="top-bar">
+        <a href="/">&larr; Dashboard</a>
+        <h1>Settings</h1>
+        <button class="btn-theme" onclick="toggleTheme()"><span id="themeIcon"></span></button>
+    </div>
+    <div class="container">
+        <div class="card">
+            <h2>Timezone</h2>
+            <label for="tz">Display Timezone</label>
+            <select id="tz">
+                <option value="America/Chicago" {{ 'selected' if settings.timezone == 'America/Chicago' }}>Central US (America/Chicago)</option>
+                <option value="America/New_York" {{ 'selected' if settings.timezone == 'America/New_York' }}>Eastern US (America/New_York)</option>
+                <option value="America/Denver" {{ 'selected' if settings.timezone == 'America/Denver' }}>Mountain US (America/Denver)</option>
+                <option value="America/Los_Angeles" {{ 'selected' if settings.timezone == 'America/Los_Angeles' }}>Pacific US (America/Los_Angeles)</option>
+                <option value="UTC" {{ 'selected' if settings.timezone == 'UTC' }}>UTC</option>
+                <option value="Europe/London" {{ 'selected' if settings.timezone == 'Europe/London' }}>London (Europe/London)</option>
+            </select>
+            <div class="hint">Automatically adjusts for daylight savings. Current time: {{ current_time }}</div>
+        </div>
+
+        <div class="card">
+            <h2>AI Configuration</h2>
+            <p style="font-size:12px; color:var(--text-secondary); margin-bottom:12px;">
+                Configure an Anthropic API key so the dashboard can generate richer project descriptions and classify unmatched chats.
+                Stored locally in ~/.claudesync_ai.json. Never leaves this machine.
+            </p>
+            <label for="ai_key">API Key</label>
+            <input type="text" id="ai_key" placeholder="sk-ant-..." value="">
+            <div class="hint">
+                {% if ai_config.api_key %}Currently set ({{ ai_config.api_key[:8] }}...){% else %}Not configured{% endif %}
+            </div>
+            <label for="ai_url">API URL</label>
+            <input type="text" id="ai_url" value="{{ ai_config.api_url }}">
+            <label for="ai_model">Model</label>
+            <select id="ai_model">
+                <option value="claude-haiku-4-5-20251001" {{ 'selected' if ai_config.model == 'claude-haiku-4-5-20251001' }}>Haiku 4.5 (fastest, cheapest)</option>
+                <option value="claude-sonnet-4-5-20250929" {{ 'selected' if ai_config.model == 'claude-sonnet-4-5-20250929' }}>Sonnet 4.5 (balanced)</option>
+                <option value="claude-opus-4-6" {{ 'selected' if ai_config.model == 'claude-opus-4-6' }}>Opus 4.6 (most capable)</option>
+            </select>
+        </div>
+
+        <div class="card">
+            <h2>Scan Paths</h2>
+            <label for="scan_paths">Directories to scan for PROJECT_STATUS.md</label>
+            <input type="text" id="scan_paths" value="{{ scan_paths }}" placeholder="~ ~/projects">
+            <div class="hint">Space-separated list of paths. Default: ~ (home directory)</div>
+        </div>
+
+        <div style="margin-top:20px;">
+            <button class="btn btn-save" id="saveBtn" onclick="saveSettings()">Save All Settings</button>
+            <span class="status-msg" id="saveStatus"></span>
+        </div>
+
+        <footer><a href="/">&larr; Back to Dashboard</a></footer>
+    </div>
+    <script>
+        function toggleTheme() {
+            var cur = document.documentElement.getAttribute('data-theme');
+            var next = cur === 'dark' ? 'light' : 'dark';
+            document.documentElement.setAttribute('data-theme', next);
+            localStorage.setItem('theme', next);
+            document.getElementById('themeIcon').textContent = next === 'dark' ? 'Light' : 'Dark';
+        }
+        document.getElementById('themeIcon').textContent =
+            document.documentElement.getAttribute('data-theme') === 'dark' ? 'Light' : 'Dark';
+
+        function saveSettings() {
+            var btn = document.getElementById('saveBtn');
+            var status = document.getElementById('saveStatus');
+            btn.disabled = true;
+            btn.textContent = 'Saving...';
+            status.textContent = '';
+
+            var body = {
+                timezone: document.getElementById('tz').value,
+                api_url: document.getElementById('ai_url').value,
+                model: document.getElementById('ai_model').value,
+            };
+            var key = document.getElementById('ai_key').value.trim();
+            if (key) body.api_key = key;
+
+            // Also save scan paths
+            var scanPaths = document.getElementById('scan_paths').value.trim();
+
+            fetch('/api/settings', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(body)
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                if (data.ok) {
+                    btn.textContent = 'Saved!';
+                    btn.style.background = '#2ECC71';
+                    status.textContent = 'Settings saved successfully';
+                    status.style.color = '#2ECC71';
+                    setTimeout(function() {
+                        btn.textContent = 'Save All Settings';
+                        btn.style.background = '';
+                        btn.disabled = false;
+                        status.textContent = '';
+                    }, 2500);
+                } else {
+                    btn.textContent = 'Error';
+                    btn.style.background = '#E74C3C';
+                    status.textContent = data.error || 'Unknown error';
+                    status.style.color = '#E74C3C';
+                    btn.disabled = false;
+                }
+            })
+            .catch(function() {
+                btn.textContent = 'Failed';
+                btn.style.background = '#E74C3C';
+                status.textContent = 'Connection error';
+                status.style.color = '#E74C3C';
+                btn.disabled = false;
+            });
+        }
+    </script>
+</body>
+</html>
+"""
+
+
+@app.route('/settings')
+def settings_page():
+    """Settings page for timezone, AI config, and scan paths."""
+    settings = _load_settings()
+    ai_config = _load_ai_config()
+    return render_template_string(
+        SETTINGS_HTML,
+        settings=settings,
+        ai_config=ai_config,
+        scan_paths=_project_cache.get('scan_paths', '~'),
+        current_time=_format_timestamp(),
+    )
+
+
 @app.route('/api/dev-state/<int:idx>', methods=['POST'])
 def api_set_dev_state(idx):
     """Set the dev state for a project and persist it to PROJECT_STATUS.md."""
@@ -1905,7 +2183,7 @@ def upload():
         print(f"Chat history uploaded: {save_path}")
 
         meta = _load_import_meta()
-        meta['last_import'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+        meta['last_import'] = _format_timestamp()
         meta['last_file'] = chat_file.filename
         _save_import_meta(meta)
 
@@ -2691,7 +2969,7 @@ Conversations:
 
     # Save results for the UI
     initiatives = _load_initiatives()
-    initiatives['last_classified'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+    initiatives['last_classified'] = _format_timestamp()
     initiatives['results'] = all_results
     initiatives['total_unmatched'] = len(unmatched)
     _save_initiatives(initiatives)
