@@ -352,30 +352,32 @@ def _thread_key(project_name, thread_text):
 def _load_ai_config():
     """Load AI API configuration.
 
-    API key resolution order:
-      1. ANTHROPIC_API_KEY environment variable (preferred, never committed)
-      2. api_key field in data/ai_config.json (for backward compat)
+    The API key comes ONLY from the ANTHROPIC_API_KEY environment variable.
+    It is never stored in or read from the repo.
     """
     config = {'api_url': 'https://api.anthropic.com/v1/messages', 'api_key': '', 'model': 'claude-haiku-4-5-20251001'}
     if os.path.exists(AI_CONFIG_FILE):
         try:
             with open(AI_CONFIG_FILE, 'r') as f:
-                config.update(json.load(f))
+                saved = json.load(f)
+            # Only load non-secret fields from the file
+            if 'api_url' in saved:
+                config['api_url'] = saved['api_url']
+            if 'model' in saved:
+                config['model'] = saved['model']
         except Exception:
             pass
-    # Prefer env var for the key so it never has to live in the repo
-    env_key = os.environ.get('ANTHROPIC_API_KEY', '')
-    if env_key:
-        config['api_key'] = env_key
+    # Key only from env var — never from the repo file
+    config['api_key'] = os.environ.get('ANTHROPIC_API_KEY', '')
     return config
 
 
 def _save_ai_config(config):
-    """Save AI API configuration. Strips the key if it came from env."""
-    save_copy = dict(config)
-    # Don't persist the key to the repo file if it came from env
-    if os.environ.get('ANTHROPIC_API_KEY'):
-        save_copy['api_key'] = ''
+    """Save AI API configuration. Never writes the API key to disk."""
+    save_copy = {
+        'api_url': config.get('api_url', 'https://api.anthropic.com/v1/messages'),
+        'model': config.get('model', 'claude-haiku-4-5-20251001'),
+    }
     with open(AI_CONFIG_FILE, 'w') as f:
         json.dump(save_copy, f, indent=2)
 
@@ -1861,10 +1863,12 @@ def api_ai_config():
     config = _load_ai_config()
     if 'api_url' in data:
         config['api_url'] = data['api_url']
-    if 'api_key' in data:
-        config['api_key'] = data['api_key']
     if 'model' in data:
         config['model'] = data['model']
+    # API key submitted via the web UI is held in memory only for this session.
+    # It is never written to disk. Set ANTHROPIC_API_KEY env var for persistence.
+    if 'api_key' in data and data['api_key']:
+        config['api_key'] = data['api_key']
     _save_ai_config(config)
     return jsonify({'ok': True})
 
