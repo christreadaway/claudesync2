@@ -46,13 +46,20 @@ app = Flask(__name__)
 app.secret_key = os.urandom(24)
 
 UPLOAD_DIR = tempfile.mkdtemp(prefix='claudesync_')
-IGNORED_FILE = os.path.expanduser('~/.claudesync_ignored.json')
-RESOLVED_FILE = os.path.expanduser('~/.claudesync_resolved.json')
-AI_CONFIG_FILE = os.path.expanduser('~/.claudesync_ai.json')
-ARCHIVED_FILE = os.path.expanduser('~/.claudesync_archived.json')
-IMPORT_META_FILE = os.path.expanduser('~/.claudesync_import_meta.json')
-ITEM_ACTIONS_FILE = os.path.expanduser('~/.claudesync_item_actions.json')
-PRIORITIZED_FILE = os.path.expanduser('~/.claudesync_prioritized.json')
+
+# All persistent state lives in data/ within the repo so it syncs across machines.
+# API keys are the exception — they come from env vars or ~/.claudesync/config.json.
+_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+os.makedirs(_DATA_DIR, exist_ok=True)
+
+IGNORED_FILE = os.path.join(_DATA_DIR, 'ignored.json')
+RESOLVED_FILE = os.path.join(_DATA_DIR, 'resolved.json')
+AI_CONFIG_FILE = os.path.join(_DATA_DIR, 'ai_config.json')
+ARCHIVED_FILE = os.path.join(_DATA_DIR, 'archived.json')
+IMPORT_META_FILE = os.path.join(_DATA_DIR, 'import_meta.json')
+ITEM_ACTIONS_FILE = os.path.join(_DATA_DIR, 'item_actions.json')
+PRIORITIZED_FILE = os.path.join(_DATA_DIR, 'prioritized.json')
+PROJECT_CACHE_FILE = os.path.join(_DATA_DIR, 'project_cache.json')
 
 # Cache loaded projects so dashboard + drill-down share data
 _project_cache = {
@@ -60,6 +67,37 @@ _project_cache = {
     'scan_paths': '~',
     'chat_history_path': None,
 }
+
+
+def _save_project_cache():
+    """Persist the project cache to data/ so it survives restarts and machine changes."""
+    try:
+        save_data = {
+            'projects': _project_cache.get('projects', []),
+            'scan_paths': _project_cache.get('scan_paths', '~'),
+            'saved_at': datetime.now(CENTRAL_TZ).strftime('%Y-%m-%d %H:%M:%S'),
+        }
+        with open(PROJECT_CACHE_FILE, 'w') as f:
+            json.dump(save_data, f, indent=2)
+    except Exception as e:
+        print(f"Warning: Could not save project cache: {e}")
+
+
+def _load_project_cache():
+    """Load persisted project cache from data/ on startup."""
+    if os.path.exists(PROJECT_CACHE_FILE):
+        try:
+            with open(PROJECT_CACHE_FILE, 'r') as f:
+                data = json.load(f)
+            projects = data.get('projects', [])
+            if projects:
+                _project_cache['projects'] = projects
+                _project_cache['scan_paths'] = data.get('scan_paths', '~')
+                print(f"Loaded {len(projects)} projects from cache (saved {data.get('saved_at', '?')})")
+                return True
+        except Exception as e:
+            print(f"Warning: Could not load project cache: {e}")
+    return False
 
 # Background task state — shared between threads
 _bg_task = {
@@ -240,6 +278,10 @@ def _bg_run_load(scan_paths_str, chat_history_path, ai_analyze):
             if enriched or classified:
                 msg += '.'
 
+        # Persist the fully-loaded project cache to data/ so it survives
+        # restarts and works on any machine that clones the repo.
+        _save_project_cache()
+
         with _bg_task['lock']:
             _bg_task['result_msg'] = msg
 
@@ -308,20 +350,34 @@ def _thread_key(project_name, thread_text):
 # =============================================================================
 
 def _load_ai_config():
-    """Load AI API configuration."""
+    """Load AI API configuration.
+
+    API key resolution order:
+      1. ANTHROPIC_API_KEY environment variable (preferred, never committed)
+      2. api_key field in data/ai_config.json (for backward compat)
+    """
+    config = {'api_url': 'https://api.anthropic.com/v1/messages', 'api_key': '', 'model': 'claude-haiku-4-5-20251001'}
     if os.path.exists(AI_CONFIG_FILE):
         try:
             with open(AI_CONFIG_FILE, 'r') as f:
-                return json.load(f)
+                config.update(json.load(f))
         except Exception:
             pass
-    return {'api_url': 'https://api.anthropic.com/v1/messages', 'api_key': '', 'model': 'claude-haiku-4-5-20251001'}
+    # Prefer env var for the key so it never has to live in the repo
+    env_key = os.environ.get('ANTHROPIC_API_KEY', '')
+    if env_key:
+        config['api_key'] = env_key
+    return config
 
 
 def _save_ai_config(config):
-    """Save AI API configuration."""
+    """Save AI API configuration. Strips the key if it came from env."""
+    save_copy = dict(config)
+    # Don't persist the key to the repo file if it came from env
+    if os.environ.get('ANTHROPIC_API_KEY'):
+        save_copy['api_key'] = ''
     with open(AI_CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=2)
+        json.dump(save_copy, f, indent=2)
 
 
 # =============================================================================
@@ -932,7 +988,7 @@ DASHBOARD_HTML = """
             <h2>AI Description Enrichment</h2>
             <p style="font-size:12px; color:var(--text-secondary); margin-bottom:14px;">
                 Configure an Anthropic API endpoint so the dashboard can generate richer project descriptions.
-                Your key is stored locally in ~/.claudesync_ai.json.
+                Your key is stored in data/ai_config.json (keep it out of git if populated).
             </p>
             <label for="ai_url">API URL</label>
             <input type="text" id="ai_url" placeholder="https://api.anthropic.com/v1/messages" value="{{ ai_config.api_url }}">
@@ -966,7 +1022,7 @@ DASHBOARD_HTML = """
             </p>
             <label for="ai_prompt_key">API Key</label>
             <input type="text" id="ai_prompt_key" placeholder="sk-ant-..." style="font-family:monospace;">
-            <p style="font-size:10px; color:var(--text-muted); margin-top:4px;">Stored locally in ~/.claudesync_ai.json. Never leaves this machine.</p>
+            <p style="font-size:10px; color:var(--text-muted); margin-top:4px;">Tip: set ANTHROPIC_API_KEY env var instead of storing the key in the repo.</p>
             <div class="btn-row">
                 <button class="btn" style="background:#8e44ad;" id="aiPromptOk" onclick="aiPromptAccept()">OK</button>
                 <button type="button" class="btn btn-cancel" id="aiPromptSkip" onclick="aiPromptDecline()">Skip</button>
@@ -2611,7 +2667,7 @@ Projects:
     return jsonify({'results': results})
 
 
-INITIATIVE_FILE = os.path.expanduser('~/.claudesync_initiatives.json')
+INITIATIVE_FILE = os.path.join(_DATA_DIR, 'initiatives.json')
 
 
 def _load_initiatives():
@@ -2895,10 +2951,14 @@ def view_unmatched():
 
 
 if __name__ == '__main__':
-    print("Pre-loading projects...")
-    _load_cached_projects()
+    # Try loading persisted cache first (fast, works on any machine).
+    # Fall back to scanning local filesystem if no cache exists.
+    if not _load_project_cache():
+        print("No cached data found, scanning local projects...")
+        _load_cached_projects()
+        total = len(_project_cache['projects'])
+        print(f"Scanned {total} projects")
     total = len(_project_cache['projects'])
-    print(f"Loaded {total} projects")
 
     print("\n" + "="*60)
     print("  Project Portfolio Dashboard")

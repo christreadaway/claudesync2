@@ -28,3 +28,9 @@ Thumbs.db
 # Generated files
 *.pdf
 daily_report.log
+
+# Plan files
+plan.md
+
+# Data directory is tracked (centralized state), but never commit secrets
+# API keys go in environment variables or ~/.claudesync/config.json (local only)
