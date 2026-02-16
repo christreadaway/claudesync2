@@ -1,76 +1,29 @@
-# Claude Code Instructions - ClaudeSync2
+# ClaudeSync2 — CLAUDE.md
 
-## About This Project
-Tool to sync Claude Code sessions and track progress across all my projects. Exports chat transcripts to PDF, generates PROJECT_STATUS.md files, and creates a portfolio overview. The irony: I built this tool to solve context loss... but haven't fully deployed it yet.
+> **Repository:** `github.com/christreadaway/claudesync2`
+> **Category:** Infrastructure
+> **Stack:** Python, reportlab, matplotlib
+> **Localhost Port:** N/A
 
-## About Me (Chris Treadaway)
-Product builder, not a coder. I bring requirements and vision — you handle implementation.
+## What This Project Is
+Project status sync tool bridging Claude Code and Claude.ai
 
-**Working with me:**
-- Bias toward action - just do it, don't argue
-- Make terminal commands dummy-proof (always start with `cd ~/claudesync2`)
-- Minimize questions - make judgment calls and tell me what you chose
-- I get interrupted frequently - always end sessions with a handoff note
-- Match my writing style: conversational, grounded in experience, uses em-dashes and numbered lists
+## Session Start Protocol
+Before starting ANY work:
 
-## Tech Stack
-- **Language:** TypeScript/Node.js
-- **Key Libraries:** googleapis (Google Docs API), pdf-lib (PDF generation)
-- **Data Flow:** Claude Code transcripts → JSON → Google Doc → PDF
-- **Architecture:** CLI tool with commands: add, global, status, export
-
-## File Paths
-- **Always use:** `~/claudesync2/path/to/file`
-- **Never use:** `/Users/christreadaway/...`
-- **Always start commands with:** `cd ~/claudesync2`
-
-## PII Rules (CRITICAL)
-❌ NEVER include in any code output:
-- Real institution names → use [Parish Name], [School Name]
-- Staff/personal names → use [Staff Name]
-- Email addresses → use user@example.com
-- Phone numbers, addresses
-- Local file paths with /Users/christreadaway → use ~/
-- API keys, tokens, credentials
-
-✅ ALWAYS use placeholders in square brackets
-
-## My Other Repositories (Context for Portfolio)
-This tool tracks 13 repos:
-- **Infrastructure:** claudesync2, repodoctor, claude-project-sync
-- **Church:** ministryfair, ministrylife, catholicevents, sacramentalrecords
-- **School:** parentpoint, parentpointedu
-- **Product:** polygraph, audioscribe, grantfinder, personalcrm, vibecoach, desmond
-
-## Key Features
-- Register projects with `add` command
-- Run `global` to scan all projects and generate combined ~/.claude/CLAUDE.md
-- Generate PROJECT_STATUS.md for each project
-- Export to PDF with project summaries
-- Track progress across all projects in one view
-
-## CLI Commands
-```bash
-cd ~/claudesync2
-
-# Register a project
-node dist/cli.js add /path/to/project
-
-# Generate global context file
-node dist/cli.js global
-
-# Export project status
-node dist/cli.js status
-
-# Generate PDF portfolio
-node dist/cli.js export-pdf
-```
-
-## Known Issues
-- **PII in transcripts:** Need automated PII scrubbing before PDF export
-- **Conversation dates:** Fixed bug where dates weren't parsing correctly
-- **Portfolio index:** Needs PORTFOLIO_INDEX.md creation feature
-- **Project discovery:** Goes in circles asking "what repos exist?" (this is the problem this tool should solve!)
+1. Run `git fetch origin` to get latest remote state
+2. If creating a new branch, ALWAYS branch from latest `origin/main`:
+   ```
+   git fetch origin
+   git checkout -b <branch-name> origin/main
+   ```
+3. If PROJECT_STATUS.md or SESSION_NOTES.md are missing on the current branch, recover them:
+   ```
+   git checkout origin/main -- PROJECT_STATUS.md SESSION_NOTES.md 2>/dev/null || true
+   ```
+4. Read CLAUDE.md (this file) fully before starting work
+5. Read SESSION_NOTES.md if it exists — check for prior session context, blockers, and next steps
+6. Confirm the current branch and its relationship to main before making changes
 
 ## Session End Routine
 Before ending EVERY session, Claude will automatically create/update SESSION_NOTES.md:
@@ -123,87 +76,30 @@ Ready to merge: [Yes/No - why or why not]
 
 SESSION_NOTES.md is committed to the repo and tracks all session progress over time.
 
-## Git Branch Strategy
-- Claude Code browser creates a new branch every session
-- At session end: Tell me if we should merge to main
-- If merging:
-  ```bash
-  cd ~/claudesync2
-  git checkout main
-  git merge [feature-branch]
-  git push origin main
-  git branch -d [feature-branch]
-  ```
-- Delete merged branches immediately to keep repo clean
+## Project-Specific Notes
+- Generates PDF status dashboard across all projects
+- Scans PROJECT_STATUS.md files from each repo
+- Extracts meaningful git commits for status reports
+- Portfolio documentation and project tracking
+- PII cleanup utilities
 
-## Testing Approach
-- Test incrementally with one repo first (use claudesync2 itself as test case)
-- Verify PDF output doesn't contain PII
-- Check that PROJECT_STATUS.md updates correctly
-- Give me exact commands to run tests on my Mac
+## Security Requirements
+- Proactively self-evaluate for SQL injection, XSS, CSRF, auth bypasses, and other common vulnerabilities
+- Flag security issues before completing builds — do not wait to be asked
+- NEVER expose API keys, tokens, or credentials in code or committed files
+- Use .env files with .gitignore for local secrets
+- Use secrets managers or environment variables for production
 
-## Setup/Installation
-When I need to set up on a new machine:
-```bash
-cd ~/claudesync2
-npm install
-npm run build
-node dist/cli.js --help  # Verify it works
-```
+## PII Rules
+- No real institution names, people, addresses, phones, or emails in code — use [Parish Name], [Staff Name], etc.
+- No local file paths in committed code — use ~/ or environment variables
+- No API keys, tokens, or credentials in any committed files
+- These rules apply to ALL code, artifacts, files, or snippets generated
 
-## The Meta-Problem This Solves
-**Problem:** I lose context between Claude Code sessions
-- I don't know what branches exist
-- I forget what I built yesterday
-- I re-explain my repos every session
-- I waste 30-40% of my time on context resets
+## User Context
+- Chris is a product builder, NOT a developer — provide detailed, dummy-proof instructions
+- When giving terminal commands, ALWAYS start with `cd` to the correct directory
+- Default to Windows paths (C:\Users\chris-treadaway\) — Chris works primarily on Windows
+- Minimize questions — make reasonable judgment calls and explain what you chose
+- Auth preference: Google Sign-In via Firebase (never username/password)
 
-**Solution:** This tool should:
-1. Auto-generate PROJECT_STATUS.md after each session
-2. Export chat transcripts to searchable PDFs
-3. Create a portfolio view of all my projects
-4. Make it easy to pick up where I left off
-
-**Irony:** I built this tool but haven't finished deploying it across all my projects yet.
-
-## Project History
-- Started Feb 1-2, 2025
-- Active development through Feb 12
-- Multiple iterations on PDF generation
-- PII cleanup feature added Feb 5
-- Dashboard and status prompt features added Feb 11
-- Still needs: Full rollout to all 13 repos
-
-## Product Vision
-Phase 1 (current): CLI tool for local use
-Phase 2 (future): Web dashboard to view all projects
-Phase 3 (future): Integration with Claude.ai to auto-update from chat sessions
-
----
-Last Updated: February 15, 2026
-
-
-## Session Management
-
-### Reading Past Work
-- `SESSION_NOTES.md` contains complete session history with detailed conversations
-- Read this file at session start if you need context on recent work
-- Sessions are ordered newest-first with full technical details
-
-### Ending Sessions
-At the end of each session, say:
-> "Append session notes to SESSION_NOTES.md"
-
-Claude will automatically:
-1. Generate a detailed session entry with conversation highlights
-2. Add it to the top of SESSION_NOTES.md (newest first)
-3. Include all technical work, files changed, commands used
-4. Commit the updated file
-
-### What Gets Logged
-- Conversation highlights (substantial exchanges)
-- Technical work and implementation details
-- Files modified/created
-- Commands executed
-- URLs and documentation referenced
-- Problem-solving context and decisions made
