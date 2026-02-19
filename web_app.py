@@ -27,7 +27,16 @@ import threading
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+
+# Central Time: UTC-6 (CST) / UTC-5 (CDT)
+# Use a fixed offset for Central Standard Time; for daylight saving,
+# we'd need pytz/zoneinfo, but a simple approach: try zoneinfo first.
+try:
+    from zoneinfo import ZoneInfo
+    CENTRAL_TZ = ZoneInfo('America/Chicago')
+except ImportError:
+    # Fallback: CST is UTC-6
+    CENTRAL_TZ = timezone(timedelta(hours=-6))
 
 from flask import (Flask, request, send_file, render_template_string,
                    flash, redirect, url_for, jsonify, Response)
@@ -38,59 +47,20 @@ app = Flask(__name__)
 app.secret_key = os.urandom(24)
 
 UPLOAD_DIR = tempfile.mkdtemp(prefix='claudesync_')
-IGNORED_FILE = os.path.expanduser('~/.claudesync_ignored.json')
-RESOLVED_FILE = os.path.expanduser('~/.claudesync_resolved.json')
-AI_CONFIG_FILE = os.path.expanduser('~/.claudesync_ai.json')
-ARCHIVED_FILE = os.path.expanduser('~/.claudesync_archived.json')
-IMPORT_META_FILE = os.path.expanduser('~/.claudesync_import_meta.json')
-ITEM_ACTIONS_FILE = os.path.expanduser('~/.claudesync_item_actions.json')
-SETTINGS_FILE = os.path.expanduser('~/.claudesync_settings.json')
 
-DEFAULT_TIMEZONE = 'America/Chicago'  # Central US (auto-adjusts for daylight savings)
+# All persistent state lives in data/ within the repo so it syncs across machines.
+# API keys are the exception — they come from env vars or ~/.claudesync/config.json.
+_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+os.makedirs(_DATA_DIR, exist_ok=True)
 
-
-def _load_settings():
-    """Load dashboard settings from disk."""
-    if os.path.exists(SETTINGS_FILE):
-        try:
-            with open(SETTINGS_FILE, 'r') as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {'timezone': DEFAULT_TIMEZONE}
-
-
-def _save_settings(settings):
-    """Save dashboard settings to disk."""
-    with open(SETTINGS_FILE, 'w') as f:
-        json.dump(settings, f, indent=2)
-
-
-def _now_local():
-    """Get current datetime in the configured timezone."""
-    settings = _load_settings()
-    tz_name = settings.get('timezone', DEFAULT_TIMEZONE)
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = ZoneInfo(DEFAULT_TIMEZONE)
-    return datetime.now(tz)
-
-
-def _format_timestamp(dt=None):
-    """Format a datetime as a readable timestamp in the configured timezone."""
-    if dt is None:
-        dt = _now_local()
-    elif dt.tzinfo is None:
-        # Naive datetime — assume UTC and convert
-        settings = _load_settings()
-        tz_name = settings.get('timezone', DEFAULT_TIMEZONE)
-        try:
-            tz = ZoneInfo(tz_name)
-        except Exception:
-            tz = ZoneInfo(DEFAULT_TIMEZONE)
-        dt = dt.replace(tzinfo=timezone.utc).astimezone(tz)
-    return dt.strftime('%Y-%m-%d %I:%M %p %Z')
+IGNORED_FILE = os.path.join(_DATA_DIR, 'ignored.json')
+RESOLVED_FILE = os.path.join(_DATA_DIR, 'resolved.json')
+AI_CONFIG_FILE = os.path.join(_DATA_DIR, 'ai_config.json')
+ARCHIVED_FILE = os.path.join(_DATA_DIR, 'archived.json')
+IMPORT_META_FILE = os.path.join(_DATA_DIR, 'import_meta.json')
+ITEM_ACTIONS_FILE = os.path.join(_DATA_DIR, 'item_actions.json')
+PRIORITIZED_FILE = os.path.join(_DATA_DIR, 'prioritized.json')
+PROJECT_CACHE_FILE = os.path.join(_DATA_DIR, 'project_cache.json')
 
 # Cache loaded projects so dashboard + drill-down share data
 _project_cache = {
@@ -99,6 +69,37 @@ _project_cache = {
     'chat_history_path': None,
     'lock': threading.Lock(),
 }
+
+
+def _save_project_cache():
+    """Persist the project cache to data/ so it survives restarts and machine changes."""
+    try:
+        save_data = {
+            'projects': _project_cache.get('projects', []),
+            'scan_paths': _project_cache.get('scan_paths', '~'),
+            'saved_at': datetime.now(CENTRAL_TZ).strftime('%Y-%m-%d %H:%M:%S'),
+        }
+        with open(PROJECT_CACHE_FILE, 'w') as f:
+            json.dump(save_data, f, indent=2)
+    except Exception as e:
+        print(f"Warning: Could not save project cache: {e}")
+
+
+def _load_project_cache():
+    """Load persisted project cache from data/ on startup."""
+    if os.path.exists(PROJECT_CACHE_FILE):
+        try:
+            with open(PROJECT_CACHE_FILE, 'r') as f:
+                data = json.load(f)
+            projects = data.get('projects', [])
+            if projects:
+                _project_cache['projects'] = projects
+                _project_cache['scan_paths'] = data.get('scan_paths', '~')
+                print(f"Loaded {len(projects)} projects from cache (saved {data.get('saved_at', '?')})")
+                return True
+        except Exception as e:
+            print(f"Warning: Could not load project cache: {e}")
+    return False
 
 # Background task state — shared between threads
 _bg_task = {
@@ -111,10 +112,23 @@ _bg_task = {
 }
 
 
-def _get_projects():
-    """Thread-safe read of the cached projects list."""
-    with _project_cache['lock']:
-        return list(_project_cache.get('projects', []))
+def _today_central():
+    """Return today's date string (YYYY-MM-DD) in Central Time."""
+    return datetime.now(CENTRAL_TZ).strftime('%Y-%m-%d')
+
+
+def _filter_future_dates(projects):
+    """Remove timeline entries with dates beyond today in Central Time.
+
+    Also updates last_worked to not exceed today.
+    """
+    today = _today_central()
+    for p in projects:
+        timeline = p.get('timeline', [])
+        if timeline:
+            p['timeline'] = [e for e in timeline if e.get('date', '') <= today]
+        if p.get('last_worked', '') > today:
+            p['last_worked'] = today
 
 
 def _bg_progress(step, detail=''):
@@ -194,7 +208,7 @@ Conversations:
     # Save results
     if all_results:
         initiatives = _load_initiatives()
-        initiatives['last_classified'] = _format_timestamp()
+        initiatives['last_classified'] = datetime.now(CENTRAL_TZ).strftime('%Y-%m-%d %H:%M')
         initiatives['results'] = all_results
         initiatives['total_unmatched'] = len(unmatched_chats)
         _save_initiatives(initiatives)
@@ -224,12 +238,15 @@ def _bg_run_load(scan_paths_str, chat_history_path, ai_analyze):
             chat_history_path=chp,
             verbose=False,
             progress_callback=_bg_progress,
+            flat=True,
         )
 
-        with _project_cache['lock']:
-            _project_cache['projects'] = projects
-            _project_cache['scan_paths'] = scan_paths_str
-            _project_cache['chat_history_path'] = chp
+        # Filter out future dates (based on Central Time)
+        _filter_future_dates(projects)
+
+        _project_cache['projects'] = projects
+        _project_cache['scan_paths'] = scan_paths_str
+        _project_cache['chat_history_path'] = chp
 
         # Chat stats
         chat_stats = getattr(load_projects, '_last_chat_stats', {})
@@ -273,6 +290,10 @@ def _bg_run_load(scan_paths_str, chat_history_path, ai_analyze):
                 msg += '.'
             if ai_warnings:
                 msg += ' Warnings: ' + '; '.join(ai_warnings)
+
+        # Persist the fully-loaded project cache to data/ so it survives
+        # restarts and works on any machine that clones the repo.
+        _save_project_cache()
 
         with _bg_task['lock']:
             _bg_task['result_msg'] = msg
@@ -342,20 +363,36 @@ def _thread_key(project_name, thread_text):
 # =============================================================================
 
 def _load_ai_config():
-    """Load AI API configuration."""
+    """Load AI API configuration.
+
+    The API key comes ONLY from the ANTHROPIC_API_KEY environment variable.
+    It is never stored in or read from the repo.
+    """
+    config = {'api_url': 'https://api.anthropic.com/v1/messages', 'api_key': '', 'model': 'claude-haiku-4-5-20251001'}
     if os.path.exists(AI_CONFIG_FILE):
         try:
             with open(AI_CONFIG_FILE, 'r') as f:
-                return json.load(f)
+                saved = json.load(f)
+            # Only load non-secret fields from the file
+            if 'api_url' in saved:
+                config['api_url'] = saved['api_url']
+            if 'model' in saved:
+                config['model'] = saved['model']
         except Exception:
             pass
-    return {'api_url': 'https://api.anthropic.com/v1/messages', 'api_key': '', 'model': 'claude-haiku-4-5-20251001'}
+    # Key only from env var — never from the repo file
+    config['api_key'] = os.environ.get('ANTHROPIC_API_KEY', '')
+    return config
 
 
 def _save_ai_config(config):
-    """Save AI API configuration."""
+    """Save AI API configuration. Never writes the API key to disk."""
+    save_copy = {
+        'api_url': config.get('api_url', 'https://api.anthropic.com/v1/messages'),
+        'model': config.get('model', 'claude-haiku-4-5-20251001'),
+    }
     with open(AI_CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=2)
+        json.dump(save_copy, f, indent=2)
 
 
 # =============================================================================
@@ -422,6 +459,30 @@ def _item_key(project_name, item_type, item_text):
 
 
 # =============================================================================
+# PRIORITIZED THREADS PERSISTENCE
+# =============================================================================
+
+def _load_prioritized():
+    """Load prioritized thread keys from disk.
+
+    Keys are 'project_name::thread_text' (same format as resolved keys).
+    """
+    if os.path.exists(PRIORITIZED_FILE):
+        try:
+            with open(PRIORITIZED_FILE, 'r') as f:
+                return set(json.load(f))
+        except Exception:
+            pass
+    return set()
+
+
+def _save_prioritized(keys):
+    """Save prioritized thread keys to disk."""
+    with open(PRIORITIZED_FILE, 'w') as f:
+        json.dump(sorted(keys), f, indent=2)
+
+
+# =============================================================================
 # DATA LOADING + EOL DETECTION
 # =============================================================================
 
@@ -435,7 +496,10 @@ def _load_cached_projects(scan_paths_str=None, chat_history_path=None):
 
     chp = chat_history_path or _project_cache.get('chat_history_path')
 
-    projects = load_projects(scan_paths=scan_paths, chat_history_path=chp, verbose=False)
+    projects = load_projects(scan_paths=scan_paths, chat_history_path=chp, verbose=False, flat=True)
+
+    # Filter out future dates (based on Central Time)
+    _filter_future_dates(projects)
 
     with _project_cache['lock']:
         _project_cache['projects'] = projects
@@ -471,7 +535,7 @@ def _detect_eol(project):
                 continue
         if dates:
             latest = max(dates)
-            days_ago = (datetime.now() - latest).days
+            days_ago = (datetime.now(CENTRAL_TZ).replace(tzinfo=None) - latest).days
             if days_ago > 90:
                 return f'No activity in {days_ago} days'
 
@@ -951,9 +1015,9 @@ DASHBOARD_HTML = """
             {% endif %}
             <form method="POST" action="/upload" enctype="multipart/form-data">
                 <div class="drop-zone" id="dropZone">
-                    <p>Drag & drop a chat export zip, or click to browse</p>
+                    <p>Drag & drop a Claude.ai export (.dms or .zip), or click to browse</p>
                     <p class="filename" id="fileName"></p>
-                    <input type="file" name="chat_history" id="fileInput" accept=".zip,.md,.txt">
+                    <input type="file" name="chat_history" id="fileInput" accept=".zip,.dms,.md,.txt,.json">
                 </div>
                 <label for="scan_paths">Scan Paths</label>
                 <input type="text" name="scan_paths" id="scanPaths" value="{{ scan_paths }}" placeholder="~ ~/projects">
@@ -972,7 +1036,7 @@ DASHBOARD_HTML = """
             <h2>AI Description Enrichment</h2>
             <p style="font-size:12px; color:var(--text-secondary); margin-bottom:14px;">
                 Configure an Anthropic API endpoint so the dashboard can generate richer project descriptions.
-                Your key is stored locally in ~/.claudesync_ai.json.
+                Your key is stored in data/ai_config.json (keep it out of git if populated).
             </p>
             <label for="ai_url">API URL</label>
             <input type="text" id="ai_url" placeholder="https://api.anthropic.com/v1/messages" value="{{ ai_config.api_url }}">
@@ -1006,7 +1070,7 @@ DASHBOARD_HTML = """
             </p>
             <label for="ai_prompt_key">API Key</label>
             <input type="text" id="ai_prompt_key" placeholder="sk-ant-..." style="font-family:monospace;">
-            <p style="font-size:10px; color:var(--text-muted); margin-top:4px;">Stored locally in ~/.claudesync_ai.json. Never leaves this machine.</p>
+            <p style="font-size:10px; color:var(--text-muted); margin-top:4px;">Tip: set ANTHROPIC_API_KEY env var instead of storing the key in the repo.</p>
             <div class="btn-row">
                 <button class="btn" style="background:#8e44ad;" id="aiPromptOk" onclick="aiPromptAccept()">OK</button>
                 <button type="button" class="btn btn-cancel" id="aiPromptSkip" onclick="aiPromptDecline()">Skip</button>
@@ -1441,7 +1505,11 @@ PROJECT_DETAIL_HTML = """
                         {{ thread_text }}
                         <div class="thread-meta">{{ project.name }}</div>
                     </div>
-                    <button class="btn-resolve" onclick="resolveThread('{{ project.name }}', '{{ thread_text[:100]|e }}', this)">Resolve</button>
+                    <div style="display:flex; gap:4px; flex-shrink:0;">
+                        <button class="btn-resolve" onclick="resolveThread('{{ project.name }}', '{{ thread_text[:100]|e }}', this)">Resolve</button>
+                        <button class="btn-resolve" style="color:#95a5a6; border-color:#95a5a6;" onclick="ignoreThread('{{ project.name }}', '{{ thread_text[:100]|e }}', this)">Ignore</button>
+                        <button class="btn-resolve" style="color:#e67e22; border-color:#e67e22;" onclick="prioritizeThread('{{ project.name }}', '{{ thread_text[:100]|e }}', this)">Prioritize</button>
+                    </div>
                 </li>
                 {% endfor %}
             </ul>
@@ -1480,6 +1548,38 @@ PROJECT_DETAIL_HTML = """
                 li.style.opacity = '0.3';
                 li.style.textDecoration = 'line-through';
                 btn.textContent = 'Resolved';
+            });
+        }
+
+        function ignoreThread(projectName, threadText, btn) {
+            btn.textContent = '...';
+            btn.disabled = true;
+            fetch('/api/ignore-thread', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({project: projectName, text: threadText})
+            })
+            .then(r => r.json())
+            .then(function() {
+                var li = btn.closest('li');
+                li.style.opacity = '0.3';
+                btn.textContent = 'Ignored';
+            });
+        }
+
+        function prioritizeThread(projectName, threadText, btn) {
+            btn.textContent = '...';
+            btn.disabled = true;
+            fetch('/api/prioritize-thread', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({project: projectName, text: threadText})
+            })
+            .then(r => r.json())
+            .then(function() {
+                btn.textContent = 'Prioritized';
+                btn.style.background = '#e67e22';
+                btn.style.color = 'white';
             });
         }
 
@@ -1778,14 +1878,67 @@ def project_detail(idx):
 
 @app.route('/api/resolve-thread', methods=['POST'])
 def api_resolve_thread():
-    """Mark a thread as resolved."""
+    """Mark a thread as resolved (done)."""
     data = request.get_json(force=True)
     project_name = data.get('project', '')
     thread_text = data.get('text', '')
     if project_name and thread_text:
+        key = _thread_key(project_name, thread_text)
         resolved = _load_resolved()
-        resolved.add(_thread_key(project_name, thread_text))
+        resolved.add(key)
         _save_resolved(resolved)
+        # Also remove from prioritized if it was there
+        prioritized = _load_prioritized()
+        prioritized.discard(key)
+        _save_prioritized(prioritized)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/ignore-thread', methods=['POST'])
+def api_ignore_thread():
+    """Mark a thread as ignored (doesn't matter). Persists like resolved."""
+    data = request.get_json(force=True)
+    project_name = data.get('project', '')
+    thread_text = data.get('text', '')
+    if project_name and thread_text:
+        key = _thread_key(project_name, thread_text)
+        # Store in resolved set (ignored items are effectively removed from view)
+        # But track separately so we can distinguish ignored vs resolved
+        resolved = _load_resolved()
+        resolved.add(key)
+        _save_resolved(resolved)
+        # Also remove from prioritized if it was there
+        prioritized = _load_prioritized()
+        prioritized.discard(key)
+        _save_prioritized(prioritized)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/prioritize-thread', methods=['POST'])
+def api_prioritize_thread():
+    """Mark a thread as prioritized. Surfaces it high in What's Next."""
+    data = request.get_json(force=True)
+    project_name = data.get('project', '')
+    thread_text = data.get('text', '')
+    if project_name and thread_text:
+        key = _thread_key(project_name, thread_text)
+        prioritized = _load_prioritized()
+        prioritized.add(key)
+        _save_prioritized(prioritized)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/unprioritize-thread', methods=['POST'])
+def api_unprioritize_thread():
+    """Remove priority from a thread."""
+    data = request.get_json(force=True)
+    project_name = data.get('project', '')
+    thread_text = data.get('text', '')
+    if project_name and thread_text:
+        key = _thread_key(project_name, thread_text)
+        prioritized = _load_prioritized()
+        prioritized.discard(key)
+        _save_prioritized(prioritized)
     return jsonify({'ok': True})
 
 
@@ -1851,10 +2004,12 @@ def api_ai_config():
     config = _load_ai_config()
     if 'api_url' in data:
         config['api_url'] = data['api_url']
-    if 'api_key' in data:
-        config['api_key'] = data['api_key']
     if 'model' in data:
         config['model'] = data['model']
+    # API key submitted via the web UI is held in memory only for this session.
+    # It is never written to disk. Set ANTHROPIC_API_KEY env var for persistence.
+    if 'api_key' in data and data['api_key']:
+        config['api_key'] = data['api_key']
     _save_ai_config(config)
     return jsonify({'ok': True})
 
@@ -2183,7 +2338,7 @@ def upload():
         print(f"Chat history uploaded: {save_path}")
 
         meta = _load_import_meta()
-        meta['last_import'] = _format_timestamp()
+        meta['last_import'] = datetime.now(CENTRAL_TZ).strftime('%Y-%m-%d %H:%M')
         meta['last_file'] = chat_file.filename
         _save_import_meta(meta)
 
@@ -2209,11 +2364,16 @@ def generate_pdf():
         flash('No projects found. Upload data first.', 'error')
         return redirect(url_for('dashboard'))
 
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = _today_central()
     output_path = os.path.join(UPLOAD_DIR, f'Project_Portfolio_Status_{today}.pdf')
 
     try:
-        create_pdf(output_path, projects)
+        # create_pdf expects {'with_repos': [...], 'without_repos': [...]}
+        pdf_projects = {
+            'with_repos': [p for p in projects if p.get('has_github_repo')],
+            'without_repos': [p for p in projects if not p.get('has_github_repo')],
+        }
+        create_pdf(output_path, pdf_projects)
     except Exception as e:
         flash(f'Error generating PDF: {e}', 'error')
         return redirect(url_for('dashboard'))
@@ -2279,6 +2439,12 @@ LIST_VIEW_HTML = """
         .progress-fill { height: 100%; border-radius: 3px; }
         .btn-sm.btn-ignore { border-color: #95a5a6; color: #95a5a6; }
         .btn-sm.btn-ignore:hover { background: #95a5a6; color: white; }
+        .btn-sm.btn-prioritize { border-color: #e67e22; color: #e67e22; }
+        .btn-sm.btn-prioritize:hover { background: #e67e22; color: white; }
+        .btn-sm.btn-unprioritize { border-color: #95a5a6; color: #95a5a6; }
+        .btn-sm.btn-unprioritize:hover { background: #95a5a6; color: white; }
+        .tag-priority { background: #e67e22; color: white; }
+        .item-prioritized { border-left: 3px solid #e67e22; }
         .btn-sm.btn-reassign { border-color: #8e44ad; color: #8e44ad; }
         .btn-sm.btn-reassign:hover { background: #8e44ad; color: white; }
         .btn-sm.btn-undo { border-color: #3498db; color: #3498db; }
@@ -2454,8 +2620,10 @@ def view_threads():
     projects = _get_projects()
     resolved = _load_resolved()
     ignored = _load_ignored()
+    prioritized = _load_prioritized()
 
-    items = ''
+    priority_items = []
+    normal_items = []
     count = 0
     for i, p in enumerate(projects):
         name = p.get('name', '')
@@ -2468,17 +2636,43 @@ def view_threads():
             count += 1
             tag_class = {'Blocker': 'tag-blocker', 'Open Question': 'tag-question',
                          'Next Step': 'tag-next'}.get(t_type, 'tag-notbuilt')
-            items += f'''<div class="list-item">
+            safe_text = t_text[:100].replace(chr(39), "&#39;")
+            safe_name = name.replace(chr(39), "&#39;")
+            is_prioritized = key in prioritized
+
+            if is_prioritized:
+                prio_btn = f'''<button class="btn-sm btn-unprioritize" onclick="apiAction('/api/unprioritize-thread', {{project:'{safe_name}', text:'{safe_text}'}}, this)">Deprioritize</button>'''
+            else:
+                prio_btn = f'''<button class="btn-sm btn-prioritize" onclick="apiAction('/api/prioritize-thread', {{project:'{safe_name}', text:'{safe_text}'}}, this)">Prioritize</button>'''
+
+            html = f'''<div class="list-item{'  item-prioritized' if is_prioritized else ''}">
                 <div class="main">
-                    <div class="title"><span class="tag {tag_class}">{t_type}</span> {t_text}</div>
+                    <div class="title">{'<span class="tag tag-priority">PRIORITY</span> ' if is_prioritized else ''}<span class="tag {tag_class}">{t_type}</span> {t_text}</div>
                     <div class="subtitle"><a href="/project/{i}" style="color:inherit;">{name}</a></div>
                 </div>
                 <div class="actions">
-                    <button class="btn-sm btn-resolve" onclick="apiAction('/api/resolve-thread', {{project:'{name}', text:'{t_text[:100].replace(chr(39), "&#39;")}'}}, this)">Resolve</button>
+                    <button class="btn-sm btn-resolve" onclick="apiAction('/api/resolve-thread', {{project:'{safe_name}', text:'{safe_text}'}}, this)">Resolve</button>
+                    <button class="btn-sm btn-ignore" onclick="apiAction('/api/ignore-thread', {{project:'{safe_name}', text:'{safe_text}'}}, this)">Ignore</button>
+                    {prio_btn}
                 </div>
             </div>'''
 
-    content = f'<div class="list-card">{items}</div>' if items else '<div class="empty">No open threads</div>'
+            if is_prioritized:
+                priority_items.append(html)
+            else:
+                normal_items.append(html)
+
+    content = ''
+    if priority_items:
+        content += '<div class="section-header">Prioritized</div>'
+        content += f'<div class="list-card">{"".join(priority_items)}</div>'
+    if normal_items:
+        if priority_items:
+            content += '<div class="section-header">Other Threads</div>'
+        content += f'<div class="list-card">{"".join(normal_items)}</div>'
+    if not priority_items and not normal_items:
+        content = '<div class="empty">No open threads</div>'
+
     return render_template_string(LIST_VIEW_HTML, title=f'Open Threads ({count})', content=content)
 
 
@@ -2487,8 +2681,10 @@ def view_blockers():
     projects = _get_projects()
     resolved = _load_resolved()
     ignored = _load_ignored()
+    prioritized = _load_prioritized()
 
-    items = ''
+    priority_items = []
+    normal_items = []
     count = 0
     for i, p in enumerate(projects):
         name = p.get('name', '')
@@ -2501,17 +2697,43 @@ def view_blockers():
             if key in resolved:
                 continue
             count += 1
-            items += f'''<div class="list-item">
+            safe_text = t_text[:100].replace(chr(39), "&#39;")
+            safe_name = name.replace(chr(39), "&#39;")
+            is_prioritized = key in prioritized
+
+            if is_prioritized:
+                prio_btn = f'''<button class="btn-sm btn-unprioritize" onclick="apiAction('/api/unprioritize-thread', {{project:'{safe_name}', text:'{safe_text}'}}, this)">Deprioritize</button>'''
+            else:
+                prio_btn = f'''<button class="btn-sm btn-prioritize" onclick="apiAction('/api/prioritize-thread', {{project:'{safe_name}', text:'{safe_text}'}}, this)">Prioritize</button>'''
+
+            html = f'''<div class="list-item{'  item-prioritized' if is_prioritized else ''}">
                 <div class="main">
-                    <div class="title"><span class="tag tag-blocker">Blocker</span> {t_text}</div>
+                    <div class="title">{'<span class="tag tag-priority">PRIORITY</span> ' if is_prioritized else ''}<span class="tag tag-blocker">Blocker</span> {t_text}</div>
                     <div class="subtitle"><a href="/project/{i}" style="color:inherit;">{name}</a></div>
                 </div>
                 <div class="actions">
-                    <button class="btn-sm btn-resolve" onclick="apiAction('/api/resolve-thread', {{project:'{name}', text:'{t_text[:100].replace(chr(39), "&#39;")}'}}, this)">Resolve</button>
+                    <button class="btn-sm btn-resolve" onclick="apiAction('/api/resolve-thread', {{project:'{safe_name}', text:'{safe_text}'}}, this)">Resolve</button>
+                    <button class="btn-sm btn-ignore" onclick="apiAction('/api/ignore-thread', {{project:'{safe_name}', text:'{safe_text}'}}, this)">Ignore</button>
+                    {prio_btn}
                 </div>
             </div>'''
 
-    content = f'<div class="list-card">{items}</div>' if items else '<div class="empty">No blockers</div>'
+            if is_prioritized:
+                priority_items.append(html)
+            else:
+                normal_items.append(html)
+
+    content = ''
+    if priority_items:
+        content += '<div class="section-header">Prioritized</div>'
+        content += f'<div class="list-card">{"".join(priority_items)}</div>'
+    if normal_items:
+        if priority_items:
+            content += '<div class="section-header">Other Blockers</div>'
+        content += f'<div class="list-card">{"".join(normal_items)}</div>'
+    if not priority_items and not normal_items:
+        content = '<div class="empty">No blockers</div>'
+
     return render_template_string(LIST_VIEW_HTML, title=f'Blockers ({count})', content=content)
 
 
@@ -2556,6 +2778,7 @@ def view_whats_next():
     archived = _load_archived()
     resolved = _load_resolved()
     item_actions = _load_item_actions()
+    prioritized = _load_prioritized()
     ai_config = _load_ai_config()
     has_ai = bool(ai_config.get('api_key'))
 
@@ -2565,6 +2788,7 @@ def view_whats_next():
 
     # Build sections
     next_items = []      # Active items per project
+    priority_items = []  # Prioritized items (shown at top)
     flagged_items = []   # Items that have been reassigned (show in target project)
     ignored_items = []   # Dismissed items
 
@@ -2585,10 +2809,13 @@ def view_whats_next():
         # Next Steps (highest priority)
         for step in p.get('next_steps', []):
             key = _item_key(name, 'Next Step', step)
+            tkey = _thread_key(name, step)
             project_items.append({
                 'key': key, 'type': 'Next Step', 'text': step,
                 'project': name, 'project_idx': i,
                 'tag_class': 'tag-next', 'priority': 1,
+                'is_prioritized': tkey in prioritized,
+                'tkey': tkey,
             })
 
         # Blockers
@@ -2601,6 +2828,8 @@ def view_whats_next():
                 'key': key, 'type': 'Blocker', 'text': b,
                 'project': name, 'project_idx': i,
                 'tag_class': 'tag-blocker', 'priority': 0,
+                'is_prioritized': tkey in prioritized,
+                'tkey': tkey,
             })
 
         # Open Questions
@@ -2613,15 +2842,20 @@ def view_whats_next():
                 'key': key, 'type': 'Open Question', 'text': q,
                 'project': name, 'project_idx': i,
                 'tag_class': 'tag-question', 'priority': 2,
+                'is_prioritized': tkey in prioritized,
+                'tkey': tkey,
             })
 
         # Not Yet Built
         for nw in p.get('not_working', []):
             key = _item_key(name, 'Not Yet Built', nw)
+            tkey = _thread_key(name, nw)
             project_items.append({
                 'key': key, 'type': 'Not Yet Built', 'text': nw,
                 'project': name, 'project_idx': i,
                 'tag_class': 'tag-notbuilt', 'priority': 3,
+                'is_prioritized': tkey in prioritized,
+                'tkey': tkey,
             })
 
         # Sort by priority (blockers first, then next steps, questions, not built)
@@ -2634,6 +2868,8 @@ def view_whats_next():
             elif action and action.get('action') == 'reassigned':
                 item['reassigned_to'] = action.get('target_project', '')
                 flagged_items.append(item)
+            elif item.get('is_prioritized'):
+                priority_items.append(item)
             else:
                 next_items.append(item)
 
@@ -2661,6 +2897,30 @@ def view_whats_next():
     # Verify all categories button
     if has_ai:
         content += '<div style="margin-bottom:16px; text-align:right;"><button class="btn-sm btn-verify" onclick="verifyAllCategories(this)" style="padding:6px 14px; font-size:11px;">Verify All Categories with AI</button></div>'
+
+    # Prioritized items (shown first, flat list)
+    if priority_items:
+        content += f'<div class="section-header">Prioritized <span class="badge">{len(priority_items)}</span></div>'
+        content += '<div class="list-card">'
+        for item in priority_items:
+            dropdown_counter += 1
+            dd_id = f'dd-{dropdown_counter}'
+            safe_key = item['key'].replace("'", "&#39;").replace('"', '&quot;')
+            safe_text = item['text'].replace("'", "&#39;").replace('"', '&quot;')
+            safe_name = item['project'].replace(chr(39), "&#39;")
+
+            content += f'''<div class="list-item item-prioritized">
+                <div class="main">
+                    <div class="title"><span class="tag tag-priority">PRIORITY</span> <span class="tag {item['tag_class']}">{item['type']}</span> {item['text']}</div>
+                    <div class="subtitle"><a href="/project/{item['project_idx']}" style="color:inherit;">{item['project']}</a></div>
+                </div>
+                <div class="actions">
+                    <button class="btn-sm btn-resolve" onclick="apiAction('/api/resolve-thread', {{project:'{safe_name}', text:'{safe_text[:100]}'}}, this)">Resolve</button>
+                    <button class="btn-sm btn-ignore" onclick="apiAction('/api/item-action', {{key:'{safe_key}', action:'ignored'}}, this)">Ignore</button>
+                    <button class="btn-sm btn-unprioritize" onclick="apiAction('/api/unprioritize-thread', {{project:'{safe_name}', text:'{safe_text[:100]}'}}, this)">Deprioritize</button>
+                </div>
+            </div>'''
+        content += '</div>'
 
     # Active items grouped by project
     active_count = len(next_items)
@@ -2690,13 +2950,15 @@ def view_whats_next():
                 safe_key = item['key'].replace("'", "&#39;").replace('"', '&quot;')
                 safe_text = item['text'].replace("'", "&#39;").replace('"', '&quot;')
 
+                safe_name = item['project'].replace(chr(39), "&#39;")
                 content += f'''<div class="list-item">
                     <div class="main">
                         <div class="title"><span class="tag {item['tag_class']}">{item['type']}</span> {item['text']}</div>
                     </div>
                     <div class="actions">
-                        <button class="btn-sm btn-resolve" onclick="apiAction('/api/resolve-thread', {{project:'{item['project'].replace(chr(39), "&#39;")}', text:'{safe_text[:100]}'}}, this)">Resolve</button>
+                        <button class="btn-sm btn-resolve" onclick="apiAction('/api/resolve-thread', {{project:'{safe_name}', text:'{safe_text[:100]}'}}, this)">Resolve</button>
                         <button class="btn-sm btn-ignore" onclick="apiAction('/api/item-action', {{key:'{safe_key}', action:'ignored'}}, this)">Ignore</button>
+                        <button class="btn-sm btn-prioritize" onclick="apiAction('/api/prioritize-thread', {{project:'{safe_name}', text:'{safe_text[:100]}'}}, this)">Prioritize</button>
                         <button class="btn-sm btn-reassign" onclick="toggleDropdown('{dd_id}')">Reassign</button>
                         <div class="reassign-dropdown" id="{dd_id}">'''
 
@@ -2863,8 +3125,7 @@ Projects:
     return jsonify({'results': results})
 
 
-INITIATIVE_FILE = os.path.expanduser('~/.claudesync_initiatives.json')
-DISMISSED_CHATS_FILE = os.path.expanduser('~/.claudesync_dismissed_chats.json')
+INITIATIVE_FILE = os.path.join(_DATA_DIR, 'initiatives.json')
 
 
 def _load_initiatives():
@@ -2988,7 +3249,7 @@ Conversations:
 
     # Save results for the UI
     initiatives = _load_initiatives()
-    initiatives['last_classified'] = _format_timestamp()
+    initiatives['last_classified'] = datetime.now(CENTRAL_TZ).strftime('%Y-%m-%d %H:%M')
     initiatives['results'] = all_results
     initiatives['total_unmatched'] = len(unmatched)
     _save_initiatives(initiatives)
@@ -3383,6 +3644,15 @@ def view_unmatched():
 
 
 if __name__ == '__main__':
+    # Try loading persisted cache first (fast, works on any machine).
+    # Fall back to scanning local filesystem if no cache exists.
+    if not _load_project_cache():
+        print("No cached data found, scanning local projects...")
+        _load_cached_projects()
+        total = len(_project_cache['projects'])
+        print(f"Scanned {total} projects")
+    total = len(_project_cache['projects'])
+
     print("\n" + "="*60)
     print("  Project Portfolio Dashboard")
     print("  Open http://localhost:5111 in your browser")

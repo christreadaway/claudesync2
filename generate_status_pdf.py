@@ -21,7 +21,7 @@ import argparse
 import json
 import os
 import re
-import subprocess
+import sys
 import zipfile
 from datetime import datetime
 
@@ -501,6 +501,443 @@ def match_chat_to_projects(chat_files, projects, verbose=False):
 # PROJECT STATUS FILE PARSING
 # =============================================================================
 
+# =============================================================================
+# CHAT HISTORY PROCESSING - Claude.ai export (conversations.json in ZIP/DMS)
+# =============================================================================
+
+def load_chat_files(chat_path):
+    """Load conversations from a Claude.ai export (ZIP/DMS with conversations.json)
+    or a directory/file of text-based chat exports.
+
+    Claude.ai exports are .dms files (renamed ZIPs) containing conversations.json:
+    a JSON array of conversation objects with uuid, name, created_at, updated_at,
+    and chat_messages[].
+
+    Returns list of dicts: [{'filename': str, 'content': str, 'date': datetime|None}, ...]
+    """
+    chat_files = []
+    if chat_path is None:
+        return chat_files
+
+    chat_path = os.path.expanduser(chat_path)
+
+    if not os.path.exists(chat_path):
+        return chat_files
+
+    # Try as ZIP/DMS archive first
+    if zipfile.is_zipfile(chat_path):
+        chat_files = _load_from_zip(chat_path)
+    elif os.path.isdir(chat_path):
+        # Walk directory for text files
+        for root, _dirs, files in os.walk(chat_path):
+            for fname in files:
+                if fname.endswith(('.md', '.txt', '.json')):
+                    fpath = os.path.join(root, fname)
+                    try:
+                        with open(fpath, 'r', errors='replace') as f:
+                            text = f.read()
+                        if fname == 'conversations.json':
+                            chat_files.extend(_parse_conversations_json(text))
+                        else:
+                            mod_time = datetime.fromtimestamp(os.path.getmtime(fpath))
+                            chat_files.append({
+                                'filename': fname,
+                                'content': text,
+                                'date': mod_time,
+                            })
+                    except Exception:
+                        continue
+    elif os.path.isfile(chat_path):
+        try:
+            with open(chat_path, 'r', errors='replace') as f:
+                text = f.read()
+            if chat_path.endswith('.json'):
+                chat_files.extend(_parse_conversations_json(text))
+            else:
+                mod_time = datetime.fromtimestamp(os.path.getmtime(chat_path))
+                chat_files.append({
+                    'filename': os.path.basename(chat_path),
+                    'content': text,
+                    'date': mod_time,
+                })
+        except Exception:
+            pass
+
+    return chat_files
+
+
+def _load_from_zip(zip_path):
+    """Extract conversations from a ZIP/DMS archive."""
+    chat_files = []
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            # Check for conversations.json (Claude.ai native export)
+            names = zf.namelist()
+            conversations_files = [n for n in names
+                                   if os.path.basename(n) == 'conversations.json']
+            if conversations_files:
+                for cf in conversations_files:
+                    try:
+                        raw = zf.read(cf).decode('utf-8', errors='replace')
+                        chat_files.extend(_parse_conversations_json(raw))
+                    except Exception:
+                        continue
+            else:
+                # Fallback: treat individual files as chat exports
+                for name in names:
+                    if name.endswith(('.md', '.txt', '.json')):
+                        try:
+                            raw = zf.read(name).decode('utf-8', errors='replace')
+                            info = zf.getinfo(name)
+                            mod_time = datetime(*info.date_time) if info.date_time else None
+                            chat_files.append({
+                                'filename': os.path.basename(name),
+                                'content': raw,
+                                'date': mod_time,
+                            })
+                        except Exception:
+                            continue
+    except Exception:
+        pass
+    return chat_files
+
+
+def _parse_conversations_json(json_text):
+    """Parse a Claude.ai conversations.json export.
+
+    Format: JSON array of conversation objects with:
+      - uuid, name, created_at, updated_at
+      - chat_messages[]: each with text, sender, created_at, content[]
+
+    Returns list of chat_file dicts compatible with our pipeline.
+    """
+    chat_files = []
+    try:
+        data = json.loads(json_text)
+    except (json.JSONDecodeError, TypeError):
+        return chat_files
+
+    if not isinstance(data, list):
+        return chat_files
+
+    for conv in data:
+        if not isinstance(conv, dict):
+            continue
+
+        # Extract conversation metadata
+        conv_name = conv.get('name', '') or ''
+        conv_uuid = conv.get('uuid', '')
+        created_at = conv.get('created_at', '')
+        updated_at = conv.get('updated_at', '')
+
+        # Parse date - prefer updated_at for "when was this worked on"
+        conv_date = None
+        for date_str in [updated_at, created_at]:
+            if date_str:
+                try:
+                    conv_date = datetime.fromisoformat(
+                        date_str.replace('Z', '+00:00')
+                    )
+                    break
+                except (ValueError, TypeError):
+                    continue
+
+        # Build combined text content from all messages
+        messages = conv.get('chat_messages', [])
+        if not messages:
+            continue
+
+        text_parts = []
+        # Add conversation title
+        if conv_name:
+            text_parts.append(f"# {conv_name}\n")
+
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            sender = msg.get('sender', '')
+            # Get text from top-level text field
+            msg_text = msg.get('text', '')
+            # Also try content blocks
+            if not msg_text:
+                content_blocks = msg.get('content', [])
+                if isinstance(content_blocks, list):
+                    for block in content_blocks:
+                        if isinstance(block, dict) and block.get('type') == 'text':
+                            msg_text = block.get('text', '')
+                            break
+
+            if msg_text:
+                label = 'Human' if sender == 'human' else 'Assistant'
+                text_parts.append(f"{label}: {msg_text}")
+
+        if not text_parts:
+            continue
+
+        combined_text = '\n\n'.join(text_parts)
+
+        # Build filename from title or UUID
+        if conv_name:
+            safe_name = re.sub(r'[^\w\s-]', '', conv_name)[:60].strip()
+            filename = safe_name or conv_uuid[:12]
+        else:
+            filename = conv_uuid[:12] if conv_uuid else 'untitled'
+
+        chat_files.append({
+            'filename': filename,
+            'content': combined_text,
+            'date': conv_date,
+            'conversation_name': conv_name,
+            'uuid': conv_uuid,
+        })
+
+    return chat_files
+
+
+def _build_search_terms(project_name):
+    """Build fuzzy search patterns from a project name."""
+    name_lower = project_name.lower().strip()
+    terms = set()
+    terms.add(name_lower)
+
+    # Without version suffix
+    no_version = re.sub(r'\s*v\d+(\.\d+)*\s*$', '', name_lower).strip()
+    if no_version and len(no_version) > 3:
+        terms.add(no_version)
+
+    # No spaces
+    squashed = name_lower.replace(' ', '')
+    if len(squashed) > 5:
+        terms.add(squashed)
+
+    # First two significant words
+    words = [w for w in name_lower.split()
+             if len(w) > 2 and w not in ('the', 'and', 'for', 'app', 'project')]
+    if len(words) >= 2:
+        terms.add(words[0] + ' ' + words[1])
+
+    # Longest significant word (if long enough)
+    if words:
+        longest = max(words, key=len)
+        if len(longest) >= 8:
+            terms.add(longest)
+
+    return list(terms)
+
+
+def _split_into_paragraphs(text):
+    """Split chat text into meaningful paragraphs, filtering out code blocks."""
+    # Remove speaker labels
+    cleaned = re.sub(r'^(Human|Assistant|User|Claude|System)\s*:', '', text, flags=re.MULTILINE)
+    # Split on double newlines or horizontal rules
+    raw_blocks = re.split(r'\n\s*\n|\n---+\n', cleaned)
+
+    paragraphs = []
+    for block in raw_blocks:
+        block = block.strip()
+        if not block or block.startswith('```') or len(block) < 30:
+            continue
+
+        # Skip code-heavy blocks
+        code_indicators = ('$', '>', '#!', 'import ', 'from ', 'def ', 'class ',
+                           'function ', 'const ', 'let ', 'var ', 'return ', '{', '}')
+        code_line_count = sum(1 for line in block.split('\n')
+                              if line.strip().startswith(code_indicators))
+        total_lines = len(block.split('\n'))
+        if total_lines > 1 and code_line_count / total_lines > 0.6:
+            continue
+
+        # Clean formatting
+        clean = block.replace('**', '').replace('`', '')
+        clean = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', clean)  # [text](url) -> text
+        clean = re.sub(r'^#+\s+', '', clean, flags=re.MULTILINE)  # Remove headers
+        clean = re.sub(r'\n+', ' ', clean).strip()
+
+        if len(clean) >= 30:
+            paragraphs.append(clean)
+
+    return paragraphs
+
+
+def _overlap_ratio(a, b):
+    """Quick overlap check between two strings using word sets."""
+    words_a = set(a.lower().split())
+    words_b = set(b.lower().split())
+    if not words_a or not words_b:
+        return 0.0
+    intersection = words_a & words_b
+    smaller = min(len(words_a), len(words_b))
+    return len(intersection) / smaller if smaller > 0 else 0.0
+
+
+def match_chat_to_projects(chat_files, projects, verbose=False, progress_callback=None):
+    """Match chat history to projects using fuzzy name matching.
+
+    Returns:
+        tuple: (project_chat_data, chat_stats)
+            project_chat_data: {project_name: {snippets: [...], timeline_entries: [...],
+                                                conversation_entries: [...]}}
+            chat_stats: {total_files, total_conversations, matched_projects,
+                         unmatched_files, unmatched_chats: [...]}
+    """
+    def _progress(detail=''):
+        if progress_callback:
+            progress_callback('matching', detail)
+
+    project_chat_data = {}
+    matched_filenames = set()  # Track which chat files matched any project
+    total_conversations_matched = 0
+
+    for pi, project in enumerate(projects):
+        name = project.get('name', '')
+        if not name:
+            continue
+
+        _progress(f'Matching chats to {name} ({pi + 1}/{len(projects)})...')
+        search_terms = _build_search_terms(name)
+        scored_paragraphs = []  # (score, text, date, filename)
+        matched_conversations = {}  # filename -> {date, paragraph_count}
+
+        for chat in chat_files:
+            paragraphs = _split_into_paragraphs(chat['content'])
+            chat_date = chat.get('date')
+            chat_filename = chat.get('filename', '')
+            conv_name = chat.get('conversation_name', '')
+
+            # Also check if the conversation title itself mentions the project
+            title_bonus = 0
+            if conv_name:
+                title_lower = conv_name.lower()
+                for term in search_terms:
+                    if term in title_lower:
+                        title_bonus = 50  # Strong signal from title match
+                        break
+
+            for para in paragraphs:
+                para_lower = para.lower()
+                score = title_bonus  # Start with title bonus if any
+
+                for term in search_terms:
+                    count = para_lower.count(term)
+                    if count > 0:
+                        score += count * len(term)
+
+                if score > 0:
+                    # Bonuses for quality
+                    length_bonus = min(len(para), 500) / 100
+                    descriptive_words = ['project', 'build', 'feature', 'implement',
+                                         'design', 'status', 'progress', 'complete',
+                                         'working', 'develop', 'launch', 'deploy']
+                    desc_bonus = sum(1 for w in descriptive_words if w in para_lower)
+                    total_score = score + length_bonus + desc_bonus
+                    scored_paragraphs.append((total_score, para, chat_date, chat_filename))
+
+                    # Track per-conversation matching
+                    if chat_filename not in matched_conversations:
+                        matched_conversations[chat_filename] = {
+                            'date': chat_date,
+                            'paragraph_count': 0,
+                        }
+                    matched_conversations[chat_filename]['paragraph_count'] += 1
+
+        scored_paragraphs.sort(key=lambda x: x[0], reverse=True)
+
+        # Best snippets (deduped)
+        best_snippets = []
+        timeline_entries = []
+
+        for _score, para, chat_date, chat_filename in scored_paragraphs:
+            is_redundant = any(_overlap_ratio(para, existing) > 0.65
+                               for existing in best_snippets)
+            if not is_redundant:
+                best_snippets.append(para)
+
+                # Create dated timeline entry
+                if chat_date:
+                    date_str = chat_date.strftime('%Y-%m-%d')
+                else:
+                    date_str = ''
+
+                summary_line = para[:150]
+                if len(para) > 150:
+                    last_period = summary_line.rfind('.')
+                    if last_period > 80:
+                        summary_line = summary_line[:last_period + 1]
+                    else:
+                        summary_line = summary_line + '...'
+
+                timeline_entries.append({
+                    'date': date_str,
+                    'source': 'Claude.ai Chat',
+                    'text': summary_line,
+                })
+
+                if len(best_snippets) >= 50:
+                    break
+
+        # Build per-conversation entries (one per matched conversation)
+        conversation_entries = []
+        for fname, info in matched_conversations.items():
+            matched_filenames.add(fname)
+            if info.get('date'):
+                date_str = info['date'].strftime('%Y-%m-%d')
+            else:
+                date_str = ''
+            conversation_entries.append({
+                'date': date_str,
+                'source': 'Claude.ai Chat',
+                'text': f"Chat conversation ({info['paragraph_count']} relevant sections)",
+            })
+
+        if best_snippets or conversation_entries:
+            project_chat_data[name] = {
+                'snippets': best_snippets,
+                'timeline_entries': timeline_entries,
+                'conversation_entries': conversation_entries,
+            }
+            total_conversations_matched += len(matched_conversations)
+
+            if verbose:
+                print(f"  Chat match for '{name}': {len(scored_paragraphs)} candidates, "
+                      f"kept {len(best_snippets)} snippets, "
+                      f"{len(matched_conversations)} conversations")
+
+    # Build unmatched list
+    unmatched_chats = []
+    for chat in chat_files:
+        fname = chat.get('filename', '')
+        if fname not in matched_filenames:
+            # Build excerpt: strip code blocks, remove labels, take first 300 chars
+            raw = chat.get('content', '')
+            excerpt = re.sub(r'```[\s\S]*?```', '', raw)
+            excerpt = re.sub(r'^(Human|Assistant|User|Claude|System)\s*:',
+                             '', excerpt, flags=re.MULTILINE)
+            excerpt = excerpt.strip()[:300]
+
+            chat_date = chat.get('date')
+            date_str = chat_date.strftime('%Y-%m-%d') if chat_date else ''
+
+            unmatched_chats.append({
+                'filename': fname,
+                'date': date_str,
+                'excerpt': excerpt,
+            })
+
+    chat_stats = {
+        'total_files': len(chat_files),
+        'total_conversations': total_conversations_matched,
+        'matched_projects': len(project_chat_data),
+        'unmatched_files': len(unmatched_chats),
+        'unmatched_chats': unmatched_chats,
+    }
+
+    return project_chat_data, chat_stats
+
+
+# =============================================================================
+# PROJECT STATUS FILE SCANNING
+# =============================================================================
+
 def find_project_status_files(scan_paths=None, max_depth=2):
     """Find all PROJECT_STATUS.md files in scan paths."""
     if scan_paths is None:
@@ -538,11 +975,15 @@ def extract_list_items(content, header_pattern, max_items=10):
             line = line.strip()
             if line.startswith('-') or line.startswith('*'):
                 item = line.lstrip('-* ').strip()
-                placeholder_words = ['describe', 'nothing yet', 'none yet', 'tbd', 'todo',
-                                     'list ', 'add ', 'initial project', 'project structure']
+                # Skip placeholder items
+                placeholder_starts = ['describe', 'list ', 'add ', 'none']
+                placeholder_contains = ['nothing yet', 'none yet', 'tbd', 'todo',
+                                        'initial project', 'project structure']
+                item_lower = item.lower()
                 is_placeholder = (
                     item.startswith('(') or
-                    any(pw in item.lower() for pw in placeholder_words) or
+                    any(item_lower.startswith(pw) for pw in placeholder_starts) or
+                    any(pw in item_lower for pw in placeholder_contains) or
                     len(item) < 10
                 )
                 if item and not is_placeholder:
@@ -553,155 +994,35 @@ def extract_list_items(content, header_pattern, max_items=10):
     return items
 
 
-def extract_section_text(content, header_pattern):
-    """Extract full text content under a markdown header."""
-    match = re.search(
-        header_pattern + r'\s*\n(.*?)(?=\n## |\n---|\Z)',
-        content, re.DOTALL
-    )
-    if match:
-        text = match.group(1).strip()
-        text = text.replace('**', '')
-        text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
-        lines = []
-        for line in text.split('\n'):
-            line = line.strip()
-            if line.startswith('- ') or line.startswith('* '):
-                line = line[2:]
-            if line:
-                lines.append(line)
-        return ' '.join(lines)
-    return ''
+COMMIT_SKIP_PATTERNS = [
+    'add files via upload',
+    'initial commit',
+    'first commit',
+    'init commit',
+    'create readme',
+    'update readme',
+    'delete ',
+    'remove ',
+    'merge branch',
+    'merge pull request',
+    'wip',
+    'fix typo',
+    'minor fix',
+    'small fix',
+    'quick fix',
+    'bump version',
+    'update dependencies',
+    'update package',
+    'lint fix',
+    'format code',
+    'cleanup',
+    'refactor',
+]
 
 
-def extract_progress_log(content):
-    """Parse the ## Progress Log section into dated entries.
-
-    Returns a list of dicts: [{'date': str, 'source': str, 'text': str}, ...]
-    sorted newest first.
-    """
-    entries = []
-
-    # Find the Progress Log section
-    log_match = re.search(r'## Progress Log\s*\n(.*?)(?=\n## |\n---\s*\n\*Last|\Z)',
-                          content, re.DOTALL)
-    if not log_match:
-        return entries
-
-    log_text = log_match.group(1)
-
-    # Split on ### headers which are date entries
-    # Pattern: ### 2026-02-04 (Claude.ai Chat — Topic)
-    # or: ### 2026-02-04 (Claude Code)
-    # or: ### 2025-12-17
-    entry_pattern = r'###\s+(\d{4}-\d{2}-\d{2})(?:\s+\(([^)]*)\))?\s*\n'
-    parts = re.split(entry_pattern, log_text)
-
-    # parts[0] is before first match (usually empty), then groups of 3: date, source, body
-    i = 1
-    while i < len(parts):
-        date_str = parts[i].strip() if i < len(parts) else ''
-        source = parts[i + 1].strip() if i + 1 < len(parts) and parts[i + 1] else ''
-        body = parts[i + 2].strip() if i + 2 < len(parts) else ''
-        i += 3
-
-        if not date_str:
-            continue
-
-        # Clean up the body: extract source line and bullet points
-        body_lines = []
-        for line in body.split('\n'):
-            line = line.strip()
-            if line.startswith('**Source:**'):
-                # Already captured source from header; skip or supplement
-                if not source:
-                    source = line.replace('**Source:**', '').strip()
-                continue
-            if line.startswith('- ') or line.startswith('* '):
-                line = line.lstrip('-* ').strip()
-            if line:
-                line = line.replace('**', '')
-                body_lines.append(line)
-
-        if body_lines:
-            # Combine into a summary, keeping it concise
-            combined = ' '.join(body_lines)
-            # Trim to ~250 chars for the timeline view
-            if len(combined) > 250:
-                trimmed = combined[:250]
-                last_period = trimmed.rfind('.')
-                if last_period > 150:
-                    combined = trimmed[:last_period + 1]
-                else:
-                    combined = trimmed + '...'
-
-            entries.append({
-                'date': date_str,
-                'source': source or 'Unknown',
-                'text': combined,
-            })
-
-    return entries
-
-
-def extract_open_questions(content):
-    """Extract open design questions from markdown tables."""
-    questions = []
-
-    # Look for tables with | # | Question | pattern
-    table_match = re.search(
-        r'## Open Design Questions.*?\n\|.*?\|.*?\|.*?\n\|[-\s|]+\n((?:\|.*\n)*)',
-        content, re.DOTALL
-    )
-    if table_match:
-        rows = table_match.group(1).strip().split('\n')
-        for row in rows:
-            cells = [c.strip() for c in row.split('|') if c.strip()]
-            if len(cells) >= 2:
-                question = cells[1].strip()
-                if question and len(question) > 10:
-                    questions.append(question)
-
-    return questions
-
-
-def extract_next_steps(content):
-    """Extract next steps from status file."""
-    items = extract_list_items(content, r'## Next Steps', 8)
-    if not items:
-        items = extract_list_items(content, r'### Next Steps', 8)
-
-    # Also try numbered lists
-    if not items:
-        match = re.search(r'## Next Steps\s*\n((?:\d+\.\s+.+\n?)+)', content, re.MULTILINE)
-        if match:
-            for line in match.group(1).split('\n'):
-                line = line.strip()
-                line = re.sub(r'^\d+\.\s+', '', line).strip()
-                if line and len(line) > 5:
-                    items.append(line.replace('**', ''))
-                    if len(items) >= 8:
-                        break
-
-    return items
-
-
-def get_dated_commits(project_dir, max_commits=50):
-    """Get recent commits with dates from a git repo.
-
-    Returns list of dicts: [{'date': 'YYYY-MM-DD', 'source': 'Git Commit', 'text': '...'}, ...]
-    """
-    commits = []
-    git_dir = os.path.join(project_dir, '.git')
-    if not os.path.isdir(git_dir):
-        return commits
-
-    skip_patterns = [
-        'add files via upload', 'initial commit', 'first commit',
-        'merge branch', 'merge pull request', 'wip', 'fix typo',
-        'minor fix', 'bump version', 'update dependencies', 'lint fix',
-        'format code', 'cleanup',
-    ]
+def get_recent_commits(project_dir, max_commits=5):
+    """Get recent meaningful commit messages from git log."""
+    import subprocess
 
     try:
         result = subprocess.run(
@@ -719,9 +1040,9 @@ def get_dated_commits(project_dir, max_commits=50):
                 if not message or len(message) < 10:
                     continue
 
-                msg_lower = message.lower()
-                if any(p in msg_lower for p in skip_patterns):
-                    continue
+                # Check against skip patterns
+                line_lower = line.lower()
+                is_garbage = any(pattern in line_lower for pattern in COMMIT_SKIP_PATTERNS)
 
                 commits.append({
                     'date': date_str,
@@ -735,6 +1056,54 @@ def get_dated_commits(project_dir, max_commits=50):
         pass
 
     return commits
+
+
+def get_recent_commits_with_dates(project_dir, max_commits=20):
+    """Get recent meaningful commits with dates from git log.
+
+    Returns list of (date_str, message) tuples where date_str is YYYY-MM-DD.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ['git', 'log', '--all', '--pretty=format:%aI%n%s'],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode == 0:
+            lines = result.stdout.strip().split('\n')
+            commits = []
+            i = 0
+            while i < len(lines) - 1:
+                date_line = lines[i].strip()
+                msg_line = lines[i + 1].strip() if i + 1 < len(lines) else ''
+                i += 2
+
+                if not msg_line or len(msg_line) < 15:
+                    continue
+
+                msg_lower = msg_line.lower()
+                is_garbage = any(p in msg_lower for p in COMMIT_SKIP_PATTERNS)
+                if is_garbage:
+                    continue
+
+                # Parse ISO date to YYYY-MM-DD
+                try:
+                    dt = datetime.fromisoformat(date_line)
+                    date_str = dt.strftime('%Y-%m-%d')
+                except (ValueError, TypeError):
+                    date_str = ''
+
+                commits.append((date_str, msg_line))
+                if len(commits) >= max_commits:
+                    break
+            return commits
+    except Exception:
+        pass
+    return []
 
 
 def parse_project_status(file_path):
@@ -765,6 +1134,7 @@ def parse_project_status(file_path):
             'last_worked': r'\*\*Last Worked\*\*\s*\|\s*(.+)',
             'last_synced': r'\*\*Last Synced to Claude\.ai\*\*\s*\|\s*(.+)',
             'dev_state': r'\*\*Dev State\*\*\s*\|\s*(.+)',
+            'last_worked': r'\*\*Last Worked\*\*\s*\|\s*(.+)',
         }
 
         for key, pattern in patterns.items():
@@ -785,6 +1155,133 @@ def parse_project_status(file_path):
         project.setdefault('last_worked', '')
         project.setdefault('last_synced', '')
         project.setdefault('dev_state', '')
+
+        # Determine if has repo
+        has_repo = project.get('has_repo', 'No').lower()
+        project['has_github_repo'] = has_repo == 'yes' or (
+            project['repo'] and 'not' not in project['repo'].lower()
+        )
+
+        # Extract features from "What's Working" section (most specific)
+        features = extract_list_items(content, r"### What's Working", 5)
+
+        # If not enough, try "What was built" entries
+        if len(features) < 3:
+            features.extend(extract_list_items(content, r'\*\*What was built:\*\*', 3))
+
+        # Dedupe while preserving order
+        seen = set()
+        unique_features = []
+        for f in features:
+            if f.lower() not in seen:
+                seen.add(f.lower())
+                unique_features.append(f)
+        project['features'] = unique_features[:5]
+
+        # Get recent commits for additional context
+        status.update(f"Reading commits: {project['name']}")
+        project['recent_commits'] = get_recent_commits(project['project_path'], 5)
+
+        # Set category_group (alias used by web dashboard)
+        project['category_group'] = project.get('category', 'Personal')
+
+        # Set last_worked default
+        project.setdefault('last_worked', '')
+
+        # ---- Extract structured sections for web dashboard ----
+
+        # What's Not Working
+        project['not_working'] = extract_list_items(content, r"### What's Not Working", 20)
+
+        # Blockers
+        project['blockers'] = extract_list_items(content, r"### Blockers", 20)
+
+        # Open Questions (from "Still stuck on:" entries across all log dates)
+        open_questions = []
+        for match in re.finditer(r'\*\*Still stuck on:\*\*\s*\n((?:[-*]\s+.+\n?)+)', content):
+            for line in match.group(1).split('\n'):
+                line = line.strip().lstrip('-* ').strip()
+                if line and len(line) >= 10:
+                    open_questions.append(line)
+        project['open_questions'] = open_questions
+
+        # Next Steps (from "Next time:" entries across all log dates)
+        next_steps = []
+        for match in re.finditer(r'\*\*Next time:\*\*\s*\n((?:[-*]\s+.+\n?)+)', content):
+            for line in match.group(1).split('\n'):
+                line = line.strip().lstrip('-* ').strip()
+                if line and len(line) >= 10:
+                    next_steps.append(line)
+        project['next_steps'] = next_steps
+
+        # Open threads: combined list of (type, text) tuples
+        open_threads = []
+        for b in project['blockers']:
+            open_threads.append(('Blocker', b))
+        for q in open_questions:
+            open_threads.append(('Open Question', q))
+        for ns in next_steps:
+            open_threads.append(('Next Step', ns))
+        for nw in project['not_working']:
+            open_threads.append(('Not Yet Built', nw))
+        project['open_threads'] = open_threads
+
+        # ---- Build timeline from progress log dates ----
+        timeline = []
+        # Find all ### YYYY-MM-DD headings and their content
+        log_section = re.search(r'## Progress Log\s*\n(.*)', content, re.DOTALL)
+        if log_section:
+            log_text = log_section.group(1)
+            # Match each dated entry
+            date_entries = re.finditer(
+                r'### (\d{4}-\d{2}-\d{2})\s*\n(.*?)(?=### \d{4}-\d{2}-\d{2}|\Z)',
+                log_text, re.DOTALL
+            )
+            for entry in date_entries:
+                log_date = entry.group(1)
+                log_body = entry.group(2).strip()
+                # Extract "What was built" as summary
+                built_match = re.search(r'\*\*What was built:\*\*\s*\n((?:[-*]\s+.+\n?)+)', log_body)
+                if built_match:
+                    for line in built_match.group(1).split('\n'):
+                        line = line.strip().lstrip('-* ').strip()
+                        if line and len(line) >= 10:
+                            timeline.append({
+                                'date': log_date,
+                                'source': 'Progress Log',
+                                'text': line,
+                            })
+                # Also extract "What was figured out" entries
+                figured_match = re.search(r'\*\*What was figured out:\*\*\s*\n((?:[-*]\s+.+\n?)+)', log_body)
+                if figured_match:
+                    for line in figured_match.group(1).split('\n'):
+                        line = line.strip().lstrip('-* ').strip()
+                        if line and len(line) >= 10:
+                            timeline.append({
+                                'date': log_date,
+                                'source': 'Progress Log',
+                                'text': line,
+                            })
+
+        # Add git commits with dates to timeline
+        commits_with_dates = get_recent_commits_with_dates(project['project_path'], 20)
+        for cdate, cmsg in commits_with_dates:
+            if cdate:
+                timeline.append({
+                    'date': cdate,
+                    'source': 'Git Commit',
+                    'text': cmsg,
+                })
+
+        # Sort timeline by date descending (newest first)
+        timeline.sort(key=lambda e: e.get('date', ''), reverse=True)
+        project['timeline'] = timeline
+
+        # Update last_worked from actual activity if not set in metadata
+        if not project['last_worked'] and timeline:
+            dates = [e['date'] for e in timeline if e.get('date')]
+            if dates:
+                project['last_worked'] = max(dates)
 
         # Store raw content for AI assessment
         project['_raw_content'] = content
@@ -859,137 +1356,26 @@ def parse_project_status(file_path):
         return None
 
 
-# =============================================================================
-# NARRATIVE + TIMELINE BUILDING
-# =============================================================================
-
-def build_project_narrative(project, chat_data=None):
-    """Build the summary narrative paragraph."""
-    parts = []
-
-    summary = project.get('summary', '')
-    if summary:
-        parts.append(summary)
-
-    features = project.get('features', [])
-    if features and not summary:
-        if len(features) >= 3:
-            parts.append('Current capabilities include: ' +
-                         ', '.join(features[:5]).rstrip('.') + '.')
-        else:
-            for f in features:
-                parts.append(f.rstrip('.') + '.')
-
-    # Supplement with chat snippets
-    if chat_data:
-        snippets = chat_data.get('snippets', [])
-        existing_text = ' '.join(parts).lower()
-        for snippet in snippets:
-            if _overlap_ratio(snippet, existing_text) < 0.4:
-                trimmed = snippet[:600]
-                if len(snippet) > 600:
-                    last_period = trimmed.rfind('.')
-                    if last_period > 300:
-                        trimmed = trimmed[:last_period + 1]
-                parts.append(trimmed)
-
-    if not parts:
-        return 'Status file exists but no detailed description available yet.'
-
-    return ' '.join(parts)
-
-
-def build_project_timeline(project, chat_data=None):
-    """Merge progress log entries with chat-sourced dated entries into one timeline.
-
-    Returns entries sorted newest-first.
-    """
-    timeline = []
-
-    # Add progress log entries
-    for entry in project.get('progress_log', []):
-        timeline.append(entry.copy())
-
-    # Add git commits
-    for entry in project.get('git_commits', []):
-        timeline.append(entry.copy())
-
-    # Add chat-sourced detailed entries
-    if chat_data:
-        for entry in chat_data.get('timeline_entries', []):
-            is_redundant = any(
-                entry['date'] == existing['date'] and
-                _overlap_ratio(entry['text'], existing['text']) > 0.4
-                for existing in timeline
-            )
-            if not is_redundant:
-                timeline.append(entry.copy())
-
-        # Add conversation-level entries (1 per chat file that mentioned this project)
-        for entry in chat_data.get('conversation_entries', []):
-            # Only add if no detailed entry already covers this date+source combo
-            already_covered = any(
-                entry['date'] == existing['date'] and
-                entry['source'] == existing.get('source', '')
-                for existing in timeline
-            )
-            if not already_covered:
-                timeline.append(entry.copy())
-
-    # Sort by date descending (newest first)
-    def sort_key(e):
-        try:
-            return datetime.strptime(e['date'], '%Y-%m-%d')
-        except (ValueError, TypeError):
-            return datetime.min
-
-    timeline.sort(key=sort_key, reverse=True)
-
-    return timeline
-
-
-def build_open_threads(project):
-    """Collect all unfinished items into a single list of open threads.
-
-    Sources: blockers, open questions, not working, next steps.
-    """
-    threads = []
-
-    # Blockers are highest priority
-    for b in project.get('blockers', []):
-        threads.append(('Blocker', b))
-
-    # Open design questions
-    for q in project.get('open_questions', []):
-        threads.append(('Open Question', q))
-
-    # Things not working / not built yet
-    for nw in project.get('not_working', [])[:3]:
-        threads.append(('Not Yet Built', nw))
-
-    # Next steps (what was left to do)
-    for ns in project.get('next_steps', []):
-        threads.append(('Next Step', ns))
-
-    return threads
-
-
-# =============================================================================
-# LOAD AND ASSEMBLE
-# =============================================================================
-
-def load_projects(scan_paths=None, chat_history_path=None, verbose=False,
-                   progress_callback=None):
-    """Load all projects, merge with chat history, build timelines.
+def load_projects(scan_paths=None, verbose=False, chat_history_path=None,
+                   progress_callback=None, flat=False):
+    """Load all projects from PROJECT_STATUS.md files.
 
     Args:
-        progress_callback: optional callable(step_name, detail) for progress reporting
+        scan_paths: List of paths to scan for PROJECT_STATUS.md files.
+        verbose: Print verbose output.
+        chat_history_path: Path to chat history ZIP (for web dashboard).
+        progress_callback: Callable(step, detail) for progress updates.
+        flat: If True, return a flat list of projects (for web dashboard).
+              If False, return {'with_repos': [...], 'without_repos': [...]}.
+
+    Returns:
+        Flat list of project dicts if flat=True, else dict with with_repos/without_repos.
     """
     def _progress(step, detail=''):
         if progress_callback:
             progress_callback(step, detail)
 
-    _progress('scanning', 'Finding PROJECT_STATUS.md files...')
+    _progress('scanning', 'Scanning for projects...')
     status_files = find_project_status_files(scan_paths)
 
     if verbose:
@@ -997,25 +1383,25 @@ def load_projects(scan_paths=None, chat_history_path=None, verbose=False,
         for sf in status_files:
             print(f"  - {sf}")
 
-    _progress('parsing', f'Parsing {len(status_files)} project files...')
     all_projects = []
-    for i, sf in enumerate(status_files):
+    with_repos = []
+    without_repos = []
+
+    total = len(status_files)
+    for i, sf in enumerate(status_files, 1):
+        _progress('parsing', f'Parsing project {i}/{total}...')
+        status.update(f"Loading project {i}/{total}: {os.path.basename(os.path.dirname(sf))}")
         project = parse_project_status(sf)
         if project:
             all_projects.append(project)
         if i % 5 == 0:
             _progress('parsing', f'Parsed {i+1}/{len(status_files)} files...')
 
-    # Load chat history
-    chat_project_data = {}
-    chat_stats = {'total_files': 0, 'matched_projects': 0, 'total_conversations': 0,
-                  'unmatched_files': 0}
-    if chat_history_path:
-        _progress('reading_chat', 'Extracting chat history archive...')
-        print(f"Loading chat history from: {chat_history_path}")
-        chat_files = load_chat_files(chat_history_path)
-        chat_stats['total_files'] = len(chat_files)
-        print(f"  Loaded {len(chat_files)} chat files")
+            all_projects.append(project)
+            if project['has_github_repo']:
+                with_repos.append(project)
+            else:
+                without_repos.append(project)
 
         if chat_files:
             _progress('matching_chat', f'Matching {len(chat_files)} conversations to {len(all_projects)} projects...')
@@ -1035,11 +1421,85 @@ def load_projects(scan_paths=None, chat_history_path=None, verbose=False,
                   f"({chat_stats['total_conversations']} conversations, "
                   f"{chat_stats['unmatched_files']} unmatched files)")
 
-    # Build narratives, timelines, and open threads
-    _progress('building', 'Building timelines and threads...')
-    for i, project in enumerate(all_projects):
-        name = project.get('name', '')
-        chat_data = chat_project_data.get(name)
+    # ---- Chat history integration ----
+    chat_stats = {}
+    if chat_history_path:
+        _progress('reading_chat', 'Loading chat history...')
+        status.update('Loading chat history...')
+        chat_files = load_chat_files(chat_history_path)
+        status.done()
+
+        if chat_files:
+            _progress('matching', f'Matching {len(chat_files)} conversations to projects...')
+            status.update(f'Matching {len(chat_files)} conversations to projects...')
+            chat_project_data, chat_stats = match_chat_to_projects(
+                chat_files, all_projects, verbose=verbose,
+                progress_callback=progress_callback,
+            )
+            status.done()
+
+            if verbose:
+                print(f"\n  Loaded {len(chat_files)} conversations")
+                print(f"  Matched to {chat_stats['matched_projects']} projects")
+                print(f"  {chat_stats['unmatched_files']} unmatched")
+
+            # Merge chat data into project timelines
+            for project in all_projects:
+                name = project.get('name', '')
+                chat_data = chat_project_data.get(name)
+                if chat_data:
+                    existing_timeline = project.get('timeline', [])
+
+                    # Add chat timeline entries (deduped against existing)
+                    for entry in chat_data.get('timeline_entries', []):
+                        is_redundant = any(
+                            entry['date'] == e['date'] and
+                            _overlap_ratio(entry['text'], e['text']) > 0.4
+                            for e in existing_timeline
+                        )
+                        if not is_redundant:
+                            existing_timeline.append(entry)
+
+                    # Add per-conversation entries
+                    for entry in chat_data.get('conversation_entries', []):
+                        existing_timeline.append(entry)
+
+                    # Re-sort timeline
+                    existing_timeline.sort(
+                        key=lambda e: e.get('date', ''), reverse=True
+                    )
+                    project['timeline'] = existing_timeline
+
+                    # Update last_worked if chat has newer dates
+                    chat_dates = [e['date'] for e in existing_timeline
+                                  if e.get('date') and 'Chat' in e.get('source', '')]
+                    if chat_dates:
+                        newest_chat = max(chat_dates)
+                        if newest_chat > project.get('last_worked', ''):
+                            project['last_worked'] = newest_chat
+
+                    # Store snippets for narrative building
+                    project['_chat_snippets'] = chat_data.get('snippets', [])
+        else:
+            chat_stats = {
+                'total_files': 0, 'total_conversations': 0,
+                'matched_projects': 0, 'unmatched_files': 0,
+                'unmatched_chats': [],
+            }
+
+    # Store chat_stats as function attribute so web_app can access it
+    load_projects._last_chat_stats = chat_stats
+
+    _progress('done', f'Loaded {len(all_projects)} projects')
+
+    if flat:
+        # Sort by progress descending for web dashboard
+        all_projects.sort(key=lambda x: x['progress'], reverse=True)
+        return all_projects
+
+    # Sort by progress descending
+    with_repos.sort(key=lambda x: x['progress'], reverse=True)
+    without_repos.sort(key=lambda x: x['progress'], reverse=True)
 
         project['narrative'] = build_project_narrative(project, chat_data)
         project['timeline'] = build_project_timeline(project, chat_data)
