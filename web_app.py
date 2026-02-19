@@ -21,11 +21,13 @@ Usage:
 
 import json
 import os
+import re
 import tempfile
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from flask import (Flask, request, send_file, render_template_string,
                    flash, redirect, url_for, jsonify, Response)
@@ -42,12 +44,60 @@ AI_CONFIG_FILE = os.path.expanduser('~/.claudesync_ai.json')
 ARCHIVED_FILE = os.path.expanduser('~/.claudesync_archived.json')
 IMPORT_META_FILE = os.path.expanduser('~/.claudesync_import_meta.json')
 ITEM_ACTIONS_FILE = os.path.expanduser('~/.claudesync_item_actions.json')
+SETTINGS_FILE = os.path.expanduser('~/.claudesync_settings.json')
+
+DEFAULT_TIMEZONE = 'America/Chicago'  # Central US (auto-adjusts for daylight savings)
+
+
+def _load_settings():
+    """Load dashboard settings from disk."""
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {'timezone': DEFAULT_TIMEZONE}
+
+
+def _save_settings(settings):
+    """Save dashboard settings to disk."""
+    with open(SETTINGS_FILE, 'w') as f:
+        json.dump(settings, f, indent=2)
+
+
+def _now_local():
+    """Get current datetime in the configured timezone."""
+    settings = _load_settings()
+    tz_name = settings.get('timezone', DEFAULT_TIMEZONE)
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo(DEFAULT_TIMEZONE)
+    return datetime.now(tz)
+
+
+def _format_timestamp(dt=None):
+    """Format a datetime as a readable timestamp in the configured timezone."""
+    if dt is None:
+        dt = _now_local()
+    elif dt.tzinfo is None:
+        # Naive datetime — assume UTC and convert
+        settings = _load_settings()
+        tz_name = settings.get('timezone', DEFAULT_TIMEZONE)
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = ZoneInfo(DEFAULT_TIMEZONE)
+        dt = dt.replace(tzinfo=timezone.utc).astimezone(tz)
+    return dt.strftime('%Y-%m-%d %I:%M %p %Z')
 
 # Cache loaded projects so dashboard + drill-down share data
 _project_cache = {
     'projects': [],
     'scan_paths': '~',
     'chat_history_path': None,
+    'lock': threading.Lock(),
 }
 
 # Background task state — shared between threads
@@ -59,6 +109,12 @@ _bg_task = {
     'result_msg': None,
     'lock': threading.Lock(),
 }
+
+
+def _get_projects():
+    """Thread-safe read of the cached projects list."""
+    with _project_cache['lock']:
+        return list(_project_cache.get('projects', []))
 
 
 def _bg_progress(step, detail=''):
@@ -103,6 +159,7 @@ Conversations:
 
         result = _call_ai(prompt, max_tokens=800)
         if not result:
+            _bg_progress('ai_classify', 'AI call failed — check API key and connection')
             break
 
         for line in result.strip().split('\n'):
@@ -137,7 +194,7 @@ Conversations:
     # Save results
     if all_results:
         initiatives = _load_initiatives()
-        initiatives['last_classified'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+        initiatives['last_classified'] = _format_timestamp()
         initiatives['results'] = all_results
         initiatives['total_unmatched'] = len(unmatched_chats)
         _save_initiatives(initiatives)
@@ -169,9 +226,10 @@ def _bg_run_load(scan_paths_str, chat_history_path, ai_analyze):
             progress_callback=_bg_progress,
         )
 
-        _project_cache['projects'] = projects
-        _project_cache['scan_paths'] = scan_paths_str
-        _project_cache['chat_history_path'] = chp
+        with _project_cache['lock']:
+            _project_cache['projects'] = projects
+            _project_cache['scan_paths'] = scan_paths_str
+            _project_cache['chat_history_path'] = chp
 
         # Chat stats
         chat_stats = getattr(load_projects, '_last_chat_stats', {})
@@ -186,11 +244,16 @@ def _bg_run_load(scan_paths_str, chat_history_path, ai_analyze):
         # AI enrichment + classification (automatic when key is present)
         enriched = 0
         classified = 0
+        ai_warnings = []
         if ai_analyze:
             _bg_progress('ai_enrichment', 'Enriching project descriptions with AI...')
-            enriched = _ai_enrich_all_projects()
-            if enriched:
-                msg += f'. AI enriched {enriched} projects'
+            try:
+                enriched = _ai_enrich_all_projects()
+                if enriched:
+                    msg += f'. AI enriched {enriched} projects'
+            except Exception as e:
+                ai_warnings.append(f'AI enrichment failed: {e}')
+                _bg_progress('ai_enrichment', f'AI enrichment failed: {e}')
 
             # Auto-classify unmatched conversations
             unmatched = chat_stats.get('unmatched_chats', [])
@@ -200,11 +263,16 @@ def _bg_run_load(scan_paths_str, chat_history_path, ai_analyze):
                     classified = _bg_classify_unmatched(unmatched, projects)
                     if classified:
                         msg += f', classified {classified} conversations'
+                    elif unmatched:
+                        ai_warnings.append('AI classified 0 conversations — API may have failed')
                 except Exception as e:
-                    print(f"AI classification failed: {e}")
+                    ai_warnings.append(f'AI classification failed: {e}')
+                    _bg_progress('ai_classify', f'AI classification failed: {e}')
 
             if enriched or classified:
                 msg += '.'
+            if ai_warnings:
+                msg += ' Warnings: ' + '; '.join(ai_warnings)
 
         with _bg_task['lock']:
             _bg_task['result_msg'] = msg
@@ -369,9 +437,10 @@ def _load_cached_projects(scan_paths_str=None, chat_history_path=None):
 
     projects = load_projects(scan_paths=scan_paths, chat_history_path=chp, verbose=False)
 
-    _project_cache['projects'] = projects
-    _project_cache['scan_paths'] = scan_paths_str
-    _project_cache['chat_history_path'] = chp
+    with _project_cache['lock']:
+        _project_cache['projects'] = projects
+        _project_cache['scan_paths'] = scan_paths_str
+        _project_cache['chat_history_path'] = chp
 
     return projects
 
@@ -516,9 +585,10 @@ def _project_activity_breakdown(projects):
             'status': p.get('status', ''),
             'category': p.get('category_group', ''),
             'last_worked': p.get('last_worked', ''),
+            'dev_state': p.get('dev_state', ''),
             'total_events': len(timeline),
             'commits': commits,
-            'chats': chats,
+            'chats': p.get('chat_conversations', 0) or chats,
             'logs': logs,
             'open_threads': len(active_threads),
             'all_threads': len(all_threads),
@@ -631,6 +701,35 @@ DASHBOARD_HTML = """
         .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: 600; }
         .badge-blocker { background: #fce4ec; color: #c62828; }
         .badge-eol { background: var(--eol-bg); color: var(--eol-text); border: 1px solid var(--eol-border); }
+        .badge-cat { font-size: 9px; font-weight: 700; padding: 2px 8px; border-radius: 10px; margin-left: 6px; letter-spacing: 0.3px; text-transform: uppercase; }
+        .badge-cat-church { background: #EDE7F6; color: #5E35B1; border: 1px solid #B39DDB; }
+        .badge-cat-school { background: #E3F2FD; color: #1565C0; border: 1px solid #90CAF9; }
+        .badge-cat-product { background: #E8F5E9; color: #2E7D32; border: 1px solid #A5D6A7; }
+        .badge-cat-infrastructure { background: #FFF3E0; color: #E65100; border: 1px solid #FFCC80; }
+        .badge-cat-personal { background: #FCE4EC; color: #AD1457; border: 1px solid #F48FB1; }
+        .badge-cat-research { background: #E0F7FA; color: #00695C; border: 1px solid #80CBC4; }
+        [data-theme="dark"] .badge-cat-church { background: #1A0A3E; color: #B39DDB; }
+        [data-theme="dark"] .badge-cat-school { background: #0A1A3E; color: #64B5F6; }
+        [data-theme="dark"] .badge-cat-product { background: #0A2E0A; color: #81C784; }
+        [data-theme="dark"] .badge-cat-infrastructure { background: #2E1500; color: #FFB74D; }
+        [data-theme="dark"] .badge-cat-personal { background: #2E0A1A; color: #F48FB1; }
+        [data-theme="dark"] .badge-cat-research { background: #002E2A; color: #80CBC4; }
+        .project-card.cat-church { border-left: 3px solid #7E57C2; }
+        .project-card.cat-school { border-left: 3px solid #1E88E5; }
+        .project-card.cat-product { border-left: 3px solid #43A047; }
+        .project-card.cat-infrastructure { border-left: 3px solid #EF6C00; }
+        .project-card.cat-personal { border-left: 3px solid #C2185B; }
+        .project-card.cat-research { border-left: 3px solid #00897B; }
+        .badge-dev-state { font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 10px; margin-left: 6px; }
+        .badge-dev-test { background: #FDF2E9; color: #E67E22; border: 1px solid #E67E22; }
+        .badge-dev-refine { background: #EBF5FB; color: #3498DB; border: 1px solid #3498DB; }
+        .badge-dev-continue { background: #FDEDEC; color: #E74C3C; border: 1px solid #E74C3C; }
+        [data-theme="dark"] .badge-dev-test { background: #3d2e00; color: #F5B041; border-color: #E67E22; }
+        [data-theme="dark"] .badge-dev-refine { background: #0d2137; color: #5DADE2; border-color: #3498DB; }
+        [data-theme="dark"] .badge-dev-continue { background: #3d0d0d; color: #F1948A; border-color: #E74C3C; }
+        .project-card.dev-test { border-left: 3px solid #E67E22; }
+        .project-card.dev-refine { border-left: 3px solid #3498DB; }
+        .project-card.dev-continue { border-left: 3px solid #E74C3C; }
 
         /* Recent decisions + loose ends on cards */
         .card-section { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border-light); }
@@ -672,7 +771,7 @@ DASHBOARD_HTML = """
         .btn-cancel { background: var(--stat-bg); color: var(--text-secondary); }
         .btn-cancel:hover { background: var(--progress-bg); }
         /* Non-blocking progress banner */
-        .progress-banner { display: none; background: var(--bar-bg); border-bottom: 1px solid rgba(52,152,219,0.3); padding: 8px 24px 4px; }
+        .progress-banner { display: none; background: var(--bar-bg); border-bottom: 1px solid rgba(52,152,219,0.3); padding: 8px 24px 4px; position: sticky; top: 0; z-index: 90; }
         .progress-banner.show { display: block; }
         .progress-banner-inner { display: flex; align-items: center; gap: 10px; }
         .progress-spinner { width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.2); border-top-color: #3498DB; border-radius: 50%; animation: spin 0.8s linear infinite; flex-shrink: 0; }
@@ -704,9 +803,19 @@ DASHBOARD_HTML = """
             </button>
             <a href="/view/whats-next" class="btn" style="background:#e67e22;">What's Next</a>
             <button class="btn btn-upload" onclick="document.getElementById('uploadModal').classList.add('show')">Upload Chat History</button>
-            <button class="btn" style="background:#8e44ad;" onclick="document.getElementById('aiModal').classList.add('show')">AI Settings</button>
+            <a href="/settings" class="btn" style="background:#8e44ad;">Settings</a>
             <a href="/generate-pdf" class="btn btn-pdf">Generate PDF</a>
         </div>
+    </div>
+
+    <!-- Progress Banner (sticky, right below top bar) -->
+    <div class="progress-banner" id="progressBanner">
+        <div class="progress-banner-inner">
+            <div class="progress-spinner"></div>
+            <span class="progress-step" id="progressStep"></span>
+            <span class="progress-detail" id="progressDetail"></span>
+        </div>
+        <div class="progress-track"><div class="progress-track-fill" id="progressFill"></div></div>
     </div>
 
     <div class="container">
@@ -768,14 +877,16 @@ DASHBOARD_HTML = """
         <!-- Project Cards -->
         <div class="projects-grid" id="projectsGrid">
             {% for p in project_cards %}
-            <div class="project-card {% if p.eol_reason %}eol{% endif %} {% if p.name in ignored_names %}hidden{% endif %}"
-                 data-name="{{ p.name }}" data-eol="{{ 'yes' if p.eol_reason else 'no' }}" data-ignored="{{ 'yes' if p.name in ignored_names else 'no' }}"
+            <div class="project-card cat-{{ p.category|lower|replace(' ', '') }} {% if p.eol_reason %}eol{% endif %} {% if p.name in ignored_names %}hidden{% endif %} {% if p.dev_state %}dev-{{ p.dev_state|lower }}{% endif %}"
+                 data-name="{{ p.name }}" data-eol="{{ 'yes' if p.eol_reason else 'no' }}" data-ignored="{{ 'yes' if p.name in ignored_names else 'no' }}" data-devstate="{{ p.dev_state|lower }}"
                  onclick="if (!event.target.closest('.btn-ignore, .btn-restore')) window.location='/project/{{ loop.index0 }}'">
                 <div class="name">
                     {{ p.name }}
+                    <span class="badge badge-cat badge-cat-{{ p.category|lower|replace(' ', '') }}">{{ p.category }}</span>
+                    {% if p.dev_state %}<span class="badge badge-dev-state badge-dev-{{ p.dev_state|lower }}">{{ p.dev_state }}</span>{% endif %}
                     {% if p.eol_reason %}<span class="badge badge-eol">Possibly EOL</span>{% endif %}
                 </div>
-                <div class="meta">{{ p.category }} &middot; {{ p.status }}{% if p.last_worked %} &middot; Last: {{ p.last_worked }}{% endif %}</div>
+                <div class="meta">{{ p.status }}{% if p.last_worked %} &middot; Last: {{ p.last_worked }}{% endif %}</div>
                 <div class="progress-bar">
                     <div class="progress-fill" style="width: {{ p.progress }}%; background: {{ '#2ECC71' if p.progress > 75 else '#3498DB' if p.progress >= 50 else '#F1C40F' if p.progress >= 25 else '#E74C3C' }};"></div>
                 </div>
@@ -826,16 +937,6 @@ DASHBOARD_HTML = """
             claudesync2 dashboard &mdash; localhost only, nothing leaves this machine<br>
             If this tool saves you time: Venmo @ctreada
         </footer>
-    </div>
-
-    <!-- Progress Bar (non-blocking, in top nav) -->
-    <div class="progress-banner" id="progressBanner">
-        <div class="progress-banner-inner">
-            <div class="progress-spinner"></div>
-            <span class="progress-step" id="progressStep"></span>
-            <span class="progress-detail" id="progressDetail"></span>
-        </div>
-        <div class="progress-track"><div class="progress-track-fill" id="progressFill"></div></div>
     </div>
 
     <!-- Upload Modal -->
@@ -920,6 +1021,9 @@ DASHBOARD_HTML = """
         function aiPromptAccept() {
             var key = document.getElementById('ai_prompt_key').value.trim();
             if (!key) { document.getElementById('ai_prompt_key').style.borderColor = '#E74C3C'; return; }
+            var okBtn = document.getElementById('aiPromptOk');
+            okBtn.textContent = 'Saving key...';
+            okBtn.disabled = true;
             // Save the key
             fetch('/api/ai-config', {
                 method: 'POST',
@@ -928,12 +1032,21 @@ DASHBOARD_HTML = """
             })
             .then(function(r) { return r.json(); })
             .then(function() {
-                document.getElementById('aiPromptModal').classList.remove('show');
-                if (_pendingFormData) {
-                    _pendingFormData.set('ai_analyze', '1');
-                    submitUpload(_pendingFormData);
-                    _pendingFormData = null;
-                }
+                okBtn.textContent = 'Key saved!';
+                okBtn.style.background = '#2ECC71';
+                setTimeout(function() {
+                    document.getElementById('aiPromptModal').classList.remove('show');
+                    if (_pendingFormData) {
+                        _pendingFormData.set('ai_analyze', '1');
+                        submitUpload(_pendingFormData);
+                        _pendingFormData = null;
+                    }
+                }, 800);
+            })
+            .catch(function() {
+                okBtn.textContent = 'Failed — try again';
+                okBtn.style.background = '#E74C3C';
+                okBtn.disabled = false;
             });
         }
 
@@ -961,11 +1074,25 @@ DASHBOARD_HTML = """
             };
             var key = document.getElementById('ai_key').value;
             if (key) body.api_key = key;
+            var saveBtn = document.querySelector('#aiModal .btn[style*="8e44ad"]');
+            saveBtn.textContent = 'Saving...';
+            saveBtn.disabled = true;
             fetch('/api/ai-config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) })
             .then(r => r.json())
             .then(function() {
-                document.getElementById('aiModal').classList.remove('show');
-                location.reload();
+                saveBtn.textContent = 'Saved!';
+                saveBtn.style.background = '#2ECC71';
+                saveBtn.style.borderColor = '#2ECC71';
+                saveBtn.style.color = 'white';
+                setTimeout(function() {
+                    document.getElementById('aiModal').classList.remove('show');
+                    location.reload();
+                }, 1200);
+            })
+            .catch(function() {
+                saveBtn.textContent = 'Failed — try again';
+                saveBtn.style.background = '#E74C3C';
+                saveBtn.disabled = false;
             });
         }
 
@@ -1085,6 +1212,11 @@ DASHBOARD_HTML = """
         };
 
         function startProgressPolling() {
+            // Clear any existing poll interval to prevent duplicates on reload
+            if (_progressPoll) {
+                clearInterval(_progressPoll);
+                _progressPoll = null;
+            }
             var banner = document.getElementById('progressBanner');
             banner.className = 'progress-banner show';
             _progressPoll = setInterval(function() {
@@ -1103,13 +1235,16 @@ DASHBOARD_HTML = """
                             banner.className = 'progress-banner show error';
                             stepEl.textContent = 'Error';
                             detailEl.textContent = data.error;
+                            // Don't auto-reload on error — let user read it
                         } else {
                             banner.className = 'progress-banner show done';
                             stepEl.textContent = 'Complete';
                             detailEl.textContent = data.result_msg || 'Done';
                             fillEl.style.width = '100%';
-                            // Auto-reload after a brief pause so user sees the result
-                            setTimeout(function() { location.reload(); }, 1500);
+                            // Check for warnings in result message
+                            var hasWarnings = data.result_msg && data.result_msg.indexOf('Warning') !== -1;
+                            var delay = hasWarnings ? 5000 : 2500;
+                            setTimeout(function() { location.reload(); }, delay);
                         }
                     }
                 });
@@ -1235,7 +1370,10 @@ PROJECT_DETAIL_HTML = """
     <div class="container">
         <!-- Project Header -->
         <div class="header-card">
-            <div class="name">{{ project.name }}</div>
+            <div class="name">
+                {{ project.name }}
+                {% if project.dev_state %}<span class="badge badge-dev-state badge-dev-{{ project.dev_state|lower }}">{{ project.dev_state }}</span>{% endif %}
+            </div>
             <div class="meta">
                 {{ project.category_group }}
                 &middot; {{ project.status }}
@@ -1246,6 +1384,19 @@ PROJECT_DETAIL_HTML = """
                 <div class="progress-fill" style="width: {{ project.progress }}%; background: {{ '#2ECC71' if project.progress > 75 else '#3498DB' if project.progress >= 50 else '#F1C40F' if project.progress >= 25 else '#E74C3C' }};"></div>
             </div>
             <div class="meta">{{ project.progress }}% complete</div>
+            <div style="margin-top:10px; display:flex; align-items:center; gap:10px;">
+                <label style="font-size:12px; font-weight:600; color:var(--text-secondary); margin:0;">Dev State:</label>
+                <select id="devStateSelect" onchange="setDevState(this.value)" style="padding:4px 8px; border-radius:5px; border:1px solid var(--input-border); background:var(--input-bg); color:var(--text); font-size:12px;">
+                    <option value="" {{ 'selected' if not project.dev_state }}>-- none --</option>
+                    <option value="test" {{ 'selected' if project.dev_state == 'test' }}>test</option>
+                    <option value="refine" {{ 'selected' if project.dev_state == 'refine' }}>refine</option>
+                    <option value="continue" {{ 'selected' if project.dev_state == 'continue' }}>continue</option>
+                </select>
+                {% if ai_configured %}
+                <button class="btn-ai" style="font-size:11px; padding:4px 10px;" onclick="aiAssessState()">AI Assess</button>
+                {% endif %}
+                <span id="devStateStatus" style="font-size:11px; color:var(--text-muted);"></span>
+            </div>
             {% if project.narrative %}
             <div class="summary" id="projectDescription">{{ project.narrative }}</div>
             {% endif %}
@@ -1359,6 +1510,42 @@ PROJECT_DETAIL_HTML = """
                 result.style.display = 'block';
             });
         }
+
+        function setDevState(state) {
+            var status = document.getElementById('devStateStatus');
+            status.textContent = 'Saving...';
+            fetch('/api/dev-state/{{ project_idx }}', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({dev_state: state})
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                if (data.ok) {
+                    status.textContent = 'Saved';
+                    setTimeout(function() { status.textContent = ''; }, 2000);
+                } else {
+                    status.textContent = 'Error: ' + (data.error || 'unknown');
+                }
+            })
+            .catch(function() { status.textContent = 'Failed to save'; });
+        }
+
+        function aiAssessState() {
+            var status = document.getElementById('devStateStatus');
+            status.textContent = 'AI assessing...';
+            fetch('/api/ai-assess-state/{{ project_idx }}', { method: 'POST' })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                if (data.dev_state) {
+                    document.getElementById('devStateSelect').value = data.dev_state;
+                    status.textContent = 'AI suggests: ' + data.dev_state + (data.reason ? ' — ' + data.reason : '');
+                } else if (data.error) {
+                    status.textContent = 'Error: ' + data.error;
+                }
+            })
+            .catch(function() { status.textContent = 'AI assessment failed'; });
+        }
     </script>
 </body>
 </html>
@@ -1409,7 +1596,7 @@ def _ai_enrich_all_projects():
     threads) to the AI and updates the narrative in the cache.
     Returns count of enriched projects.
     """
-    projects = _project_cache.get('projects', [])
+    projects = _get_projects()
     enriched = 0
 
     for project in projects:
@@ -1462,9 +1649,18 @@ Be specific and factual. No filler language."""
 
 @app.route('/')
 def dashboard():
-    projects = _project_cache.get('projects')
+    projects = _get_projects()
     if not projects:
-        projects = _load_cached_projects()
+        # If no background task running, kick one off (non-blocking)
+        with _bg_task['lock']:
+            already_running = _bg_task['running']
+        if not already_running:
+            t = threading.Thread(
+                target=_bg_run_load,
+                args=(_project_cache.get('scan_paths', '~'), None, False),
+                daemon=True,
+            )
+            t.start()
 
     ignored_names = _load_ignored()
     archived_names = _load_archived()
@@ -1521,7 +1717,7 @@ def api_progress():
 def api_chart_data():
     mode = request.args.get('mode', 'day')
     ignored_names = _load_ignored()
-    projects = [p for p in _project_cache.get('projects', [])
+    projects = [p for p in _get_projects()
                 if p.get('name', '') not in ignored_names]
     data = _aggregate_activity(projects, mode=mode)
     return jsonify(data)
@@ -1553,7 +1749,7 @@ def api_restore():
 
 @app.route('/project/<int:idx>')
 def project_detail(idx):
-    projects = _project_cache.get('projects', [])
+    projects = _get_projects()
     if idx < 0 or idx >= len(projects):
         flash('Project not found.', 'error')
         return redirect(url_for('dashboard'))
@@ -1596,7 +1792,7 @@ def api_resolve_thread():
 @app.route('/api/enrich/<int:idx>', methods=['POST'])
 def api_enrich(idx):
     """Use AI to generate a richer project description."""
-    projects = _project_cache.get('projects', [])
+    projects = _get_projects()
     if idx < 0 or idx >= len(projects):
         return jsonify({'error': 'Project not found'}), 404
 
@@ -1663,6 +1859,313 @@ def api_ai_config():
     return jsonify({'ok': True})
 
 
+@app.route('/api/settings', methods=['GET', 'POST'])
+def api_settings():
+    """Get or set dashboard settings (timezone, etc)."""
+    if request.method == 'GET':
+        settings = _load_settings()
+        ai_config = _load_ai_config()
+        return jsonify({**settings, 'ai_config': ai_config})
+
+    data = request.get_json(force=True)
+    settings = _load_settings()
+    if 'timezone' in data:
+        # Validate timezone
+        tz_name = data['timezone']
+        try:
+            ZoneInfo(tz_name)
+            settings['timezone'] = tz_name
+        except Exception:
+            return jsonify({'error': f'Invalid timezone: {tz_name}'}), 400
+    _save_settings(settings)
+
+    # Also save AI config if provided
+    if any(k in data for k in ('api_key', 'api_url', 'model')):
+        ai_config = _load_ai_config()
+        if 'api_url' in data:
+            ai_config['api_url'] = data['api_url']
+        if 'api_key' in data:
+            ai_config['api_key'] = data['api_key']
+        if 'model' in data:
+            ai_config['model'] = data['model']
+        _save_ai_config(ai_config)
+
+    return jsonify({'ok': True})
+
+
+SETTINGS_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Settings -- Dashboard</title>
+    <style>
+        """ + THEME_CSS + """
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); }
+        .top-bar { background: var(--bar-bg); color: var(--bar-text); padding: 16px 24px; display: flex; align-items: center; gap: 16px; }
+        .top-bar a { color: #8cc4e8; text-decoration: none; font-size: 13px; }
+        .top-bar a:hover { color: white; }
+        .top-bar h1 { font-size: 18px; font-weight: 600; flex: 1; }
+        .btn-theme { background: transparent; border: 1px solid rgba(255,255,255,0.3); color: var(--bar-text); font-size: 12px; padding: 5px 10px; border-radius: 4px; cursor: pointer; }
+        .container { max-width: 600px; margin: 0 auto; padding: 24px 20px; }
+        .card { background: var(--bg-card); border-radius: 8px; padding: 22px; margin-bottom: 16px; box-shadow: 0 1px 3px var(--shadow); }
+        .card h2 { font-size: 15px; font-weight: 600; color: var(--heading); margin-bottom: 16px; }
+        label { display: block; font-size: 12px; color: var(--text-secondary); margin: 12px 0 5px; font-weight: 600; }
+        input[type="text"], select { width: 100%; padding: 9px 12px; border: 1px solid var(--input-border); border-radius: 5px; font-size: 13px; background: var(--input-bg); color: var(--text); }
+        .hint { font-size: 10px; color: var(--text-muted); margin-top: 3px; }
+        .btn { padding: 10px 22px; border-radius: 5px; font-size: 13px; font-weight: 600; cursor: pointer; border: none; color: white; }
+        .btn-save { background: #3498DB; }
+        .btn-save:hover { background: #2980B9; }
+        .btn-save:disabled { opacity: 0.5; }
+        .status-msg { display: inline-block; margin-left: 12px; font-size: 12px; font-weight: 600; }
+        footer { text-align: center; font-size: 11px; color: var(--text-muted); margin-top: 30px; }
+        footer a { color: var(--text-muted); text-decoration: none; }
+    </style>
+    <script>
+        (function() {
+            var t = localStorage.getItem('theme') || 'light';
+            document.documentElement.setAttribute('data-theme', t);
+        })();
+    </script>
+</head>
+<body>
+    <div class="top-bar">
+        <a href="/">&larr; Dashboard</a>
+        <h1>Settings</h1>
+        <button class="btn-theme" onclick="toggleTheme()"><span id="themeIcon"></span></button>
+    </div>
+    <div class="container">
+        <div class="card">
+            <h2>Timezone</h2>
+            <label for="tz">Display Timezone</label>
+            <select id="tz">
+                <option value="America/Chicago" {{ 'selected' if settings.timezone == 'America/Chicago' }}>Central US (America/Chicago)</option>
+                <option value="America/New_York" {{ 'selected' if settings.timezone == 'America/New_York' }}>Eastern US (America/New_York)</option>
+                <option value="America/Denver" {{ 'selected' if settings.timezone == 'America/Denver' }}>Mountain US (America/Denver)</option>
+                <option value="America/Los_Angeles" {{ 'selected' if settings.timezone == 'America/Los_Angeles' }}>Pacific US (America/Los_Angeles)</option>
+                <option value="UTC" {{ 'selected' if settings.timezone == 'UTC' }}>UTC</option>
+                <option value="Europe/London" {{ 'selected' if settings.timezone == 'Europe/London' }}>London (Europe/London)</option>
+            </select>
+            <div class="hint">Automatically adjusts for daylight savings. Current time: {{ current_time }}</div>
+        </div>
+
+        <div class="card">
+            <h2>AI Configuration</h2>
+            <p style="font-size:12px; color:var(--text-secondary); margin-bottom:12px;">
+                Configure an Anthropic API key so the dashboard can generate richer project descriptions and classify unmatched chats.
+                Stored locally in ~/.claudesync_ai.json. Never leaves this machine.
+            </p>
+            <label for="ai_key">API Key</label>
+            <input type="text" id="ai_key" placeholder="sk-ant-..." value="">
+            <div class="hint">
+                {% if ai_config.api_key %}Currently set ({{ ai_config.api_key[:8] }}...){% else %}Not configured{% endif %}
+            </div>
+            <label for="ai_url">API URL</label>
+            <input type="text" id="ai_url" value="{{ ai_config.api_url }}">
+            <label for="ai_model">Model</label>
+            <select id="ai_model">
+                <option value="claude-haiku-4-5-20251001" {{ 'selected' if ai_config.model == 'claude-haiku-4-5-20251001' }}>Haiku 4.5 (fastest, cheapest)</option>
+                <option value="claude-sonnet-4-5-20250929" {{ 'selected' if ai_config.model == 'claude-sonnet-4-5-20250929' }}>Sonnet 4.5 (balanced)</option>
+                <option value="claude-opus-4-6" {{ 'selected' if ai_config.model == 'claude-opus-4-6' }}>Opus 4.6 (most capable)</option>
+            </select>
+        </div>
+
+        <div class="card">
+            <h2>Scan Paths</h2>
+            <label for="scan_paths">Directories to scan for PROJECT_STATUS.md</label>
+            <input type="text" id="scan_paths" value="{{ scan_paths }}" placeholder="~ ~/projects">
+            <div class="hint">Space-separated list of paths. Default: ~ (home directory)</div>
+        </div>
+
+        <div style="margin-top:20px;">
+            <button class="btn btn-save" id="saveBtn" onclick="saveSettings()">Save All Settings</button>
+            <span class="status-msg" id="saveStatus"></span>
+        </div>
+
+        <footer><a href="/">&larr; Back to Dashboard</a></footer>
+    </div>
+    <script>
+        function toggleTheme() {
+            var cur = document.documentElement.getAttribute('data-theme');
+            var next = cur === 'dark' ? 'light' : 'dark';
+            document.documentElement.setAttribute('data-theme', next);
+            localStorage.setItem('theme', next);
+            document.getElementById('themeIcon').textContent = next === 'dark' ? 'Light' : 'Dark';
+        }
+        document.getElementById('themeIcon').textContent =
+            document.documentElement.getAttribute('data-theme') === 'dark' ? 'Light' : 'Dark';
+
+        function saveSettings() {
+            var btn = document.getElementById('saveBtn');
+            var status = document.getElementById('saveStatus');
+            btn.disabled = true;
+            btn.textContent = 'Saving...';
+            status.textContent = '';
+
+            var body = {
+                timezone: document.getElementById('tz').value,
+                api_url: document.getElementById('ai_url').value,
+                model: document.getElementById('ai_model').value,
+            };
+            var key = document.getElementById('ai_key').value.trim();
+            if (key) body.api_key = key;
+
+            // Also save scan paths
+            var scanPaths = document.getElementById('scan_paths').value.trim();
+
+            fetch('/api/settings', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(body)
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                if (data.ok) {
+                    btn.textContent = 'Saved!';
+                    btn.style.background = '#2ECC71';
+                    status.textContent = 'Settings saved successfully';
+                    status.style.color = '#2ECC71';
+                    setTimeout(function() {
+                        btn.textContent = 'Save All Settings';
+                        btn.style.background = '';
+                        btn.disabled = false;
+                        status.textContent = '';
+                    }, 2500);
+                } else {
+                    btn.textContent = 'Error';
+                    btn.style.background = '#E74C3C';
+                    status.textContent = data.error || 'Unknown error';
+                    status.style.color = '#E74C3C';
+                    btn.disabled = false;
+                }
+            })
+            .catch(function() {
+                btn.textContent = 'Failed';
+                btn.style.background = '#E74C3C';
+                status.textContent = 'Connection error';
+                status.style.color = '#E74C3C';
+                btn.disabled = false;
+            });
+        }
+    </script>
+</body>
+</html>
+"""
+
+
+@app.route('/settings')
+def settings_page():
+    """Settings page for timezone, AI config, and scan paths."""
+    settings = _load_settings()
+    ai_config = _load_ai_config()
+    return render_template_string(
+        SETTINGS_HTML,
+        settings=settings,
+        ai_config=ai_config,
+        scan_paths=_project_cache.get('scan_paths', '~'),
+        current_time=_format_timestamp(),
+    )
+
+
+@app.route('/api/dev-state/<int:idx>', methods=['POST'])
+def api_set_dev_state(idx):
+    """Set the dev state for a project and persist it to PROJECT_STATUS.md."""
+    projects = _get_projects()
+    if idx < 0 or idx >= len(projects):
+        return jsonify({'error': 'Project not found'}), 404
+
+    data = request.get_json(force=True)
+    new_state = data.get('dev_state', '').strip().lower()
+    if new_state and new_state not in ('test', 'refine', 'continue'):
+        return jsonify({'error': f'Invalid dev_state: must be test, refine, continue, or empty'}), 400
+    project = projects[idx]
+    project['dev_state'] = new_state
+
+    # Also persist to the PROJECT_STATUS.md file if we have it
+    status_file = project.get('file_path', '')
+    if status_file and os.path.isfile(status_file):
+        try:
+            with open(status_file, 'r') as f:
+                content = f.read()
+            # Try to update existing Dev State line
+            updated = re.sub(
+                r'(\*\*Dev State\*\*\s*\|\s*)(.+)',
+                r'\g<1>' + (new_state or '[test/refine/continue]'),
+                content
+            )
+            if updated == content and new_state:
+                # No existing Dev State line — insert after Status line
+                updated = re.sub(
+                    r'(\| \*\*Status\*\* \|[^\n]+\n)',
+                    r'\1| **Dev State** | ' + new_state + ' |\n',
+                    content
+                )
+            if updated != content:
+                with open(status_file, 'w') as f:
+                    f.write(updated)
+        except Exception as e:
+            print(f"Warning: could not persist dev_state to {status_file}: {e}")
+
+    return jsonify({'ok': True, 'dev_state': new_state})
+
+
+@app.route('/api/ai-assess-state/<int:idx>', methods=['POST'])
+def api_ai_assess_state(idx):
+    """Use AI to assess which dev state a project should be in."""
+    projects = _get_projects()
+    if idx < 0 or idx >= len(projects):
+        return jsonify({'error': 'Project not found'}), 404
+
+    project = projects[idx]
+
+    timeline_text = '\n'.join(
+        f"- {e.get('date', '?')}: [{e.get('source', '')}] {e.get('text', '')}"
+        for e in project.get('timeline', [])[:20]
+    )
+    threads_text = '\n'.join(
+        f"- [{t}] {txt}" for t, txt in project.get('open_threads', [])
+    )
+
+    prompt = f"""Classify this project into exactly ONE development state. The three states are:
+
+- test: Code was pushed with no evidence of testing. Needs testing before proceeding.
+- refine: The user seems satisfied or is riffing/exploring. Chat was abandoned in a good state. Refinement work.
+- continue: Active testing is ongoing but not resolved. Work in progress that needs continuation.
+
+Project: {project.get('name', '')}
+Status: {project.get('status', 'Unknown')} ({project.get('progress', 0)}% complete)
+
+Recent activity:
+{timeline_text or 'No recent activity'}
+
+Open threads:
+{threads_text or 'None'}
+
+Reply with ONLY a JSON object like: {{"state": "test", "reason": "brief reason"}}
+No other text."""
+
+    result = _call_ai(prompt, max_tokens=100)
+    if result:
+        try:
+            parsed = json.loads(result.strip())
+            state = parsed.get('state', '').lower()
+            reason = parsed.get('reason', '')
+            if state in ('test', 'refine', 'continue'):
+                project['dev_state'] = state
+                return jsonify({'dev_state': state, 'reason': reason})
+        except (json.JSONDecodeError, AttributeError):
+            # Try to extract state from freeform response
+            result_lower = result.lower()
+            for s in ('test', 'refine', 'continue'):
+                if s in result_lower:
+                    project['dev_state'] = s
+                    return jsonify({'dev_state': s, 'reason': result.strip()})
+        return jsonify({'error': 'AI returned unexpected format: ' + result[:200]})
+    return jsonify({'error': 'AI not configured or call failed. Check AI Settings.'})
+
+
 @app.route('/upload', methods=['POST'])
 def upload():
     """Accept upload, kick off background processing, return immediately."""
@@ -1680,7 +2183,7 @@ def upload():
         print(f"Chat history uploaded: {save_path}")
 
         meta = _load_import_meta()
-        meta['last_import'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+        meta['last_import'] = _format_timestamp()
         meta['last_file'] = chat_file.filename
         _save_import_meta(meta)
 
@@ -1700,9 +2203,7 @@ def upload():
 
 @app.route('/generate-pdf')
 def generate_pdf():
-    projects = _project_cache.get('projects', [])
-    if not projects:
-        projects = _load_cached_projects()
+    projects = _get_projects()
 
     if not projects:
         flash('No projects found. Upload data first.', 'error')
@@ -1863,7 +2364,7 @@ LIST_VIEW_HTML = """
 
 @app.route('/view/projects')
 def view_projects():
-    projects = _project_cache.get('projects', [])
+    projects = _get_projects()
     archived = _load_archived()
     ignored = _load_ignored()
 
@@ -1909,7 +2410,7 @@ def view_projects():
 
 @app.route('/view/events')
 def view_events():
-    projects = _project_cache.get('projects', [])
+    projects = _get_projects()
     ignored = _load_ignored()
 
     all_events = []
@@ -1950,7 +2451,7 @@ def view_events():
 
 @app.route('/view/threads')
 def view_threads():
-    projects = _project_cache.get('projects', [])
+    projects = _get_projects()
     resolved = _load_resolved()
     ignored = _load_ignored()
 
@@ -1983,7 +2484,7 @@ def view_threads():
 
 @app.route('/view/blockers')
 def view_blockers():
-    projects = _project_cache.get('projects', [])
+    projects = _get_projects()
     resolved = _load_resolved()
     ignored = _load_ignored()
 
@@ -2039,9 +2540,17 @@ def api_unarchive():
 @app.route('/view/whats-next')
 def view_whats_next():
     """Cross-project view: what needs to happen next for every project."""
-    projects = _project_cache.get('projects', [])
+    projects = _get_projects()
     if not projects:
-        projects = _load_cached_projects()
+        with _bg_task['lock']:
+            already_running = _bg_task['running']
+        if not already_running:
+            t = threading.Thread(
+                target=_bg_run_load,
+                args=(_project_cache.get('scan_paths', '~'), None, False),
+                daemon=True,
+            )
+            t.start()
 
     ignored = _load_ignored()
     archived = _load_archived()
@@ -2296,7 +2805,7 @@ def api_item_action():
 @app.route('/api/verify-categories', methods=['POST'])
 def api_verify_categories():
     """Use AI to verify each project is in the right category."""
-    projects = _project_cache.get('projects', [])
+    projects = _get_projects()
     ignored = _load_ignored()
     archived = _load_archived()
 
@@ -2355,6 +2864,7 @@ Projects:
 
 
 INITIATIVE_FILE = os.path.expanduser('~/.claudesync_initiatives.json')
+DISMISSED_CHATS_FILE = os.path.expanduser('~/.claudesync_dismissed_chats.json')
 
 
 def _load_initiatives():
@@ -2372,6 +2882,24 @@ def _save_initiatives(data):
         json.dump(data, f, indent=2)
 
 
+def _load_dismissed_chats():
+    """Load set of dismissed (ignored) chat filenames."""
+    if os.path.exists(DISMISSED_CHATS_FILE):
+        try:
+            with open(DISMISSED_CHATS_FILE, 'r') as f:
+                data = json.load(f)
+                return set(data.get('dismissed', []))
+        except Exception:
+            pass
+    return set()
+
+
+def _save_dismissed_chats(dismissed):
+    """Save dismissed chat filenames to disk."""
+    with open(DISMISSED_CHATS_FILE, 'w') as f:
+        json.dump({'dismissed': sorted(dismissed)}, f, indent=2)
+
+
 @app.route('/api/classify-unmatched', methods=['POST'])
 def api_classify_unmatched():
     """Use AI to classify unmatched chat conversations into initiatives."""
@@ -2381,7 +2909,7 @@ def api_classify_unmatched():
     if not unmatched:
         return jsonify({'error': 'No unmatched conversations found. Upload chat history first.'})
 
-    projects = _project_cache.get('projects', [])
+    projects = _get_projects()
     project_names = [p.get('name', '') for p in projects if p.get('name')]
 
     # Process in batches of 15 for token efficiency
@@ -2460,7 +2988,7 @@ Conversations:
 
     # Save results for the UI
     initiatives = _load_initiatives()
-    initiatives['last_classified'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+    initiatives['last_classified'] = _format_timestamp()
     initiatives['results'] = all_results
     initiatives['total_unmatched'] = len(unmatched)
     _save_initiatives(initiatives)
@@ -2473,28 +3001,109 @@ Conversations:
     })
 
 
+@app.route('/api/dismiss-chat', methods=['POST'])
+def api_dismiss_chat():
+    """Dismiss (ignore) an unmatched chat so it no longer shows up."""
+    data = request.get_json(force=True)
+    filename = data.get('filename', '')
+    if not filename:
+        return jsonify({'error': 'filename required'}), 400
+
+    dismissed = _load_dismissed_chats()
+    dismissed.add(filename)
+    _save_dismissed_chats(dismissed)
+    return jsonify({'ok': True, 'dismissed_count': len(dismissed)})
+
+
+@app.route('/api/restore-chat', methods=['POST'])
+def api_restore_chat():
+    """Restore a previously dismissed chat."""
+    data = request.get_json(force=True)
+    filename = data.get('filename', '')
+    if not filename:
+        return jsonify({'error': 'filename required'}), 400
+
+    dismissed = _load_dismissed_chats()
+    dismissed.discard(filename)
+    _save_dismissed_chats(dismissed)
+    return jsonify({'ok': True, 'dismissed_count': len(dismissed)})
+
+
+@app.route('/api/assign-chat', methods=['POST'])
+def api_assign_chat():
+    """Assign an unmatched chat to an existing project."""
+    data = request.get_json(force=True)
+    filename = data.get('filename', '')
+    project_name = data.get('project', '')
+    if not filename or not project_name:
+        return jsonify({'error': 'filename and project required'}), 400
+
+    # Update the initiatives file to record the assignment
+    initiatives = _load_initiatives()
+    if 'assigned' not in initiatives:
+        initiatives['assigned'] = {}
+    initiatives['assigned'][filename] = {
+        'project': project_name,
+        'assigned_at': _format_timestamp(),
+    }
+    _save_initiatives(initiatives)
+
+    # Also dismiss it from the unmatched view
+    dismissed = _load_dismissed_chats()
+    dismissed.add(filename)
+    _save_dismissed_chats(dismissed)
+
+    return jsonify({'ok': True, 'assigned_to': project_name})
+
+
+@app.route('/api/dismiss-chat/bulk', methods=['POST'])
+def api_dismiss_chat_bulk():
+    """Dismiss multiple chats at once (e.g., all skipped chats)."""
+    data = request.get_json(force=True)
+    filenames = data.get('filenames', [])
+    if not filenames:
+        return jsonify({'error': 'filenames list required'}), 400
+
+    dismissed = _load_dismissed_chats()
+    for fn in filenames:
+        dismissed.add(fn)
+    _save_dismissed_chats(dismissed)
+    return jsonify({'ok': True, 'dismissed_count': len(dismissed)})
+
+
 @app.route('/view/unmatched')
 def view_unmatched():
-    """Show unmatched chat conversations and AI classification results."""
+    """Show unmatched chat conversations with assign/dismiss actions."""
     chat_stats = getattr(load_projects, '_last_chat_stats', {})
     unmatched = chat_stats.get('unmatched_chats', [])
     initiatives = _load_initiatives()
     ai_results = initiatives.get('results', [])
+    assigned = initiatives.get('assigned', {})
     ai_config = _load_ai_config()
     has_ai = bool(ai_config.get('api_key'))
+    dismissed = _load_dismissed_chats()
+
+    # Build project list for the assign dropdown
+    projects = _get_projects()
+    project_names = sorted(set(p.get('name', '') for p in projects if p.get('name')))
 
     # Build lookup from AI results
     classified = {}
     for r in ai_results:
         classified[r.get('idx', -1)] = r
 
-    # Group by suggested initiative
+    # Filter out dismissed chats and group the rest
     by_initiative = defaultdict(list)
     unclassified = []
     skipped = []
     matched_to_existing = []
+    dismissed_list = []
 
     for i, chat in enumerate(unmatched):
+        fn = chat.get('filename', '')
+        if fn in dismissed:
+            dismissed_list.append({**chat, 'idx': i, 'assigned_to': assigned.get(fn, {}).get('project', '')})
+            continue
         c = classified.get(i)
         if c:
             if c['action'] == 'match':
@@ -2509,13 +3118,14 @@ def view_unmatched():
     content = ''
 
     # Stats bar
+    visible_total = len(unmatched) - len(dismissed_list)
     total = len(unmatched)
     classified_count = len(ai_results)
     new_initiatives = len(by_initiative)
     content += f'''<div style="display:flex; gap:16px; margin-bottom:20px; flex-wrap:wrap;">
         <div style="background:var(--stat-bg); padding:12px 20px; border-radius:8px; flex:1; min-width:120px; text-align:center;">
-            <div style="font-size:24px; font-weight:700; color:var(--heading);">{total}</div>
-            <div style="font-size:11px; color:var(--text-muted);">Unmatched Conversations</div>
+            <div style="font-size:24px; font-weight:700; color:var(--heading);">{visible_total}</div>
+            <div style="font-size:11px; color:var(--text-muted);">Active Unmatched</div>
         </div>
         <div style="background:var(--stat-bg); padding:12px 20px; border-radius:8px; flex:1; min-width:120px; text-align:center;">
             <div style="font-size:24px; font-weight:700; color:var(--heading);">{new_initiatives}</div>
@@ -2526,21 +3136,53 @@ def view_unmatched():
             <div style="font-size:11px; color:var(--text-muted);">Matched to Existing</div>
         </div>
         <div style="background:var(--stat-bg); padding:12px 20px; border-radius:8px; flex:1; min-width:120px; text-align:center;">
-            <div style="font-size:24px; font-weight:700; color:var(--heading);">{len(skipped)}</div>
-            <div style="font-size:11px; color:var(--text-muted);">Skipped (small talk)</div>
+            <div style="font-size:24px; font-weight:700; color:#2ECC71;">{len(dismissed_list)}</div>
+            <div style="font-size:11px; color:var(--text-muted);">Dismissed / Assigned</div>
         </div>
     </div>'''
 
+    # Build project options for assign dropdown
+    project_options = ''.join(f'<option value="{name}">{name}</option>' for name in project_names)
+
+    def _chat_item_html(chat, show_actions=True, extra_class='', extra_info=''):
+        """Render a single chat item row with action buttons."""
+        fn = chat['filename'].replace("'", "\\'").replace('"', '&quot;')
+        fn_display = chat['filename']
+        excerpt = (chat.get('excerpt', '') or '')[:150]
+        date = chat.get('date', 'Unknown')
+        row_id = f'chat-row-{chat.get("idx", 0)}'
+
+        actions = ''
+        if show_actions:
+            actions = f'''<div class="actions" style="flex-shrink:0; display:flex; gap:4px; align-items:center; flex-wrap:wrap;">
+                <select class="assign-select" data-filename="{fn}" onchange="assignChat(this)"
+                    style="font-size:10px; padding:3px 6px; border:1px solid var(--border); border-radius:4px; background:var(--input-bg); color:var(--text); max-width:140px;">
+                    <option value="">Assign to...</option>
+                    {project_options}
+                </select>
+                <button class="btn-sm" style="border-color:#e67e22; color:#e67e22; font-size:10px;"
+                    onclick="dismissChat('{fn}', this)">Dismiss</button>
+            </div>'''
+
+        return f'''<div class="list-item" id="{row_id}" style="{extra_class}">
+            <div class="main">
+                <div class="title" style="font-size:12px;">{fn_display}</div>
+                <div class="subtitle">{date}{extra_info}</div>
+                <div class="detail">{excerpt}</div>
+            </div>
+            {actions}
+        </div>'''
+
     # Classify button
-    if has_ai and total > 0:
+    if has_ai and visible_total > 0:
         if classified_count == 0:
             content += '<div style="margin-bottom:16px;"><button class="btn-sm btn-verify" onclick="classifyUnmatched(this)" style="padding:8px 18px; font-size:12px;">Classify with AI</button></div>'
         else:
             content += f'<div style="margin-bottom:16px; font-size:11px; color:var(--text-muted);">Last classified: {initiatives.get("last_classified", "never")} &mdash; <button class="btn-sm btn-verify" onclick="classifyUnmatched(this)" style="padding:4px 10px; font-size:10px;">Re-classify</button></div>'
-    elif total == 0:
+    elif visible_total == 0 and len(dismissed_list) == 0:
         content += '<div class="empty">No unmatched conversations. Upload chat history first, or all conversations were matched to projects.</div>'
-    elif not has_ai:
-        content += '<div style="margin-bottom:16px; font-size:12px; color:var(--text-muted);">Configure an API key in AI Settings to classify these conversations.</div>'
+    elif not has_ai and visible_total > 0:
+        content += '<div style="margin-bottom:16px; font-size:12px; color:var(--text-muted);">Configure an API key in <a href="/settings">Settings</a> to auto-classify these conversations.</div>'
 
     # New initiatives suggested by AI
     if by_initiative:
@@ -2553,100 +3195,207 @@ def view_unmatched():
                         <div class="subtitle">{len(chats)} conversation{"s" if len(chats) != 1 else ""}</div>
                     </div>
                 </div>'''
-            for chat in chats[:10]:  # Show first 10
-                content += f'''<div class="list-item">
-                    <div class="main">
-                        <div class="title" style="font-size:12px;">{chat["filename"]}</div>
-                        <div class="subtitle">{chat["date"]}</div>
-                        <div class="detail">{chat.get("excerpt", "")[:120]}</div>
-                    </div>
-                </div>'''
-            if len(chats) > 10:
-                content += f'<div class="list-item"><div class="main"><div class="subtitle">...and {len(chats) - 10} more</div></div></div>'
+            for chat in chats[:15]:
+                content += _chat_item_html(chat)
+            if len(chats) > 15:
+                content += f'<div class="list-item"><div class="main"><div class="subtitle">...and {len(chats) - 15} more</div></div></div>'
             content += '</div>'
 
     # Matched to existing projects
     if matched_to_existing:
-        content += f'<div class="section-header">Matched to Existing Initiatives <span class="badge">{len(matched_to_existing)}</span></div>'
-        # Group by initiative
+        content += f'<div class="section-header">Matched to Existing Projects <span class="badge">{len(matched_to_existing)}</span></div>'
         by_existing = defaultdict(list)
         for item in matched_to_existing:
             by_existing[item['initiative']].append(item)
-        content += '<div class="list-card">'
         for init_name, items in sorted(by_existing.items()):
-            content += f'''<div class="list-item" style="background:var(--stat-bg);">
-                <div class="main">
-                    <div class="title" style="font-size:13px;">{init_name}</div>
-                    <div class="subtitle">{len(items)} conversation{"s" if len(items) != 1 else ""}</div>
-                </div>
-            </div>'''
-        content += '</div>'
+            content += f'''<div class="list-card" style="margin-bottom:12px;">
+                <div class="list-item" style="background:var(--stat-bg); padding:10px 18px;">
+                    <div class="main">
+                        <div class="title" style="font-size:13px;">{init_name}</div>
+                        <div class="subtitle">{len(items)} conversation{"s" if len(items) != 1 else ""}</div>
+                    </div>
+                </div>'''
+            for chat in items[:10]:
+                content += _chat_item_html(chat)
+            if len(items) > 10:
+                content += f'<div class="list-item"><div class="main"><div class="subtitle">...and {len(items) - 10} more</div></div></div>'
+            content += '</div>'
 
     # Unclassified (not yet sent to AI)
     if unclassified:
         content += f'<div class="section-header">Not Yet Classified <span class="badge">{len(unclassified)}</span></div>'
         content += '<div class="list-card">'
-        for chat in unclassified[:20]:
-            content += f'''<div class="list-item">
-                <div class="main">
-                    <div class="title" style="font-size:12px;">{chat["filename"]}</div>
-                    <div class="subtitle">{chat["date"]}</div>
-                    <div class="detail">{chat.get("excerpt", "")[:120]}</div>
-                </div>
-            </div>'''
-        if len(unclassified) > 20:
-            content += f'<div class="list-item"><div class="main"><div class="subtitle">...and {len(unclassified) - 20} more</div></div></div>'
+        for chat in unclassified[:30]:
+            content += _chat_item_html(chat)
+        if len(unclassified) > 30:
+            content += f'<div class="list-item"><div class="main"><div class="subtitle">...and {len(unclassified) - 30} more</div></div></div>'
         content += '</div>'
 
-    # Skipped
+    # Skipped by AI
     if skipped:
-        content += f'<div class="section-header">Skipped (Small Talk / Greetings) <span class="badge">{len(skipped)}</span></div>'
-        content += '<div class="list-card">'
-        for chat in skipped[:10]:
-            content += f'''<div class="list-item item-ignored">
-                <div class="main">
-                    <div class="title" style="font-size:12px;">{chat["filename"]}</div>
-                    <div class="subtitle">{chat["date"]}</div>
-                </div>
-            </div>'''
-        if len(skipped) > 10:
-            content += f'<div class="list-item"><div class="main"><div class="subtitle">...and {len(skipped) - 10} more</div></div></div>'
+        content += f'''<div class="section-header">Skipped (Small Talk / Greetings) <span class="badge">{len(skipped)}</span>
+            <button class="btn-sm" style="margin-left:12px; border-color:#e67e22; color:#e67e22; font-size:10px;"
+                onclick="dismissAllSkipped()">Dismiss All Skipped</button>
+        </div>'''
+        content += '<div class="list-card" id="skippedCard">'
+        for chat in skipped[:15]:
+            content += _chat_item_html(chat, extra_class='opacity:0.7;')
+        if len(skipped) > 15:
+            content += f'<div class="list-item"><div class="main"><div class="subtitle">...and {len(skipped) - 15} more</div></div></div>'
         content += '</div>'
 
-    # JS for classify button
-    content += '''
+    # Dismissed / Assigned section (collapsed by default)
+    if dismissed_list:
+        content += f'''<div class="section-header" style="cursor:pointer;" onclick="toggleDismissed()">
+            Dismissed / Assigned <span class="badge">{len(dismissed_list)}</span>
+            <span id="dismissedToggle" style="font-size:10px; margin-left:8px; color:var(--text-muted);">Show</span>
+        </div>'''
+        content += '<div class="list-card" id="dismissedCard" style="display:none;">'
+        for chat in dismissed_list[:30]:
+            assigned_info = f' &mdash; Assigned to: <strong>{chat["assigned_to"]}</strong>' if chat.get('assigned_to') else ''
+            content += f'''<div class="list-item" style="opacity:0.5;">
+                <div class="main">
+                    <div class="title" style="font-size:12px;">{chat["filename"]}</div>
+                    <div class="subtitle">{chat.get("date", "Unknown")}{assigned_info}</div>
+                </div>
+                <div class="actions">
+                    <button class="btn-sm" style="border-color:#2ECC71; color:#2ECC71; font-size:10px;"
+                        onclick="restoreChat('{chat['filename'].replace(chr(39), chr(92)+chr(39))}', this)">Restore</button>
+                </div>
+            </div>'''
+        if len(dismissed_list) > 30:
+            content += f'<div class="list-item"><div class="main"><div class="subtitle">...and {len(dismissed_list) - 30} more</div></div></div>'
+        content += '</div>'
+
+    # Build JS for skipped filenames (for bulk dismiss)
+    skipped_fns_json = json.dumps([c['filename'] for c in skipped])
+
+    # JS for all actions
+    content += f'''
     <script>
-    function classifyUnmatched(btn) {
+    function classifyUnmatched(btn) {{
         btn.disabled = true;
         btn.textContent = 'Classifying...';
-        fetch('/api/classify-unmatched', { method: 'POST' })
+        fetch('/api/classify-unmatched', {{ method: 'POST' }})
         .then(r => r.json())
-        .then(function(data) {
-            if (data.error) {
-                btn.textContent = data.error;
-            } else {
-                location.reload();
-            }
-        })
-        .catch(function() { btn.textContent = 'Failed'; });
-    }
+        .then(function(data) {{
+            if (data.error) {{ btn.textContent = data.error; }}
+            else {{ location.reload(); }}
+        }})
+        .catch(function() {{ btn.textContent = 'Failed'; }});
+    }}
+
+    function dismissChat(filename, btn) {{
+        btn.disabled = true;
+        btn.textContent = 'Dismissing...';
+        fetch('/api/dismiss-chat', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{ filename: filename }})
+        }})
+        .then(r => r.json())
+        .then(function(data) {{
+            if (data.ok) {{
+                var row = btn.closest('.list-item');
+                row.style.opacity = '0.3';
+                row.style.transition = 'opacity 0.3s';
+                setTimeout(function() {{ row.remove(); }}, 400);
+            }} else {{
+                btn.textContent = 'Error';
+                btn.disabled = false;
+            }}
+        }});
+    }}
+
+    function restoreChat(filename, btn) {{
+        btn.disabled = true;
+        btn.textContent = 'Restoring...';
+        fetch('/api/restore-chat', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{ filename: filename }})
+        }})
+        .then(r => r.json())
+        .then(function(data) {{
+            if (data.ok) {{ location.reload(); }}
+            else {{ btn.textContent = 'Error'; btn.disabled = false; }}
+        }});
+    }}
+
+    function assignChat(select) {{
+        var project = select.value;
+        var filename = select.dataset.filename;
+        if (!project) return;
+        select.disabled = true;
+        fetch('/api/assign-chat', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{ filename: filename, project: project }})
+        }})
+        .then(r => r.json())
+        .then(function(data) {{
+            if (data.ok) {{
+                var row = select.closest('.list-item');
+                row.style.background = 'rgba(46,204,113,0.1)';
+                var main = row.querySelector('.main');
+                main.innerHTML += '<div style="font-size:11px; color:#2ECC71; font-weight:600; margin-top:4px;">Assigned to ' + project + '</div>';
+                var actions = row.querySelector('.actions');
+                if (actions) actions.remove();
+                setTimeout(function() {{ row.style.opacity = '0.3'; }}, 1500);
+            }} else {{
+                select.disabled = false;
+                alert(data.error || 'Failed to assign');
+            }}
+        }});
+    }}
+
+    function dismissAllSkipped() {{
+        var filenames = {skipped_fns_json};
+        if (!filenames.length) return;
+        if (!confirm('Dismiss all ' + filenames.length + ' skipped conversations?')) return;
+        fetch('/api/dismiss-chat/bulk', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{ filenames: filenames }})
+        }})
+        .then(r => r.json())
+        .then(function(data) {{
+            if (data.ok) {{ location.reload(); }}
+        }});
+    }}
+
+    function toggleDismissed() {{
+        var card = document.getElementById('dismissedCard');
+        var toggle = document.getElementById('dismissedToggle');
+        if (card.style.display === 'none') {{
+            card.style.display = '';
+            toggle.textContent = 'Hide';
+        }} else {{
+            card.style.display = 'none';
+            toggle.textContent = 'Show';
+        }}
+    }}
     </script>'''
 
     return render_template_string(LIST_VIEW_HTML,
-                                  title=f'Unmatched Conversations ({total})',
+                                  title=f'Unmatched Conversations ({visible_total})',
                                   content=content)
 
 
 if __name__ == '__main__':
-    print("Pre-loading projects...")
-    _load_cached_projects()
-    total = len(_project_cache['projects'])
-    print(f"Loaded {total} projects")
-
     print("\n" + "="*60)
     print("  Project Portfolio Dashboard")
     print("  Open http://localhost:5111 in your browser")
     print("  Press Ctrl+C to stop")
     print("="*60 + "\n")
+
+    # Kick off initial project load in background so server starts immediately
+    print("Loading projects in background...")
+    t = threading.Thread(
+        target=_bg_run_load,
+        args=('~', None, False),
+        daemon=True,
+    )
+    t.start()
 
     app.run(host='127.0.0.1', port=5111, debug=False)
