@@ -101,6 +101,13 @@ def _load_project_cache():
             print(f"Warning: Could not load project cache: {e}")
     return False
 
+
+def _get_projects():
+    """Return the current list of loaded projects from the cache."""
+    with _project_cache['lock']:
+        return list(_project_cache.get('projects', []))
+
+
 # Background task state — shared between threads
 _bg_task = {
     'running': False,

@@ -20,7 +20,9 @@ Usage:
 import argparse
 import json
 import os
+import platform
 import re
+import subprocess
 import sys
 import zipfile
 from datetime import datetime
@@ -1022,8 +1024,7 @@ COMMIT_SKIP_PATTERNS = [
 
 def get_recent_commits(project_dir, max_commits=5):
     """Get recent meaningful commit messages from git log."""
-    import subprocess
-
+    commits = []
     try:
         result = subprocess.run(
             ['git', 'log', '--all', '--pretty=format:%ad|%s', '--date=short'],
@@ -1041,8 +1042,9 @@ def get_recent_commits(project_dir, max_commits=5):
                     continue
 
                 # Check against skip patterns
-                line_lower = line.lower()
-                is_garbage = any(pattern in line_lower for pattern in COMMIT_SKIP_PATTERNS)
+                msg_lower = message.lower()
+                if any(pattern in msg_lower for pattern in COMMIT_SKIP_PATTERNS):
+                    continue
 
                 commits.append({
                     'date': date_str,
@@ -1104,6 +1106,98 @@ def get_recent_commits_with_dates(project_dir, max_commits=20):
     except Exception:
         pass
     return []
+
+
+def _get_git_branches(project_dir):
+    """Get all local and remote branches for a project."""
+    branches = []
+    try:
+        result = subprocess.run(
+            ['git', 'branch', '-a', '--no-color'],
+            cwd=project_dir, capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().split('\n'):
+                branch = line.strip().lstrip('* ').strip()
+                if not branch or 'HEAD' in branch:
+                    continue
+                # Normalize remote branch names
+                if branch.startswith('remotes/origin/'):
+                    branch = branch.replace('remotes/origin/', '')
+                branches.append(branch)
+            # Dedupe (local + remote may have same name)
+            branches = sorted(set(branches))
+    except Exception:
+        pass
+    return branches
+
+
+def _read_last_session(project_dir):
+    """Read the most recent session entry from SESSION_NOTES.md."""
+    for fname in ('SESSION_NOTES.md', 'session_notes.md'):
+        notes_file = os.path.join(project_dir, fname)
+        if os.path.exists(notes_file):
+            break
+    else:
+        return None
+
+    try:
+        with open(notes_file, 'r') as f:
+            content = f.read()
+
+        # Find the first ## YYYY-MM-DD entry (most recent)
+        match = re.search(
+            r'## (\d{4}-\d{2}-\d{2})\s*[—–-]?\s*(.*?)\n(.*?)(?=\n## \d{4}-\d{2}-\d{2}|\Z)',
+            content, re.DOTALL
+        )
+        if match:
+            date_str = match.group(1)
+            title = match.group(2).strip()
+            body = match.group(3).strip()
+
+            # Extract a short summary from the body
+            summary = ''
+            # Try "What We Built" or "What Was Accomplished"
+            built = re.search(
+                r'(?:What We Built|What Was Accomplished)\s*\n((?:[-*]\s+.+\n?)+)',
+                body
+            )
+            if built:
+                items = []
+                for line in built.group(1).split('\n'):
+                    line = line.strip().lstrip('-* ').strip()
+                    if line and len(line) > 10:
+                        items.append(line)
+                summary = '; '.join(items[:3])
+
+            return {
+                'date': date_str,
+                'title': title,
+                'summary': summary or title,
+                'body': body[:1000],
+            }
+    except Exception:
+        pass
+    return None
+
+
+def _read_project_docs(project_dir):
+    """Read key documentation files from a project for context."""
+    docs = {}
+    doc_files = [
+        'PRODUCT_SPEC.md', 'BUSINESS_SPEC.md', 'README.md',
+        'CLAUDE.md', 'REQUIREMENTS.md',
+    ]
+    for fname in doc_files:
+        fpath = os.path.join(project_dir, fname)
+        if os.path.exists(fpath):
+            try:
+                with open(fpath, 'r') as f:
+                    # Read first 2000 chars for context
+                    docs[fname] = f.read(2000)
+            except Exception:
+                pass
+    return docs
 
 
 def parse_project_status(file_path):
@@ -1179,7 +1273,6 @@ def parse_project_status(file_path):
         project['features'] = unique_features[:5]
 
         # Get recent commits for additional context
-        status.update(f"Reading commits: {project['name']}")
         project['recent_commits'] = get_recent_commits(project['project_path'], 5)
 
         # Set category_group (alias used by web dashboard)
@@ -1290,64 +1383,20 @@ def parse_project_status(file_path):
         raw_cat = project['category'].lower().strip()
         project['category_group'] = CATEGORY_MAP.get(raw_cat, project['category'])
 
-        # Has repo?
-        has_repo = project.get('has_repo', 'No').lower()
-        project['has_github_repo'] = has_repo == 'yes' or (
-            project['repo']
-            and 'not' not in project['repo'].lower()
-            and 'none' not in project['repo'].lower()
-        )
+        # ---- Git branch detection ----
+        project['branches'] = _get_git_branches(project['project_path'])
+        project['has_multiple_branches'] = len(project['branches']) > 1
 
-        # Summary/description
-        summary = extract_section_text(content, r'## Project Summary')
-        if not summary:
-            summary = extract_section_text(content, r'## Description')
-        if not summary:
-            summary = extract_section_text(content, r'## Notes')
-        project['summary'] = summary
+        # ---- SESSION_NOTES.md reading ----
+        project['last_session'] = _read_last_session(project['project_path'])
 
-        # Features
-        features = extract_list_items(content, r"### What's Working", 10)
-        if len(features) < 3:
-            features.extend(extract_list_items(content, r"### What Exists", 10))
-        seen = set()
-        unique = []
-        for f in features:
-            if f.lower() not in seen:
-                seen.add(f.lower())
-                unique.append(f)
-        project['features'] = unique
-
-        # Blockers
-        blockers = extract_list_items(content, r'### Blockers', 5)
-        blockers = [b for b in blockers if 'none' not in b.lower()[:10]]
-        project['blockers'] = blockers
-
-        # Not working / doesn't exist yet
-        not_working = extract_list_items(content, r"### What's Not Working", 5)
-        if not not_working:
-            not_working = extract_list_items(content, r"### What Doesn't Exist Yet", 5)
-        project['not_working'] = not_working
-
-        # Next steps
-        project['next_steps'] = extract_next_steps(content)
-
-        # Open design questions
-        project['open_questions'] = extract_open_questions(content)
-
-        # Progress log (temporal data!)
-        project['progress_log'] = extract_progress_log(content)
-
-        # Git commits (temporal data!)
-        if project['has_github_repo']:
-            project['git_commits'] = get_dated_commits(project['project_path'])
-        else:
-            project['git_commits'] = []
-
-        # Narrative and timeline built later after chat history is loaded
-        project['narrative'] = ''
-        project['timeline'] = []
-        project['open_threads'] = []
+        # ---- Narrative from features ----
+        narrative_parts = []
+        if project['features']:
+            narrative_parts.append(', '.join(project['features'][:3]))
+        if project['last_session']:
+            narrative_parts.append(project['last_session'].get('summary', ''))
+        project['narrative'] = '. '.join(p for p in narrative_parts if p) or 'No description available.'
 
         return project
 
@@ -1366,10 +1415,9 @@ def load_projects(scan_paths=None, verbose=False, chat_history_path=None,
         chat_history_path: Path to chat history ZIP (for web dashboard).
         progress_callback: Callable(step, detail) for progress updates.
         flat: If True, return a flat list of projects (for web dashboard).
-              If False, return {'with_repos': [...], 'without_repos': [...]}.
 
     Returns:
-        Flat list of project dicts if flat=True, else dict with with_repos/without_repos.
+        List of project dicts sorted by progress descending.
     """
     def _progress(step, detail=''):
         if progress_callback:
@@ -1384,59 +1432,29 @@ def load_projects(scan_paths=None, verbose=False, chat_history_path=None,
             print(f"  - {sf}")
 
     all_projects = []
-    with_repos = []
-    without_repos = []
 
     total = len(status_files)
     for i, sf in enumerate(status_files, 1):
         _progress('parsing', f'Parsing project {i}/{total}...')
-        status.update(f"Loading project {i}/{total}: {os.path.basename(os.path.dirname(sf))}")
+        if verbose:
+            print(f"  Loading {i}/{total}: {os.path.basename(os.path.dirname(sf))}")
         project = parse_project_status(sf)
         if project:
             all_projects.append(project)
-        if i % 5 == 0:
-            _progress('parsing', f'Parsed {i+1}/{len(status_files)} files...')
-
-            all_projects.append(project)
-            if project['has_github_repo']:
-                with_repos.append(project)
-            else:
-                without_repos.append(project)
-
-        if chat_files:
-            _progress('matching_chat', f'Matching {len(chat_files)} conversations to {len(all_projects)} projects...')
-            chat_project_data = match_chat_to_projects(chat_files, all_projects, verbose=verbose)
-            chat_stats['matched_projects'] = len(chat_project_data)
-            chat_stats['total_conversations'] = sum(
-                d.get('conversation_count', 0) for d in chat_project_data.values()
-            )
-            # Count unique matched files
-            matched_files = set()
-            for data in chat_project_data.values():
-                for entry in data.get('conversation_entries', []):
-                    src = entry.get('source', '')
-                    matched_files.add(src)
-            chat_stats['unmatched_files'] = len(chat_files) - len(matched_files)
-            print(f"  Matched chat context to {len(chat_project_data)} projects "
-                  f"({chat_stats['total_conversations']} conversations, "
-                  f"{chat_stats['unmatched_files']} unmatched files)")
 
     # ---- Chat history integration ----
     chat_stats = {}
+    chat_project_data = {}
     if chat_history_path:
         _progress('reading_chat', 'Loading chat history...')
-        status.update('Loading chat history...')
         chat_files = load_chat_files(chat_history_path)
-        status.done()
 
         if chat_files:
             _progress('matching', f'Matching {len(chat_files)} conversations to projects...')
-            status.update(f'Matching {len(chat_files)} conversations to projects...')
             chat_project_data, chat_stats = match_chat_to_projects(
                 chat_files, all_projects, verbose=verbose,
                 progress_callback=progress_callback,
             )
-            status.done()
 
             if verbose:
                 print(f"\n  Loaded {len(chat_files)} conversations")
@@ -1490,69 +1508,10 @@ def load_projects(scan_paths=None, verbose=False, chat_history_path=None,
     # Store chat_stats as function attribute so web_app can access it
     load_projects._last_chat_stats = chat_stats
 
-    _progress('done', f'Loaded {len(all_projects)} projects')
-
-    if flat:
-        # Sort by progress descending for web dashboard
-        all_projects.sort(key=lambda x: x['progress'], reverse=True)
-        return all_projects
-
     # Sort by progress descending
-    with_repos.sort(key=lambda x: x['progress'], reverse=True)
-    without_repos.sort(key=lambda x: x['progress'], reverse=True)
-
-        project['narrative'] = build_project_narrative(project, chat_data)
-        project['timeline'] = build_project_timeline(project, chat_data)
-        project['open_threads'] = build_open_threads(project)
-        # Store per-project chat conversation count
-        if chat_data:
-            project['chat_conversations'] = chat_data.get('conversation_count', 0)
-        else:
-            project['chat_conversations'] = 0
-
-        if verbose:
-            print(f"\n{project['name']}:")
-            print(f"  Category: {project['category_group']}")
-            print(f"  Timeline entries: {len(project['timeline'])}")
-            print(f"  Open threads: {len(project['open_threads'])}")
-            print(f"  Chat conversations: {project['chat_conversations']}")
-
-        if i % 5 == 0:
-            _progress('building', f'Built {i+1}/{len(all_projects)} project timelines...')
-
     all_projects.sort(key=lambda x: x['progress'], reverse=True)
 
-    # Store stats + unmatched files for AI classification
-    # Figure out which chat files were NOT matched to any project
-    matched_filenames = set()
-    for data in chat_project_data.values():
-        for entry in data.get('conversation_entries', []):
-            # Extract filename from source string
-            src = entry.get('source', '')
-            if ' — ' in src:
-                fname_hint = src.split(' — ', 1)[1]
-                matched_filenames.add(fname_hint)
-
-    unmatched_chats = []
-    for chat in (chat_files if chat_history_path else []):
-        fname_hint = chat['filename'].replace('.md', '').replace('.txt', '').replace('.json', '').replace('_', ' ')
-        if fname_hint not in matched_filenames:
-            # Grab a short excerpt for AI classification
-            content = chat.get('content', '')
-            # Get the first ~300 chars of non-code text
-            excerpt = re.sub(r'```[\s\S]*?```', '', content)
-            excerpt = re.sub(r'^(Human|Assistant|User|Claude|System)\s*:', '', excerpt, flags=re.MULTILINE)
-            excerpt = excerpt.strip()[:300]
-            unmatched_chats.append({
-                'filename': chat['filename'],
-                'date': chat['date'].strftime('%Y-%m-%d') if chat.get('date') else 'Unknown',
-                'excerpt': excerpt,
-            })
-
-    chat_stats['unmatched_chats'] = unmatched_chats
-    load_projects._last_chat_stats = chat_stats
-
-    _progress('done', f'Loaded {len(all_projects)} projects.')
+    _progress('done', f'Loaded {len(all_projects)} projects')
     return all_projects
 
 # Initialize the stats attribute
@@ -1619,6 +1578,26 @@ def _render_project_block(p, styles_dict):
             source_tag = f' ({source})' if source else ''
             line = f"<b>{display_date}</b>{source_tag} — {text}"
             elements.append(Paragraph(line, styles_dict['timeline_entry']))
+
+    # --- Branch Warning ---
+    branches = p.get('branches', [])
+    if len(branches) > 1:
+        branch_list = ', '.join(branches[:6])
+        if len(branches) > 6:
+            branch_list += f' (+{len(branches) - 6} more)'
+        elements.append(Spacer(1, 4))
+        elements.append(Paragraph(
+            f'<font color="#E74C3C"><b>Branches need resolution ({len(branches)}):</b></font> {branch_list}',
+            styles_dict['timeline_entry']
+        ))
+
+    # --- Last Session ---
+    last_session = p.get('last_session')
+    if last_session:
+        session_text = f"Last session ({last_session['date']}): {last_session['summary']}"
+        if len(session_text) > 200:
+            session_text = session_text[:197] + '...'
+        elements.append(Paragraph(session_text, styles_dict['timeline_entry']))
 
     # --- Open Threads ---
     open_threads = p.get('open_threads', [])
@@ -1850,6 +1829,8 @@ def main():
                         help='Path to chat history zip file or directory of .md/.txt exports')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Show detailed debug output')
+    parser.add_argument('--open', action='store_true',
+                        help='Open the PDF after generation')
     args = parser.parse_args()
 
     print("Scanning for PROJECT_STATUS.md files...")
@@ -1876,6 +1857,15 @@ def main():
         output_path = os.path.expanduser(args.output)
 
     create_pdf(output_path, all_projects)
+
+    if args.open:
+        system = platform.system()
+        if system == 'Darwin':
+            subprocess.run(['open', output_path])
+        elif system == 'Linux':
+            subprocess.run(['xdg-open', output_path])
+        elif system == 'Windows':
+            os.startfile(output_path)
 
 
 if __name__ == '__main__':
