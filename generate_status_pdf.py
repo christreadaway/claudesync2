@@ -20,7 +20,9 @@ Usage:
 import argparse
 import json
 import os
+import platform
 import re
+import subprocess
 import sys
 import zipfile
 from datetime import datetime
@@ -1850,6 +1852,8 @@ def main():
                         help='Path to chat history zip file or directory of .md/.txt exports')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Show detailed debug output')
+    parser.add_argument('--open', action='store_true',
+                        help='Open the PDF after generation')
     args = parser.parse_args()
 
     print("Scanning for PROJECT_STATUS.md files...")
@@ -1876,6 +1880,15 @@ def main():
         output_path = os.path.expanduser(args.output)
 
     create_pdf(output_path, all_projects)
+
+    if args.open:
+        system = platform.system()
+        if system == 'Darwin':
+            subprocess.run(['open', output_path])
+        elif system == 'Linux':
+            subprocess.run(['xdg-open', output_path])
+        elif system == 'Windows':
+            os.startfile(output_path)
 
 
 if __name__ == '__main__':

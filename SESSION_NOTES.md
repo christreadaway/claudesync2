@@ -1,14 +1,52 @@
 # CLAUDESYNC2 - Session History
 
-**Repository:** `claudesync2`  
-**Total Sessions Logged:** 11  
-**Date Range:** 2025-02-02 to 2025-02-12  
-**Last Updated:** 2026-02-16 at 14:48 UTC
+**Repository:** `claudesync2`
+**Total Sessions Logged:** 12
+**Date Range:** 2025-02-02 to 2026-03-02
+**Last Updated:** 2026-03-02
 
 This file contains a complete history of Claude Code sessions for this repository, automatically generated from transcript files. Sessions are listed in reverse chronological order (most recent first).
 
 ---
 
+## 2026-03-02 — Desktop Launcher for One-Click Status Reports
+
+### What We Built
+- Created `Project_Status.command` — a macOS double-clickable launcher that pulls all 13 repos, syncs git activity, generates PDF, and opens it
+- Added `--open` flag to `generate_status_pdf.py` so it auto-opens the PDF in Preview after generation
+- Updated `PROJECT_STATUS.md` to reflect actual project state (was stuck at 0%/Not Started)
+
+### Technical Details
+**Files Modified/Created:**
+- `Project_Status.command` (new) — macOS .command launcher, chmod +x
+- `generate_status_pdf.py` — added `--open` flag, `platform`/`subprocess` imports
+- `PROJECT_STATUS.md` — updated from template to actual state (75%, Active)
+- `SESSION_NOTES.md` — this entry
+
+### Current Status
+- ✅ PDF generator works
+- ✅ Desktop launcher created
+- ✅ Auto-open flag added
+- 🚧 Needs testing on Mac (copy to Desktop, double-click)
+
+### Branch Info
+- Branch: `claude/desktop-project-link-80ldf`
+- Ready to merge: Yes, after testing on Mac
+
+### Decisions Made
+- Used `.command` extension (macOS runs these in Terminal on double-click) rather than Automator .app
+- Launcher pulls all repos first so status is current, not stale
+- PDF goes to ~/Downloads with date-stamped filename
+
+### Next Steps
+1. Test on Mac: copy `Project_Status.command` to Desktop
+2. Install Python deps if needed: `pip3 install -r ~/claudesync2/requirements.txt`
+3. Consider adding missing repos (vibecoach, repodoctor, repodoctor2) to tracked list
+
+### Questions/Blockers
+- None
+
+---
 
 ## 2025-02-12 — Conversation Dates Fix
 **Source:** `claudesync2-conversation-dates-fix-2025-02-12.txt`
