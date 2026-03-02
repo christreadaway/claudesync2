@@ -1,13 +1,14 @@
 #!/bin/bash
 #
-# Project Status Report - Double-click to run
+# Project Status Dashboard - Double-click to launch
 #
-# Syncs all project repos, generates a PDF status report, and opens it.
-# Place this file on your Desktop for quick access.
+# Pulls all repos, syncs status, then launches the web dashboard.
+# Place this file (or a symlink) on your Desktop for quick access.
 #
 
 SCRIPT_DIR="$HOME/claudesync2"
 LOG_FILE="$SCRIPT_DIR/daily_report.log"
+PORT=5111
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 
 # ── Helper ───────────────────────────────────────────────────────────────
@@ -28,13 +29,13 @@ cd "$SCRIPT_DIR" || {
     exit 1
 }
 
-banner "PROJECT STATUS REPORT"
+banner "PROJECT STATUS DASHBOARD"
 echo "  Started: $TIMESTAMP"
 echo ""
 
 # ── Step 1: Pull latest for all repos ───────────────────────────────────
 banner "Step 1/3: Pulling latest from all repositories"
-log "Starting manual status report"
+log "Starting dashboard launch"
 
 REPOS=(
     audioscribe
@@ -50,6 +51,11 @@ REPOS=(
     parentpoint
     parentpointedu
     personalcrm
+    vibecoach
+    repodoctor
+    repodoctor2
+    claudecodearchiver
+    sacramentalrecords
 )
 
 for repo in "${REPOS[@]}"; do
@@ -68,28 +74,19 @@ banner "Step 2/3: Syncing project status"
 python3 "$SCRIPT_DIR/sync_all_status.py" 2>&1
 log "Sync complete"
 
-# ── Step 3: Generate PDF and open it ────────────────────────────────────
-banner "Step 3/3: Generating PDF report"
+# ── Step 3: Launch web dashboard ────────────────────────────────────────
+banner "Step 3/3: Launching web dashboard"
 
-python3 "$SCRIPT_DIR/generate_status_pdf.py" --open 2>&1
-EXIT_CODE=$?
+# Kill any existing instance on this port
+lsof -ti:$PORT 2>/dev/null | xargs kill 2>/dev/null
 
-if [ $EXIT_CODE -eq 0 ]; then
-    log "PDF generation completed and opened"
-    echo ""
-    echo "  Done! Your PDF report should be open now."
-else
-    log "ERROR: PDF generation failed (exit code $EXIT_CODE)"
-    echo ""
-    echo "  ERROR: PDF generation failed."
-    echo "  Check $LOG_FILE for details."
-    echo ""
-    echo "  Common fixes:"
-    echo "    pip3 install -r $SCRIPT_DIR/requirements.txt"
-fi
-
+echo "  Starting dashboard on http://localhost:$PORT"
+echo "  (PDF export available from the web interface)"
 echo ""
-echo "═══════════════════════════════════════════════"
-echo "  Press any key to close this window"
-echo "═══════════════════════════════════════════════"
-read -n 1 -s -r
+log "Launching web dashboard on port $PORT"
+
+# Open browser after a short delay (give Flask time to start)
+(sleep 2 && open "http://localhost:$PORT") &
+
+# Run the web app (this blocks until you close the terminal)
+python3 "$SCRIPT_DIR/web_app.py"

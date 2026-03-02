@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 PROJECTS = [
     ("audioscribe", "audioscribe"),
     ("Catholic Events", "catholicevents"),
+    ("Claude Code Archiver", "claudecodearchiver"),
     ("Claude Project Sync (v1)", "claude-project-sync"),
     ("Claude Project Sync v2", "claudesync2"),
     ("Desmond", "desmond"),
@@ -23,6 +24,10 @@ PROJECTS = [
     ("ParentPoint", "parentpoint"),
     ("ParentPoint EDU", "parentpointedu"),
     ("Personal CRM", "personalcrm"),
+    ("RepoDoctor", "repodoctor"),
+    ("RepoDoctor v2", "repodoctor2"),
+    ("Sacramental Records", "sacramentalrecords"),
+    ("VibeCoach", "vibecoach"),
 ]
 
 HOME = os.path.expanduser("~")
