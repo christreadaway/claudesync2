@@ -39,12 +39,11 @@ except ImportError:
     CENTRAL_TZ = timezone(timedelta(hours=-6))
 
 from flask import (Flask, request, send_file, render_template_string,
-                   flash, redirect, url_for, jsonify, Response)
+                   flash, redirect, url_for, jsonify, Response, session)
+from functools import wraps
+import hashlib
 
 from generate_status_pdf import load_projects, create_pdf
-
-app = Flask(__name__)
-app.secret_key = os.urandom(24)
 
 UPLOAD_DIR = tempfile.mkdtemp(prefix='claudesync_')
 
@@ -52,6 +51,119 @@ UPLOAD_DIR = tempfile.mkdtemp(prefix='claudesync_')
 # API keys are the exception — they come from env vars or ~/.claudesync/config.json.
 _DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 os.makedirs(_DATA_DIR, exist_ok=True)
+
+app = Flask(__name__)
+# Use a persistent secret key in production (from env or generate once and store)
+_secret_key_file = os.path.join(_DATA_DIR, '.secret_key')
+if os.environ.get('SECRET_KEY'):
+    app.secret_key = os.environ['SECRET_KEY']
+elif os.path.exists(_secret_key_file):
+    with open(_secret_key_file, 'rb') as f:
+        app.secret_key = f.read()
+else:
+    app.secret_key = os.urandom(24)
+    with open(_secret_key_file, 'wb') as f:
+        f.write(app.secret_key)
+
+# Session cookie settings for production
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+if os.environ.get('PRODUCTION'):
+    app.config['SESSION_COOKIE_SECURE'] = True
+
+
+# =============================================================================
+# AUTHENTICATION
+# =============================================================================
+# Set DASHBOARD_PASSWORD env var to enable auth. When not set, no auth required
+# (for local development). Password is hashed before comparison.
+
+AUTH_PASSWORD_HASH = None
+_raw_pw = os.environ.get('DASHBOARD_PASSWORD', '')
+if _raw_pw:
+    AUTH_PASSWORD_HASH = hashlib.sha256(_raw_pw.encode()).hexdigest()
+
+LOGIN_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login — ClaudeSync Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+               background: #1a1d23; color: #e0e0e0; display: flex; align-items: center;
+               justify-content: center; min-height: 100vh; }
+        .login-box { background: #2a2d35; border-radius: 12px; padding: 40px;
+                     box-shadow: 0 8px 32px rgba(0,0,0,0.3); width: 360px; text-align: center; }
+        h1 { font-size: 20px; margin-bottom: 8px; color: #8cc4e8; }
+        p { font-size: 13px; color: #999; margin-bottom: 24px; }
+        input[type=password] { width: 100%; padding: 12px 16px; border: 1px solid #444;
+                                border-radius: 6px; background: #1a1d23; color: #e0e0e0;
+                                font-size: 14px; margin-bottom: 16px; outline: none; }
+        input[type=password]:focus { border-color: #8cc4e8; }
+        button { width: 100%; padding: 12px; background: #3498db; color: white; border: none;
+                 border-radius: 6px; font-size: 14px; font-weight: 600; cursor: pointer; }
+        button:hover { background: #2980b9; }
+        .error { color: #e74c3c; font-size: 12px; margin-bottom: 12px; }
+    </style>
+</head>
+<body>
+    <div class="login-box">
+        <h1>ClaudeSync Dashboard</h1>
+        <p>claudesync.treadaway.org</p>
+        {% if error %}<div class="error">{{ error }}</div>{% endif %}
+        <form method="POST">
+            <input type="password" name="password" placeholder="Password" autofocus>
+            <button type="submit">Sign In</button>
+        </form>
+    </div>
+</body>
+</html>
+"""
+
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if AUTH_PASSWORD_HASH and not session.get('authenticated'):
+            return redirect('/login')
+        return f(*args, **kwargs)
+    return decorated
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if not AUTH_PASSWORD_HASH:
+        return redirect('/')
+    error = None
+    if request.method == 'POST':
+        pw = request.form.get('password', '')
+        if hashlib.sha256(pw.encode()).hexdigest() == AUTH_PASSWORD_HASH:
+            session['authenticated'] = True
+            session.permanent = True
+            app.permanent_session_lifetime = timedelta(days=30)
+            return redirect('/')
+        error = 'Incorrect password'
+    return render_template_string(LOGIN_HTML, error=error)
+
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect('/login')
+
+
+@app.before_request
+def check_auth():
+    """Enforce authentication on all routes except /login and static assets."""
+    if not AUTH_PASSWORD_HASH:
+        return  # No password set, skip auth
+    if request.endpoint in ('login', 'static'):
+        return
+    if not session.get('authenticated'):
+        return redirect('/login')
 
 IGNORED_FILE = os.path.join(_DATA_DIR, 'ignored.json')
 RESOLVED_FILE = os.path.join(_DATA_DIR, 'resolved.json')
@@ -61,6 +173,7 @@ IMPORT_META_FILE = os.path.join(_DATA_DIR, 'import_meta.json')
 ITEM_ACTIONS_FILE = os.path.join(_DATA_DIR, 'item_actions.json')
 PRIORITIZED_FILE = os.path.join(_DATA_DIR, 'prioritized.json')
 PROJECT_CACHE_FILE = os.path.join(_DATA_DIR, 'project_cache.json')
+PROCESSED_CHATS_FILE = os.path.join(_DATA_DIR, 'processed_chats.json')
 
 # Cache loaded projects so dashboard + drill-down share data
 _project_cache = {
@@ -265,6 +378,7 @@ def _bg_run_load(scan_paths_str, chat_history_path, ai_analyze):
             if chat_stats.get('unmatched_files'):
                 msg += f', {chat_stats["unmatched_files"]} unmatched'
 
+
         # AI enrichment + classification (automatic when key is present)
         enriched = 0
         classified = 0
@@ -279,19 +393,32 @@ def _bg_run_load(scan_paths_str, chat_history_path, ai_analyze):
                 ai_warnings.append(f'AI enrichment failed: {e}')
                 _bg_progress('ai_enrichment', f'AI enrichment failed: {e}')
 
-            # Auto-classify unmatched conversations
+            # Auto-classify unmatched conversations (incremental — skip already-classified)
             unmatched = chat_stats.get('unmatched_chats', [])
             if unmatched:
-                _bg_progress('ai_classify', f'Classifying {len(unmatched)} unmatched conversations...')
-                try:
-                    classified = _bg_classify_unmatched(unmatched, projects)
-                    if classified:
-                        msg += f', classified {classified} conversations'
-                    elif unmatched:
-                        ai_warnings.append('AI classified 0 conversations — API may have failed')
-                except Exception as e:
-                    ai_warnings.append(f'AI classification failed: {e}')
-                    _bg_progress('ai_classify', f'AI classification failed: {e}')
+                new_unmatched = _filter_new_chats(unmatched)
+                skipped = len(unmatched) - len(new_unmatched)
+                if new_unmatched:
+                    _bg_progress('ai_classify', f'Classifying {len(new_unmatched)} new unmatched conversations (skipping {skipped} already classified)...')
+                    try:
+                        classified = _bg_classify_unmatched(new_unmatched, projects)
+                        if classified:
+                            msg += f', classified {classified} new conversations'
+                            # Mark newly classified chats
+                            processed = _load_processed_chats()
+                            now = datetime.now(CENTRAL_TZ).strftime('%Y-%m-%d %H:%M')
+                            for chat in new_unmatched:
+                                key = chat.get('uuid') or chat.get('filename', '')
+                                if key:
+                                    processed[key] = {'processed_at': now, 'action': 'classified'}
+                            _save_processed_chats(processed)
+                        elif new_unmatched:
+                            ai_warnings.append('AI classified 0 conversations — API may have failed')
+                    except Exception as e:
+                        ai_warnings.append(f'AI classification failed: {e}')
+                        _bg_progress('ai_classify', f'AI classification failed: {e}')
+                elif skipped:
+                    msg += f' ({skipped} chats already classified, skipped)'
 
             if enriched or classified:
                 msg += '.'
@@ -438,6 +565,55 @@ def _load_import_meta():
 def _save_import_meta(meta):
     with open(IMPORT_META_FILE, 'w') as f:
         json.dump(meta, f, indent=2)
+
+
+# =============================================================================
+# PROCESSED CHATS PERSISTENCE (incremental chat import)
+# =============================================================================
+# Tracks which chat conversations have already been processed by the AI pipeline
+# so re-uploads only send new/updated conversations through AI classification.
+# Format: { "uuid_or_filename": {"processed_at": "...", "action": "matched|classified|skipped"} }
+
+def _load_processed_chats():
+    if os.path.exists(PROCESSED_CHATS_FILE):
+        try:
+            with open(PROCESSED_CHATS_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_processed_chats(data):
+    with open(PROCESSED_CHATS_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
+def _mark_chats_processed(chat_files, matched_filenames):
+    """Mark chat conversations as processed after matching/classification."""
+    processed = _load_processed_chats()
+    now = datetime.now(CENTRAL_TZ).strftime('%Y-%m-%d %H:%M')
+    for chat in chat_files:
+        key = chat.get('uuid') or chat.get('filename', '')
+        if not key:
+            continue
+        action = 'matched' if chat.get('filename', '') in matched_filenames else 'unmatched'
+        processed[key] = {'processed_at': now, 'action': action}
+    _save_processed_chats(processed)
+
+
+def _filter_new_chats(unmatched_chats):
+    """Filter unmatched chats to only those not yet classified by AI."""
+    processed = _load_processed_chats()
+    new_chats = []
+    for chat in unmatched_chats:
+        key = chat.get('uuid') or chat.get('filename', '')
+        entry = processed.get(key, {})
+        # Skip if already classified by AI (but not if just 'unmatched' — those need classification)
+        if entry.get('action') == 'classified':
+            continue
+        new_chats.append(chat)
+    return new_chats
 
 
 # =============================================================================
@@ -3650,29 +3826,35 @@ def view_unmatched():
                                   content=content)
 
 
-if __name__ == '__main__':
+def _startup():
+    """Common startup logic for both dev and production."""
     # Try loading persisted cache first (fast, works on any machine).
-    # Fall back to scanning local filesystem if no cache exists.
     if not _load_project_cache():
-        print("No cached data found, scanning local projects...")
-        _load_cached_projects()
-        total = len(_project_cache['projects'])
-        print(f"Scanned {total} projects")
-    total = len(_project_cache['projects'])
-
-    print("\n" + "="*60)
-    print("  Project Portfolio Dashboard")
-    print("  Open http://localhost:5111 in your browser")
-    print("  Press Ctrl+C to stop")
-    print("="*60 + "\n")
+        print("No cached data found — will scan in background...")
 
     # Kick off initial project load in background so server starts immediately
-    print("Loading projects in background...")
+    scan_paths = os.environ.get('SCAN_PATHS', '~')
+    print(f"Loading projects in background (scan_paths={scan_paths})...")
     t = threading.Thread(
         target=_bg_run_load,
-        args=('~', None, False),
+        args=(scan_paths, None, False),
         daemon=True,
     )
     t.start()
 
-    app.run(host='127.0.0.1', port=5111, debug=False)
+
+# Run startup for both gunicorn (module import) and direct execution
+_startup()
+
+
+if __name__ == '__main__':
+    host = os.environ.get('HOST', '127.0.0.1')
+    port = int(os.environ.get('PORT', '5111'))
+
+    print("\n" + "="*60)
+    print("  Project Portfolio Dashboard")
+    print(f"  Open http://{host}:{port} in your browser")
+    print("  Press Ctrl+C to stop")
+    print("="*60 + "\n")
+
+    app.run(host=host, port=port, debug=False)
